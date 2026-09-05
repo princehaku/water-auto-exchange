@@ -1,0 +1,7 @@
+logs/
+build/
+tools/vendor/
+*.bin
+*.soc
+*.pac
+*.lod

@@ -1,1 +1,1 @@
-{"status":"ok","service":"water-auto-exchange","mode":"project-entry","device_integration":"not_configured"}
+{"status":"ok","service":"water-auto-exchange","mode":"web-console","device_status_endpoint":"api/status"}

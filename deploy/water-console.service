@@ -1,0 +1,22 @@
+[Unit]
+Description=Water exchange console API
+After=network.target
+
+[Service]
+Type=simple
+User=waterconsole
+Group=waterconsole
+EnvironmentFile=/etc/water-console.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/usr/bin/python3 /opt/water-console/app.py
+Restart=on-failure
+RestartSec=3
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/water-console
+
+[Install]
+WantedBy=multi-user.target

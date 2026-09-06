@@ -1,24 +1,26 @@
 <!doctype html>
 <html lang="zh-CN">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>自动换水 · Water Auto Exchange</title>
-  <style>
-    :root{color-scheme:light;font-family:system-ui,-apple-system,"Segoe UI",sans-serif;color:#143c43;background:#edf6f5}
-    *{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;padding:24px}
-    main{width:min(680px,100%);padding:clamp(28px,6vw,56px);background:white;border:1px solid #d3e6e3;border-radius:24px}
-    .label{color:#26796c;font-size:13px;letter-spacing:.12em}h1{font-size:clamp(32px,7vw,48px);margin:16px 0}p{line-height:1.8;color:#526e71}
-    .status{display:inline-block;background:#e6f5ef;color:#236b53;border-radius:999px;padding:8px 14px;font-size:14px}
-    .note{border-top:1px solid #e2ecea;margin-top:28px;padding-top:20px;font-size:14px}footer{margin-top:28px;font-size:12px;color:#788f91}
-  </style>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#123d39"><title>水序 · 自动换水</title>
+<link rel="stylesheet" href="./style.css"><script src="./app.js" defer></script>
 </head>
-<body><main>
-  <div class="label">WATER AUTO EXCHANGE</div>
-  <h1>自动换水</h1>
-  <span class="status">项目入口已就绪</span>
-  <p>用于鱼缸与水箱的水位监测、排水和补水。</p>
-  <p class="note">网页控制与设备接入尚未配置。当前页面仅展示项目入口，设备操作请继续使用本地控制流程。</p>
-  <footer>bytegallop.com / water</footer>
-</main></body>
-</html>
+<body>
+<header><a class="brand" href="./"><span class="mark">≈</span> 水序 <small>WATER CONTROL</small></a><span class="site">自动换水控制台</span></header>
+<main>
+<section class="intro"><div><p class="eyebrow">A LITTLE CARE, EVERY DAY</p><h1>让每一次换水，<br>井然有序。</h1><p class="muted">查看设备状态，完成一次排水与补水。</p></div><div class="water-art" aria-hidden="true"><span>水</span><i></i><i></i><i></i></div></section>
+<section id="login-panel" class="card login"><div><p class="eyebrow">WELCOME BACK</p><h2>连接你的控制台</h2><p class="muted">输入管理密钥，查看设备并进行操作。</p></div><form id="login-form"><label for="key">管理密钥</label><div class="input-row"><input id="key" type="password" autocomplete="current-password" required placeholder="输入管理密钥"><button type="submit">登录</button></div></form></section>
+<div id="console" hidden>
+<div class="toolbar"><span id="connection" class="badge">正在获取状态</span><span id="last-seen" class="muted"></span><button id="refresh" class="ghost">刷新</button><button id="logout" class="ghost">退出</button></div>
+<div class="grid">
+<section class="card device"><div class="section-head"><h2>设备概况</h2><span id="version" class="muted">尚无设备数据</span></div><div class="state-row"><div><p class="muted">当前状态</p><h3 id="state">等待设备连接</h3><p id="reason" class="muted">设备通过 4G 接入后，状态会自动更新。</p></div><div class="state-icon" aria-hidden="true">≈</div></div><div class="metrics"><div><span>补水请求</span><strong id="need-fill">未知</strong></div><div><span>补水输出</span><strong id="fill">未知</strong></div><div><span>排水输出</span><strong id="drain">未知</strong></div><div><span>累计启动轮次</span><strong id="cycle">—</strong></div></div><div id="protection" class="note">等待保护状态</div><p class="caption">液位板提供一路迟滞反馈，无法显示水深或百分比。输出状态来自软件记录。</p></section>
+<section class="card controls"><p class="eyebrow">CONTROL</p><h2>开始一轮照料</h2><p id="control-hint" class="muted">设备在线且配置就绪后可操作。</p><button id="start" class="action" data-command="START" disabled><span>开始换水</span><small>排水 → 间隔 → 补水</small><b>↗</b></button><button id="fill-button" class="action secondary" data-command="FILL" disabled><span>单独补水</span><small>适合首次加水，补至请求解除</small><b>↗</b></button><div class="control-bottom"><button id="stop" class="danger" data-command="STOP" disabled>停止输出</button><button id="reset" class="ghost" data-command="RESET" disabled>故障复位</button></div><p class="caption">停止结果以设备回执为准。复位后回到待机。</p></section>
+</div>
+<section class="card flow"><div class="section-head"><h2>换水流程</h2><span class="muted">按液位反馈自动切换</span></div><ol><li data-state="DRAINING"><b>01</b><span>排水<small>等待低位补水请求</small></span></li><li data-state="SETTLING"><b>02</b><span>间隔<small>关闭输出，等待 1 秒</small></span></li><li data-state="FILLING"><b>03</b><span>补水<small>等待补水请求解除</small></span></li><li data-state="DONE"><b>04</b><span>完成<small>全部输出关闭</small></span></li></ol></section>
+<section class="card history"><div class="section-head"><h2>操作记录</h2><span class="muted">最近 60 条</span></div><p id="empty" class="muted">还没有操作记录。</p><div class="table-wrap"><table id="history-table" hidden><thead><tr><th>提交时间</th><th>操作</th><th>结果</th><th>设备回执 / 说明</th></tr></thead><tbody id="history"></tbody></table></div></section>
+</div>
+<p id="message" role="status" aria-live="polite"></p>
+<footer><span>水序 · WATER AUTO EXCHANGE</span><span>用细致的控制，照顾一缸日常。</span></footer>
+</main>
+<dialog id="confirm"><form method="dialog"><p class="eyebrow">CONFIRM ACTION</p><h2 id="confirm-title">确认操作</h2><p id="confirm-body"></p><div class="dialog-actions"><button value="cancel" class="ghost">取消</button><button value="ok">确认执行</button></div></form></dialog>
+</body></html>

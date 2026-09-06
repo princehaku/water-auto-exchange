@@ -1,5 +1,5 @@
 PROJECT = "water_auto_exchange"
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 
 local sys = require "sys"
 local log = require "log"
@@ -8,6 +8,7 @@ log.openTrace(true)
 local config = require "water_config"
 local water = require "water_control"
 local usb = require "water_usb"
+local network_config = require "water_network_config"
 
 print(PROJECT, VERSION, "boot", _VERSION)
 sys.init(0, 0)
@@ -25,6 +26,17 @@ if call_ok and ready then
     end
 else
     print("WATER usb_unavailable", tostring(call_ok and reason or ready))
+end
+
+if call_ok and ready and network_config.enabled == true then
+    local ok, started, detail = pcall(function()
+        local network = require "water_network"
+        return network.start(controller, network_config)
+    end)
+    if not ok or not started then
+        pcall(controller.stop)
+        print("WATER NET unavailable", ok and tostring(detail) or "initialization_failed")
+    end
 end
 
 -- Trace remains independent from USB writes; no automatic START/FILL/PROBE.

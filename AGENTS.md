@@ -1,5 +1,21 @@
 # 项目约定与本轮对话摘要
 
+## 2026-09-07 最新接续：0.4.0 + Web 控制台
+
+本节优先于下文 0.3.0 和静态网站阶段的历史描述。
+
+- 用户要求“继续完成功能和web端”，并明确设备需通过 **4G 独立联网**。已实现 `water_network.lua` / `water_network_config.lua`，基于旧 LuaTask V2.4.4 的 HTTPS 回调接口，启用 CA 校验和 SNI；保留 USB 调试网关。
+- 板端源码升级为 **0.4.0**，控制状态机与未确认的 GPIO 配置保持原状。默认源码的网络也禁用且没有凭据；`tools/build-firmware.py` 仅在被忽略的 `build/firmware/` 中启用 4G 和填入设备密钥。
+- 下载清单为 7 个 Lua 文件及 `water-ca.crt`，精确列表在 `build/firmware/flash-files.txt`；全部使用同一生成目录，保留原 CORE 和默认库。JSON 使用 CORE 全局模块，不 require 不存在的 json.lua。用户亲自点击下载，禁止代刷。
+- 远程会话重建取消旧命令；8 秒命令有效期、单次交付、回执跟踪、STOP 优先。5 秒网络请求总截止及 10 秒通信看门狗会尝试停止远程启动周期；USB STOP 作废在途远程响应。网络请求不重叠，不自动恢复泵。全部输出仍由原适配器检查互锁/液位/超时。
+- 网站新增登录、在线状态、液位请求、软件输出、故障、START/FILL/STOP/RESET、最近 60 条操作记录和手机布局。Python 标准库 + SQLite API 绑定 127.0.0.1:8790，由 Nginx `/water/api/` 代理，systemd 非特权用户运行。管理密钥与设备密钥分离、会话 Cookie、Origin 校验。部署说明见 docs/deployment.md。
+- 本地测试：原有 82 项 Lua + 20 项网络 + 3 项启动集成，共 **105 项**通过；Python 后端/网关 **28 项**通过；Edge 浏览器真实 HTTP 联调通过，覆盖登录、离线、提交/取消/回执、停止、补水条件、故障、XSS 文本、手机布局、掉线和退出。官方 LuaFLOAT 全部 src 语法与 PowerShell 解析通过。
+- 本轮电脑未枚举到串口，未刷写、未启动真实输出。最近历史实读仍是已 STOP 的 0.2.8。GPIO、液位板接线、Air724UG 实板 TLS/4G 及真实水流都仍需核验。不得把模拟设备或公网网站健康写成实板在线。
+- 当前服务器证书链根为 AAA Certificate Services，公开 CA 放 certs/，并已用服务器 OpenSSL 验证。物理设备握手待验证，不允许去掉 CA 来绕过失败。
+- 已部署并实测公网 HTTPS 登录/退出、设备离线与控制禁用、空操作记录及桌面/手机布局；四个静态文件与本地逐字节一致。API health 200、匿名 status 401、缺失资源 404、/water 308 保留查询参数，主站及 /sms 健康正常，Nginx 检查通过、water-console 服务 active。未向线上设备发送测试命令。部署备份：`/root/apps/water-auto-exchange/backups/20260906T182029Z-1468822/`。
+- 本轮凭据与准备包均放 build/（Git 忽略）；详细用法见 docs/web-console.md。不要在聊天、日志、Git 中打印密钥。后续修改验证后仍须使用中文标准提交信息 commit/push。
+
+
 适用范围：整个 `water-auto-exchange` 仓库。整理时间：2026-09-06，覆盖 2026-09-05 至 09-06 的首次连接、硬件辨识、GPIO 诊断、测量反馈、0.3.0 自动换水实现与 Git 同步。后续用户的新指示及新的实测结果优先；更新结论时保留证据和未确认部分。
 
 接续工作先读 [MEMORY.md](MEMORY.md) 的简明现状，再查本文件的约定与证据。0.3.0 源码和板上最近实读的 0.2.8 必须分开记录；下文标记为历史的扫描流程不能作为现行入口的操作指令。

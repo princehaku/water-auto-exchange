@@ -11,7 +11,7 @@ local function contains(actual, expected)
 end
 
 local function fixture(real_controller)
-    for _, name in ipairs({"sys", "log", "pins", "water_config", "water_control", "water_cycle", "water_usb"}) do
+    for _, name in ipairs({"sys", "log", "pins", "water_config", "water_control", "water_cycle", "water_usb", "water_network_config", "water_network"}) do
         package.loaded[name] = nil
     end
     local f = {rx = {}, replies = {}, calls = {}, logs = {}, setups = {}, timers = {}, gpio_calls = 0}
@@ -43,7 +43,7 @@ local function fixture(real_controller)
             f.trace = true
         end}
     end
-    _G.PROJECT, _G.VERSION = "water_auto_exchange", "0.3.0"
+    _G.PROJECT, _G.VERSION = "water_auto_exchange", "0.4.0"
     _G.uart = {
         USB = 0x81, PAR_NONE = 0, STOP_1 = 1,
         setup = function(id, baud, bits, parity, stop)
@@ -128,7 +128,7 @@ test("fragmented STATUS is read-only and unknown water level is explicit", funct
     f.feed("STA")
     equal(#f.replies, 1)
     f.feed("TUS\r")
-    contains(f.replies[2], "OK STATUS project=water_auto_exchange version=0.3.0")
+    contains(f.replies[2], "OK STATUS project=water_auto_exchange version=0.4.0")
     contains(f.replies[2], "ready=0 fill=0 drain=0 outputs_known=0 need_fill=unknown")
     f.feed("\n")
     equal(#f.replies, 2, "CRLF must yield one reply")
@@ -245,7 +245,7 @@ test("boot prints immediately and every 5 seconds without starting outputs", fun
     local f = fixture()
     f.boot()
     equal(PROJECT, "water_auto_exchange")
-    equal(VERSION, "0.3.0")
+    equal(VERSION, "0.4.0")
     equal(f.sys_init[1], 0)
     equal(f.sys_init[2], 0)
     equal(f.sys_run, true)
@@ -254,7 +254,7 @@ test("boot prints immediately and every 5 seconds without starting outputs", fun
     equal(f.calls.start, nil)
     equal(f.calls.fill, nil)
     equal(f.gpio_calls, 0)
-    contains(table.concat(f.logs), "WATER STATUS project=water_auto_exchange version=0.3.0")
+    contains(table.concat(f.logs), "WATER STATUS project=water_auto_exchange version=0.4.0")
     equal(#f.timers, 1)
     equal(f.timers[1].ms, 5000)
     local replies, status_calls = #f.replies, f.calls.status
@@ -310,6 +310,41 @@ test("default real configuration boots unconfigured without any GPIO or scan", f
     contains(replies, "fill=0 drain=0 outputs_known=0")
     equal(f.gpio_calls, 0)
     equal(#f.timers, 1, "only trace heartbeat is scheduled when unconfigured")
+end)
+
+test("network starts after USB and controller initialization", function()
+    local f = fixture()
+    package.loaded.water_network_config = {enabled = true}
+    package.loaded.water_network = {start = function(controller)
+        equal(controller, f.controller)
+        equal(f.calls.init, 1)
+        assert(f.receive)
+        f.network_started = true
+        return true
+    end}
+    f.boot()
+    assert(f.network_started and f.sys_run)
+end)
+
+test("network startup failure keeps USB STOP available", function()
+    local f = fixture()
+    package.loaded.water_network_config = {enabled = true}
+    package.loaded.water_network = {start = function() error("network unavailable") end}
+    f.boot()
+    assert(f.sys_run and f.calls.stop == 1)
+    f.feed("STOP\n")
+    equal(f.calls.stop, 2)
+end)
+
+test("USB startup failure cannot start remote control", function()
+    local f = fixture()
+    f.setup_false = true
+    package.loaded.water_network_config = {enabled = true}
+    package.loaded.water_network = {start = function() error("must not start") end}
+    f.boot()
+    equal(f.calls.init, nil)
+    contains(table.concat(f.logs), "WATER usb_unavailable")
+    assert(not table.concat(f.logs):find("WATER NET",1,true))
 end)
 
 local failures = {}

@@ -5,3 +5,12 @@ tools/vendor/
 *.soc
 *.pac
 *.lod
+__pycache__/
+*.pyc
+.venv/
+*.db
+*.db-wal
+*.db-shm
+*.private.json
+*.private.txt
+*.env

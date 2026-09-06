@@ -251,8 +251,8 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__ == '__main__':
     admin, device = os.environ['WATER_ADMIN_KEY'], os.environ['WATER_DEVICE_KEY']
-    if len(admin) < 32 or len(device) < 32 or admin == device:
-        raise SystemExit('Use distinct random keys of at least 32 characters')
+    if len(admin) < 8 or len(device) < 32 or admin == device:
+        raise SystemExit('Use distinct keys: admin at least 8 characters, device at least 32')
     store = Store(os.environ.get('WATER_DB', '/var/lib/water-console/water.db'))
     Server(('127.0.0.1', int(os.environ.get('WATER_PORT', '8790'))), store,
            admin, device, os.environ.get('WATER_ORIGIN', 'https://bytegallop.com')).serve_forever()

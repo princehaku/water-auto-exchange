@@ -1,8 +1,13 @@
 -- LuatOS-Air / Lua 5.1. Loading this module performs no hardware I/O.
 local M = {}
 local sequence = {
-    -- Toggle only GPIO5 while the user measures other board terminals.
-    { gpio = 5, physical = 49 }
+    -- All three are fixed V_GLOBAL_1V8 GPIOs, configured only in the running app.
+    -- GPIO13 is also a boot calibration input: never externally pull it HIGH at power-on.
+    -- GPIO22/23 share CP TX/SIM detect functions; pins.setup selects GPIO mode.
+    -- Exclude the previous 20 DO2 candidates and the identified GPIO5/12.
+    { gpio = 13, physical = 43 },
+    { gpio = 22, physical = 7 },
+    { gpio = 23, physical = 8 }
 }
 local candidate_ids = {}
 for i, item in ipairs(sequence) do candidate_ids[i] = tostring(item.gpio) end
@@ -124,7 +129,7 @@ advance = function()
         index = index + 1
         begin_pin()
     else
-        -- Release the completed cycle before starting the next one.
+        -- Invalidate the completed cycle before returning to GPIO13.
         errors = cleanup()
         if #errors > 0 then error(table.concat(errors, "; "), 0) end
         if continuous_mode then
@@ -167,7 +172,7 @@ function M.start(callback, continuous)
         assert(type(pins.setup) == "function" and type(pins.close) == "function",
             "pins_api_unavailable")
         assert(pin_api and type(pin_api.setval) == "function", "setval_api_unavailable")
-        report(string.format("PROBE state=RUNNING event=START total=%d hold_ms=%d cycle_ms=%d domain=V_GLOBAL_1V8",
+        report(string.format("PROBE state=RUNNING event=START total=%d hold_ms=%d cycle_ms=%d target=DO2 domain=V_GLOBAL_1V8",
             #sequence, hold_ms, cycle_ms)
             .. " continuous=" .. (continuous_mode and "1" or "0"))
         if state == "RUNNING" and token == generation then

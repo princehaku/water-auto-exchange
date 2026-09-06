@@ -3,8 +3,8 @@ param(
     [ValidatePattern('^COM[1-9][0-9]*$')]
     [string]$Port = 'COM4',
     [switch]$Continuous,
-    [ValidateRange(15, 600)]
-    [int]$TimeoutSeconds = 20
+    [ValidateRange(35, 600)]
+    [int]$TimeoutSeconds = 45
 )
 
 $ErrorActionPreference = 'Stop'
@@ -56,11 +56,11 @@ try {
     while ($checkTimer.Elapsed.TotalSeconds -lt 4 -and -not $identified) {
         foreach ($line in @(Read-ProbeLines)) {
             Write-ProbeLine $line
-            if ($line -match '^OK STATUS project=gk21_motor_test version=0\.2\.5 ' -and
+            if ($line -match '^OK STATUS project=gk21_motor_test version=0\.2\.8 ' -and
                 $line -match ' state=STANDBY ' -and
-                $line -match ' probe_total=1 ' -and
-                $line -match ' probe_cycle_ms=10000 ' -and
-                $line -match ' probe_candidates=5(?: |$)' -and
+                $line -match ' probe_total=3 ' -and
+                $line -match ' probe_cycle_ms=30000 ' -and
+                $line -match ' probe_candidates=13,22,23(?: |$)' -and
                 ($line -match ' probe_state=(IDLE|DONE|STOPPED)(?: |$)' -or
                  ($Continuous -and $line -match ' probe_state=RUNNING ' -and $line -match ' probe_continuous=1 '))) {
                 $identified = $true
@@ -72,19 +72,19 @@ try {
         }
         if (-not $identified) { Start-Sleep -Milliseconds 25 }
     }
-    if (-not $identified) { throw 'Expected gk21_motor_test v0.2.5 toggling only GPIO5, with a 10-second cycle; use -Continuous to observe its automatic loop.' }
+    if (-not $identified) { throw 'Expected gk21_motor_test v0.2.8 with GPIO13/22/23 only and a 30-second cycle; use -Continuous to observe its automatic loop.' }
     $modeLabel = if ($Continuous) { 'continuous' } else { 'one pass' }
     $started = $true
     if ($alreadyRunning) {
-        Write-ProbeLine 'HOST observing automatic loop: GPIO5 only; HIGH 5 seconds / LOW 5 seconds; 10 seconds per cycle.'
+        Write-ProbeLine 'HOST observing DO2 scan: GPIO13/22/23 only; HIGH 5 seconds / LOW 5 seconds; 30 seconds per cycle.'
     }
     else {
-        Write-ProbeLine ('HOST starting ' + $modeLabel + ': GPIO5 only; HIGH 5 seconds / LOW 5 seconds; 10 seconds per cycle.')
+        Write-ProbeLine ('HOST starting ' + $modeLabel + ' DO2 scan: GPIO13/22/23 only; HIGH 5 seconds / LOW 5 seconds; 30 seconds per cycle.')
         if ($Continuous) { $serial.Write("PROBE LOOP`r`n") }
         else { $serial.Write("PROBE`r`n") }
     }
     $runTimer = [Diagnostics.Stopwatch]::StartNew()
-    $nextStatus = 11.0
+    $nextStatus = 31.0
     while ($runTimer.Elapsed.TotalSeconds -lt $TimeoutSeconds -and -not $completed) {
         foreach ($line in @(Read-ProbeLines)) {
             Write-ProbeLine $line

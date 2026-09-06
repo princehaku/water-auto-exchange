@@ -1,36 +1,44 @@
-PROJECT = "gk21_motor_test"
-VERSION = "0.2.5"
+PROJECT = "water_auto_exchange"
+VERSION = "0.3.0"
 
 local sys = require "sys"
 local log = require "log"
--- Keep LuaTools trace on without assigning a physical UART to logging.
+-- Default trace does not assign a physical UART or wait for a SIM/network.
 log.openTrace(true)
-local config = require "motor_config"
-local motor = require "motor_cycle"
-local probe = require "gpio_probe"
+local config = require "water_config"
+local water = require "water_control"
+local usb = require "water_usb"
 
 print(PROJECT, VERSION, "boot", _VERSION)
-local ready, reason = motor.can_start(config)
-print("motor_cycle", "STANDBY", reason)
+sys.init(0, 0)
+local controller = water.new(config)
 
--- Keep USB commands and boot diagnostics on the same interlock/STOP path.
-local ok, result, detail, handler = pcall(function()
-    return require("usb_control").start(motor, config, probe)
-end)
-if not ok then print("usb_control error", tostring(result))
-elseif not result then print("usb_control unavailable", tostring(detail)) end
-
-if config.auto_start == true and ready then
-    local started, start_error = motor.start(config)
-    if not started then print("motor_cycle start error", start_error) end
+-- Install the STOP command before initializing any configured outputs.
+local call_ok, ready, reason = pcall(usb.start, controller)
+if call_ok and ready then
+    local init_ok, initialized, detail = pcall(controller.init)
+    if not init_ok then
+        pcall(controller.stop)
+        print("WATER init_error", tostring(initialized))
+    elseif not initialized then
+        print("WATER standby", tostring(detail))
+    end
+else
+    print("WATER usb_unavailable", tostring(call_ok and reason or ready))
 end
 
-sys.init(0, 0)
-if ok and result and type(handler) == "function" and config.auto_start ~= true then
-    local started, start_error = pcall(handler, "PROBE LOOP")
-    if not started then
-        pcall(handler, "STOP")
-        print("gpio_probe boot error", tostring(start_error))
-    end
+-- Trace remains independent from USB writes; no automatic START/FILL/PROBE.
+local function print_status()
+    local ok, status = pcall(function()
+        return usb.format_status(controller.status())
+    end)
+    if ok then print("WATER STATUS " .. status)
+    else print("WATER status_error", tostring(status)) end
+end
+
+print_status()
+local timer_ok, timer_id = pcall(sys.timerLoopStart, print_status, 5000)
+if not timer_ok or not timer_id or timer_id == 0 then
+    print("WATER status_timer_error", tostring(timer_id))
 end
 sys.run()

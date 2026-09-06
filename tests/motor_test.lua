@@ -115,29 +115,6 @@ local function fixture()
     return f
 end
 
-local function mock_boot_probe(f)
-    f.probe_starts, f.probe_stops, f.probe_state = 0, 0, "IDLE"
-    package.loaded.gpio_probe = {
-        start = function(emit, continuous)
-            assert(f.sys_init, "boot diagnostics must wait for sys.init")
-            equal(f.sys_run, nil, "boot diagnostics should be scheduled before sys.run")
-            assert(f.receive, "USB STOP receiver must exist before diagnostics start")
-            equal(f.trace_enabled, true)
-            equal(continuous, true, "boot must request continuous diagnostics")
-            f.probe_starts = f.probe_starts + 1
-            f.probe_state = "RUNNING"
-            emit("PROBE state=RUNNING fixture=boot continuous=1")
-            return true, "started"
-        end,
-        status = function() return { state = f.probe_state, continuous = true, cycle = 1 } end,
-        stop = function()
-            f.probe_stops = f.probe_stops + 1
-            f.probe_state = "STOPPED"
-            return true, "stopped"
-        end
-    }
-end
-
 local function off(f)
     equal(f.outputs[10001], 0, "first input must be OFF")
     equal(f.outputs[10002], 0, "second input must be OFF")
@@ -336,78 +313,19 @@ test("USB discards an entire oversized line and resumes at the next line", funct
     equal(f.pins_required, 0)
 end)
 
-test("default main starts continuous diagnostics after sys.init and USB STOP remains available", function()
-    local f = fixture()
-    mock_boot_probe(f)
-    dofile(root .. "/src/main.lua")
-    equal(VERSION, "0.2.5")
-    equal(f.sys_init[1], 0)
-    equal(f.sys_init[2], 0)
-    equal(f.sys_run, true)
-    equal(f.trace_enabled, true)
-    equal(#f.uart_setups, 1)
-    equal(f.uart_setups[1][1], 0x81)
-    equal(f.pins_required, 0)
-    equal(#f.setups, 0)
-    equal(#f.writes, 0)
-    equal(#f.timer_attempts, 0)
-    equal(f.motor.status(), "STANDBY")
-    equal(f.probe_starts, 1)
-    equal(f.probe_state, "RUNNING")
-    contains(table.concat(f.replies), "PROBE state=RUNNING fixture=boot continuous=1")
-    contains(table.concat(f.replies), "OK PROBE started")
-    f.feed("STATUS\nSTOP\nSTATUS\n")
-    equal(f.probe_stops, 1)
-    equal(f.probe_state, "STOPPED")
-    equal(f.probe_starts, 1, "STOP must not trigger another automatic diagnostic")
-    contains(table.concat(f.replies), "probe_state=RUNNING")
-    contains(table.concat(f.replies), "OK STOP stopped")
-    contains(f.replies[#f.replies], "probe_state=STOPPED")
-end)
-
-test("main does not start diagnostics when USB setup is unavailable or throws", function()
-    for _, failure in ipairs({ "unavailable", "exception" }) do
-        local f = fixture()
-        mock_boot_probe(f)
-        if failure == "unavailable" then _G.uart = nil
-        else uart.setup = function() error("injected USB setup exception") end end
-        dofile(root .. "/src/main.lua")
-        equal(f.probe_starts, 0)
-        equal(f.sys_run, true)
-        equal(f.pins_required, 0)
-        equal(#f.setups, 0)
-        equal(#f.timer_attempts, 0)
-    end
-end)
-
-test("motor auto-start configuration excludes automatic diagnostics", function()
-    for _, ready in ipairs({ true, false }) do
-        local f = fixture()
-        mock_boot_probe(f)
-        local config = confirmed_config()
-        config.auto_start, config.mapping_confirmed = true, ready
-        package.loaded.motor_config = config
-        dofile(root .. "/src/main.lua")
-        equal(f.probe_starts, 0)
-        equal(f.sys_run, true)
-        equal(f.motor.status(), ready and "RUNNING_ON" or "STANDBY")
-        assert(f.motor.stop())
-    end
-end)
-
 test("USB diagnostic interlock prevents simultaneous motor and probe outputs", function()
     local f = fixture()
     local state, starts, stops = "IDLE", 0, 0
     local probe = {
         status = function() return {
-            state = state, gpio = 5, level = 0, total = 1,
-            cycle_ms = 10000, candidates = "5"
+            state = state, gpio = 13, level = 0, total = 3,
+            cycle_ms = 30000, candidates = "13,22,23"
         } end,
         start = function(emit, continuous)
             equal(continuous, true, "PROBE LOOP must request continuous diagnostics")
             starts = starts + 1
             state = "RUNNING"
-            emit("PROBE gpio=27 level=0 hold_ms=5000")
+            emit("PROBE gpio=13 level=0 hold_ms=5000")
             return true, "started"
         end,
         stop = function() stops = stops + 1; state = "STOPPED"; return true, "stopped" end
@@ -416,8 +334,8 @@ test("USB diagnostic interlock prevents simultaneous motor and probe outputs", f
     f.feed("PROBE LOOP\nSTART\nSTATUS\n")
     equal(starts, 1)
     contains(table.concat(f.replies), "ERROR START probe_not_stopped")
-    contains(table.concat(f.replies), "probe_state=RUNNING probe_gpio=5 probe_level=0")
-    contains(table.concat(f.replies), "probe_total=1 probe_cycle_ms=10000 probe_candidates=5")
+    contains(table.concat(f.replies), "probe_state=RUNNING probe_gpio=13 probe_level=0")
+    contains(table.concat(f.replies), "probe_total=3 probe_cycle_ms=30000 probe_candidates=13,22,23")
     equal(#f.setups, 0, "motor must not configure outputs while probing")
     f.feed("STOP\nSTART\nPROBE\n")
     equal(stops, 1)

@@ -2,6 +2,11 @@
 local root = (arg and arg[1]) or "."
 package.path = root .. "/src/?.lua;" .. package.path
 local real_print = print
+local expected_gpio = { 13, 22, 23 }
+local expected_physical = { 43, 7, 8 }
+local expected_candidates = "13,22,23"
+local allowed = {}
+for _, pin in ipairs(expected_gpio) do allowed[pin] = true end
 
 local function equal(actual, expected, message)
     assert(actual == expected, (message or "unexpected value")
@@ -12,11 +17,15 @@ local function fixture()
     for _, name in ipairs({ "gpio_probe", "sys", "pins" }) do package.loaded[name] = nil end
     local f = {
         now = 0, events = {}, messages = {}, logs = {}, active = {}, timers = {},
-        attempts = {}, faults = {}, required = 0, next_id = 0, forbidden_accesses = 0
+        attempts = {}, faults = {}, required = 0, next_id = 0,
+        power_reads = 0, uart_reads = 0, unauthorized_gpio_accesses = 0
     }
     local function event(kind, a, b)
         if kind == "setup" or kind == "set" or kind == "close" then
-            equal(a, 5, "only GPIO5 may be configured, written or closed")
+            if not allowed[a] then
+                f.unauthorized_gpio_accesses = f.unauthorized_gpio_accesses + 1
+                error("GPIO outside the authorized DO2 candidates: " .. tostring(a))
+            end
         end
         f.events[#f.events + 1] = { kind = kind, a = a, b = b, time = f.now }
         f.attempts[kind] = (f.attempts[kind] or 0) + 1
@@ -27,34 +36,36 @@ local function fixture()
         end
         return "ok"
     end
-    local function forbidden()
-        f.forbidden_accesses = f.forbidden_accesses + 1
-        error("GPIO5 diagnostics must not access pmd or uart")
-    end
-    _G.pmd = setmetatable({}, { __index = forbidden, __newindex = forbidden })
-    _G.uart = setmetatable({}, { __index = forbidden, __newindex = forbidden })
+    -- Count before throwing so a pcall in the implementation cannot hide forbidden access.
+    _G.pmd = setmetatable({}, { __index = function(_, key)
+        f.power_reads = f.power_reads + 1
+        error("power API is forbidden for this fixed-domain group: " .. tostring(key))
+    end })
+    _G.uart = setmetatable({}, { __index = function(_, key)
+        f.uart_reads = f.uart_reads + 1
+        error("UART API is forbidden in the probe: " .. tostring(key))
+    end })
     _G.print = function(line) f.logs[#f.logs + 1] = line end
     _G.pio = { pin = {
         setval = function(value, pin)
             assert(value == 0 or value == 1, "only explicit 0/1 writes are allowed")
             if event("set", pin, value) == "false" then return false end
             f.active[pin] = value
-            -- Native functions may return nil on success.
         end
     } }
     package.preload.pins = function()
         f.required = f.required + 1
         return {
             setup = function(pin, value)
-                equal(next(f.active), nil, "the preceding output must be released before setup")
+                equal(next(f.active), nil, "release the preceding output before setup")
                 equal(value, 0, "setup must initially configure LOW")
                 f.active[pin] = value -- Model partial setup before a reported failure.
                 local result = event("setup", pin, value)
                 if result == "false" then return false end
                 if result == "nil" then return nil end
                 return function(value)
-                    assert(value ~= nil, "an output closure must never be read without an argument")
-                    error("writes should use pio.pin.setval so its failure is observable")
+                    assert(value ~= nil, "never read an output closure without an argument")
+                    error("writes should use pio.pin.setval so failures are observable")
                 end
             end,
             close = function(pin)
@@ -68,9 +79,9 @@ local function fixture()
         return {
             timerStart = function(callback, duration)
                 equal(duration, 5000, "every phase must hold for five seconds")
-                -- Register before failure to exercise partial timer-start cleanup.
                 f.next_id = f.next_id + 1
                 local id = f.next_id
+                -- Register before failure to exercise partial timer-start cleanup.
                 f.timers[id] = { callback = callback, active = true, due = f.now + duration }
                 f.latest_id = id
                 local result = event("timer_start", id, duration)
@@ -98,11 +109,14 @@ local function fixture()
         f.now = timer.due
         timer.callback()
     end
+    function f.advance(ticks)
+        for _ = 1, ticks do f.fire() end
+    end
     function f.finish()
         local guard = 0
         while f.probe.status().state == "RUNNING" do
             guard = guard + 1
-            assert(guard <= 2, "single pass must finish after two timers")
+            assert(guard <= 6, "single pass must finish after six timers")
             f.fire()
         end
     end
@@ -118,17 +132,19 @@ local function fixture()
 end
 
 local function quiescent(f)
-    equal(next(f.active), nil, "GPIO5 must be released")
-    equal(f.forbidden_accesses, 0, "pmd and uart must remain untouched")
+    equal(next(f.active), nil, "all GPIOs must be released")
     local before = #f.events
     for _, timer in pairs(f.timers) do timer.callback() end
     equal(#f.events, before, "stale callbacks must perform no I/O")
+    equal(f.power_reads, 0, "probe must never access pmd")
+    equal(f.uart_reads, 0, "probe must never access uart")
+    equal(f.unauthorized_gpio_accesses, 0, "only GPIO13/22/23 may be touched")
 end
 
 local tests = {}
 local function test(name, callback) tests[#tests + 1] = { name, callback } end
 
-test("require, status and an initial STOP perform no hardware I/O", function()
+test("require, status and an initial STOP perform no hardware or power access", function()
     local f = fixture()
     equal(#f.events, 0)
     equal(f.required, 0)
@@ -137,178 +153,179 @@ test("require, status and an initial STOP perform no hardware I/O", function()
     equal(status.gpio, nil)
     equal(status.level, nil)
     equal(status.index, 0)
-    equal(status.total, 1)
+    equal(status.total, 3)
     equal(status.hold_ms, 5000)
     equal(status.continuous, false)
     equal(status.cycle, 0)
-    equal(status.cycle_ms, 10000)
-    equal(status.candidates, "5")
+    equal(status.cycle_ms, 30000)
+    equal(status.candidates, expected_candidates)
     equal(f.probe.start(f.emit, "true"), false)
     status.state, status.total, status.candidates = "RUNNING", 99, "other"
     equal(f.probe.status().state, "IDLE")
-    equal(f.probe.status().total, 1)
-    equal(f.probe.status().candidates, "5")
+    equal(f.probe.status().total, 3)
+    equal(f.probe.status().candidates, expected_candidates)
     assert(f.probe.stop())
     equal(#f.events, 0)
     equal(f.required, 0)
+    equal(f.power_reads, 0)
     quiescent(f)
 end)
 
-test("single pass drives GPIO5 HIGH immediately, LOW at five seconds and releases at ten", function()
+test("single pass covers exactly three physical mappings with HIGH and LOW five seconds each", function()
     local f = fixture()
     assert(f.probe.start(f.emit))
-    equal(f.probe.status().gpio, 5)
+    equal(f.probe.status().gpio, 13)
     equal(f.probe.status().level, 1)
-    equal(f.active[5], 1)
-    f.fire()
-    equal(f.now, 5000)
-    equal(f.probe.status().level, 0)
-    equal(f.active[5], 0)
-    f.fire()
-    equal(f.now, 10000)
+    f.finish()
+    equal(f.now, 30000)
     equal(f.probe.status().state, "DONE")
     equal(f.probe.status().cycle, 1)
     equal(f.probe.status().gpio, nil)
     local setups, writes, closes = f.events_of("setup"), f.events_of("set"), f.events_of("close")
-    equal(#setups, 1)
-    equal(setups[1].b, 0)
-    equal(#writes, 3)
-    for i, expected in ipairs({ { 1, 0 }, { 0, 5000 }, { 0, 10000 } }) do
-        equal(writes[i].a, 5)
-        equal(writes[i].b, expected[1])
-        equal(writes[i].time, expected[2])
+    equal(#setups, 3); equal(#writes, 9); equal(#closes, 3)
+    for i, pin in ipairs(expected_gpio) do
+        equal(setups[i].a, pin)
+        equal(setups[i].b, 0)
+        equal(setups[i].time, (i - 1) * 10000)
+        local high, low, released = writes[3 * i - 2], writes[3 * i - 1], writes[3 * i]
+        equal(high.a, pin); equal(high.b, 1); equal(high.time, (i - 1) * 10000)
+        equal(low.a, pin); equal(low.b, 0); equal(low.time, (i - 1) * 10000 + 5000)
+        equal(released.a, pin); equal(released.b, 0); equal(released.time, i * 10000)
+        equal(closes[i].a, pin); equal(closes[i].time, i * 10000)
     end
-    equal(#closes, 1)
-    equal(closes[1].time, 10000)
-    equal(#f.events_of("timer_start"), 2)
-    equal(f.messages[1].line, "PROBE state=RUNNING event=START total=1 hold_ms=5000 cycle_ms=10000 domain=V_GLOBAL_1V8 continuous=0")
-    equal(f.messages[2].line, "PROBE gpio=5 physical=49 level=1 phase=HIGH index=1/1 hold_ms=5000 domain=V_GLOBAL_1V8")
-    equal(f.messages[2].time, 0)
-    equal(f.messages[3].line, "PROBE gpio=5 physical=49 level=0 phase=LOW index=1/1 hold_ms=5000 domain=V_GLOBAL_1V8")
-    equal(f.messages[3].time, 5000)
-    equal(f.messages[4].line, "PROBE state=DONE event=END total=1 duration_ms=10000")
+    local progress = {}
+    for _, item in ipairs(f.messages) do
+        if item.line:match("^PROBE gpio=") then progress[#progress + 1] = item end
+    end
+    equal(#progress, 6)
+    for n, message in ipairs(progress) do
+        local i = math.floor((n - 1) / 2) + 1
+        local high = n % 2 == 1
+        equal(message.time, (n - 1) * 5000)
+        equal(message.line, string.format(
+            "PROBE gpio=%d physical=%d level=%d phase=%s index=%d/3 hold_ms=5000 domain=V_GLOBAL_1V8",
+            expected_gpio[i], expected_physical[i], high and 1 or 0, high and "HIGH" or "LOW", i))
+    end
+    equal(#f.events_of("timer_start"), 6)
+    equal(f.messages[1].line, "PROBE state=RUNNING event=START total=3 hold_ms=5000 cycle_ms=30000 target=DO2 domain=V_GLOBAL_1V8 continuous=0")
+    equal(f.messages[#f.messages].line, "PROBE state=DONE event=END total=3 duration_ms=30000")
     equal(#f.logs, #f.messages)
     for i, message in ipairs(f.messages) do equal(f.logs[i], message.line) end
     quiescent(f)
 end)
 
-test("continuous mode repeats only GPIO5 every ten seconds without an extra holding phase", function()
+test("continuous mode releases the third pin before restarting GPIO13 every 30 seconds", function()
     local f = fixture()
     assert(f.probe.start(f.emit, true))
-    for n = 1, 6 do
+    for n = 1, 12 do
         f.fire()
-        local status = f.probe.status()
-        equal(f.now, n * 5000)
-        equal(status.state, "RUNNING")
-        equal(status.continuous, true)
-        equal(status.gpio, 5)
-        equal(status.cycle, math.floor(n / 2) + 1)
-        equal(status.level, n % 2 == 0 and 1 or 0)
-        equal(f.active[5], status.level)
-        equal(f.timers[f.latest_id].due, f.now + 5000)
+        if n == 6 or n == 12 then
+            local status = f.probe.status()
+            equal(f.now, n * 5000)
+            equal(status.state, "RUNNING")
+            equal(status.continuous, true)
+            equal(status.gpio, 13)
+            equal(status.cycle, n / 6 + 1)
+            equal(status.level, 1)
+            local closes = f.events_of("close")
+            equal(closes[#closes].a, 23)
+            equal(closes[#closes].time, f.now)
+            equal(f.events_of("setup")[#closes + 1].a, 13)
+            equal(f.timers[f.latest_id].due, f.now + 5000)
+        end
     end
-    equal(#f.events_of("setup"), 4)
-    equal(#f.events_of("close"), 3)
+    equal(#f.events_of("setup"), 7)
+    equal(#f.events_of("close"), 6)
     assert(f.probe.stop())
     quiescent(f)
 end)
 
-test("STOP during either level writes LOW, closes GPIO5 and invalidates callbacks across restart", function()
-    for _, ticks in ipairs({ 0, 1 }) do
+test("STOP at all six phases and the next cycle releases outputs and rejects old callbacks after restart", function()
+    for ticks = 0, 6 do
         local f = fixture()
         assert(f.probe.start(f.emit, true))
-        if ticks == 1 then f.fire() end
+        f.advance(ticks)
+        local current = f.probe.status().gpio
+        equal(current, expected_gpio[math.floor((ticks % 6) / 2) + 1])
         local id, callback = f.latest_id, f.timers[f.latest_id].callback
         assert(f.probe.stop())
         equal(f.probe.status().state, "STOPPED")
         equal(f.timers[id].active, false)
-        local writes = f.events_of("set")
+        local writes, closes = f.events_of("set"), f.events_of("close")
+        equal(writes[#writes].a, current)
         equal(writes[#writes].b, 0)
-        equal(writes[#writes].time, f.now, "STOP must write LOW without waiting for a timer")
+        equal(writes[#writes].time, f.now, "STOP must not wait for a timer")
+        equal(closes[#closes].a, current)
         quiescent(f)
         assert(f.probe.start(f.emit))
         equal(f.probe.status().continuous, false)
         equal(f.probe.status().cycle, 1)
         local count = #f.events
         callback()
-        equal(#f.events, count, "the old loop cannot alter the new pass")
+        equal(#f.events, count)
         assert(f.probe.stop())
         quiescent(f)
     end
 end)
 
-test("duplicate START does not replace the emitter or interrupt the active cycle", function()
-    local f = fixture()
-    assert(f.probe.start(f.emit, true))
-    local count, id = #f.events, f.latest_id
-    local ok, reason = f.probe.start(function() error("wrong emitter") end, false)
-    equal(ok, false)
-    equal(reason, "already_running")
-    equal(#f.events, count)
-    equal(f.latest_id, id)
-    equal(f.probe.status().continuous, true)
-    f.fire()
-    equal(f.probe.status().level, 0)
-    assert(f.probe.stop())
-    quiescent(f)
-end)
-
-test("DONE and STOPPED require another explicit START before any further output", function()
+test("duplicate START preserves current progress and DONE needs explicit restart", function()
     local f = fixture()
     assert(f.probe.start(f.emit))
+    local count, id = #f.events, f.latest_id
+    local ok, reason = f.probe.start(function() error("wrong emitter") end, true)
+    equal(ok, false); equal(reason, "already_running")
+    equal(#f.events, count); equal(f.latest_id, id)
+    equal(f.probe.status().continuous, false)
     f.finish()
     quiescent(f)
     assert(f.probe.start(f.emit, true))
     equal(f.probe.status().cycle, 1)
     assert(f.probe.stop())
     quiescent(f)
-    assert(f.probe.start(f.emit))
-    equal(f.probe.status().continuous, false)
-    f.finish()
-    quiescent(f)
 end)
 
-test("partial setup failures attempt LOW and close even when setup returns no closure", function()
-    for _, mode in ipairs({ "nil", "false", "throw" }) do
-        local f = fixture()
-        f.faults.setup = { mode = mode }
-        equal(f.probe.start(f.emit), false)
-        equal(f.probe.status().state, "ERROR")
-        equal(#f.events_of("set"), 1)
-        equal(f.events_of("set")[1].b, 0)
-        equal(#f.events_of("close"), 1)
-        equal(#f.events_of("timer_start"), 0)
-        quiescent(f)
-        equal(f.probe.start(f.emit), false, "ERROR requires a successful STOP")
-        f.faults = {}
-        assert(f.probe.stop())
+test("partial setup failure at each candidate closes the pin", function()
+    for at = 1, 3 do
+        for _, mode in ipairs({ "nil", "false", "throw" }) do
+            local f = fixture()
+            f.faults.setup = { at = at, mode = mode }
+            local ok = f.probe.start(f.emit)
+            if at == 1 then equal(ok, false)
+            else assert(ok); f.finish() end
+            equal(f.probe.status().state, "ERROR")
+            equal(#f.events_of("setup"), at)
+            equal(f.events_of("close")[at].a, expected_gpio[at])
+            quiescent(f)
+            equal(f.probe.start(f.emit), false)
+            f.faults = {}
+            assert(f.probe.stop())
+        end
     end
 end)
 
-test("setval failures during HIGH, LOW or release stop the pass and clean up", function()
-    for _, mode in ipairs({ "false", "throw" }) do
-        for _, at in ipairs({ 1, 2, 3 }) do
+test("setval failure at every HIGH, LOW or release cleans all resources", function()
+    for at = 1, 9 do
+        for _, mode in ipairs({ "false", "throw" }) do
             local f = fixture()
             f.faults.set = { at = at, mode = mode }
             local ok = f.probe.start(f.emit)
             if at == 1 then equal(ok, false)
             else assert(ok); f.finish() end
             equal(f.probe.status().state, "ERROR")
-            equal(#f.events_of("setup"), 1)
             assert(f.messages[#f.messages].line:find("PROBE state=ERROR", 1, true))
             quiescent(f)
         end
     end
 end)
 
-test("failed timer creation cancels a partly registered callback and releases GPIO5", function()
-    for _, mode in ipairs({ "nil", "false", "throw" }) do
-        for _, at in ipairs({ 1, 2 }) do
+test("failed timers at all six phases cancel partly registered callbacks and release GPIOs", function()
+    for at = 1, 6 do
+        for _, mode in ipairs({ "nil", "false", "throw" }) do
             local f = fixture()
             f.faults.timer_start = { at = at, mode = mode }
             local ok = f.probe.start(f.emit)
             if at == 1 then equal(ok, false)
-            else assert(ok); f.fire() end
+            else assert(ok); f.finish() end
             equal(f.probe.status().state, "ERROR")
             equal(f.timers[f.latest_id].active, false)
             quiescent(f)
@@ -316,65 +333,72 @@ test("failed timer creation cancels a partly registered callback and releases GP
     end
 end)
 
-test("STOP attempts timer, LOW and close independently and permits failed-close retry", function()
-    for _, mode in ipairs({ "false", "throw" }) do
-        local f = fixture()
-        assert(f.probe.start(f.emit, true))
-        f.faults.timer_stop = { mode = mode }
-        f.faults.set = { mode = mode }
-        f.faults.close = { mode = mode }
-        equal(f.probe.stop(), false)
-        equal(f.probe.status().state, "ERROR")
-        equal(f.probe.status().gpio, 5)
-        equal(#f.events_of("timer_stop"), 1)
-        equal(#f.events_of("set"), 2)
-        equal(#f.events_of("close"), 1)
-        local count = #f.events
-        for _, timer in pairs(f.timers) do timer.callback() end
-        equal(#f.events, count)
-        equal(f.probe.start(f.emit), false)
-        f.faults = {}
-        assert(f.probe.stop())
-        quiescent(f)
+test("STOP independently attempts timer, LOW and GPIO close even when all fail", function()
+    for ticks = 0, 5 do
+        for _, mode in ipairs({ "false", "throw" }) do
+            local f = fixture()
+            assert(f.probe.start(f.emit, true))
+            f.advance(ticks)
+            local pin, before = f.probe.status().gpio, {}
+            for _, kind in ipairs({ "timer_stop", "set", "close" }) do
+                before[kind] = #f.events_of(kind)
+                f.faults[kind] = { mode = mode }
+            end
+            equal(f.probe.stop(), false)
+            equal(f.probe.status().state, "ERROR")
+            equal(f.probe.status().gpio, pin, "failed close must retain ownership")
+            for kind, count in pairs(before) do equal(#f.events_of(kind), count + 1) end
+            local count = #f.events
+            for _, timer in pairs(f.timers) do timer.callback() end
+            equal(#f.events, count)
+            equal(f.probe.start(f.emit), false)
+            f.faults = {}
+            assert(f.probe.stop())
+            quiescent(f)
+        end
     end
 end)
 
-test("close failure at a continuous boundary prevents another HIGH cycle", function()
-    local f = fixture()
-    f.faults.close = { mode = "throw" }
-    assert(f.probe.start(f.emit, true))
-    f.finish()
-    equal(f.probe.status().state, "ERROR")
-    equal(f.probe.status().cycle, 1)
-    equal(#f.events_of("setup"), 1)
-    f.faults = {}
-    assert(f.probe.stop())
-    quiescent(f)
+test("GPIO close failures block the next candidate or next cycle", function()
+    for at = 1, 3 do
+        for _, mode in ipairs({ "false", "throw" }) do
+            local f = fixture()
+            f.faults.close = { at = at, mode = mode }
+            assert(f.probe.start(f.emit, true))
+            f.finish()
+            equal(f.probe.status().state, "ERROR")
+            equal(#f.events_of("setup"), at)
+            equal(f.probe.status().cycle, 1)
+            assert(f.probe.stop())
+            quiescent(f)
+        end
+    end
 end)
 
-test("progress-emitter exceptions stop and release both initial HIGH and timed LOW", function()
-    for _, target in ipairs({ "phase=HIGH", "phase=LOW" }) do
+test("progress-emitter exceptions at each candidate release all resources", function()
+    for _, target in ipairs({ "gpio=13 physical=43 level=1", "gpio=22 physical=7 level=1",
+        "gpio=23 physical=8 level=0" }) do
         local f = fixture()
         f.emit_fault = target
         local ok = f.probe.start(f.emit, true)
-        if target == "phase=HIGH" then equal(ok, false)
-        else assert(ok); f.fire() end
+        if target:find("gpio=13 ", 1, true) then equal(ok, false)
+        else assert(ok); f.finish() end
         equal(f.probe.status().state, "ERROR")
         quiescent(f)
     end
 end)
 
-test("STOP from HIGH, LOW or cycle-boundary emitters cannot schedule more output", function()
-    for _, target in ipairs({ "phase=HIGH", "phase=LOW", "event=NEXT_CYCLE" }) do
+test("STOP from START, phase progress and cycle-boundary emitters cannot resume output", function()
+    for _, target in ipairs({ "event=START", "gpio=13 physical=43 level=0",
+        "gpio=22 physical=7 level=1", "gpio=23 physical=8 level=0", "event=NEXT_CYCLE" }) do
         local f = fixture()
         f.on_emit = function(line)
             if line:find(target, 1, true) then assert(f.probe.stop()) end
         end
         local ok = f.probe.start(f.emit, true)
-        if target == "phase=HIGH" then equal(ok, false)
+        if target == "event=START" then equal(ok, false)
         else assert(ok); f.finish() end
         equal(f.probe.status().state, "STOPPED")
-        equal(#f.events_of("setup"), 1)
         quiescent(f)
     end
 end)

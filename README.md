@@ -59,3 +59,7 @@ Lua 5.1 模拟测试全部通过：换水状态机 17 项、硬件适配器 24 �
 上述记录尚不足以填入补水/排水泵配置。液位板反馈必须是已确认隔离且不带外来电压的触点，或匹配 1.8V 的隔离接口；不能把探针或 12V 直接接 GPIO。具体约束见自动换水说明。
 
 历史诊断源码与测试保留，不在新版启动路径中。快速接续见 [项目记忆](MEMORY.md)，完整记录见 [AGENTS.md](AGENTS.md)、[连接与诊断历史](docs/diagnostic-history.md)、[板级控制分析](docs/board-control-analysis.md)。
+
+## 网站入口
+
+项目入口：https://bytegallop.com/water/ 。当前仅提供静态项目页，设备网络接入与网页控制尚未配置。部署脚本、Nginx 片段及操作说明见 [网站部署](docs/deployment.md)。本地仓库位于 `E:\water-auto-exchange`。

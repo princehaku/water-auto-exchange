@@ -35,7 +35,15 @@
 - 本地 LuaTools 项目 `tools/vendor/luatools/project/water-exchange.ini` 已配置五文件：`main.lua`、`water_config.lua`、`water_cycle.lua`、`water_control.lua`、`water_usb.lua`。若界面仍是旧清单，重新载入核对。默认库已含 `sys`，每个 `require` 单独一行以兼容依赖解析。
 - 新主机工具：`tools/water-command.ps1 -Port COM4 -Command STATUS`，支持 `STATUS/START/FILL/STOP/RESET`，先核对 `water_auto_exchange 0.3.0`。COM 编号可能变化；旧 motor/probe 命令仅用于历史诊断。
 - `fill/drain` 是软件记录，不是电压或流量测量；`outputs_known=0` 表示未初始化或写入结果不确定。API 使用旧 `pins/pio/sys`，不能套新版 `gpio.setup`。
-- Git：分支 `main`，远程 `git@github.com:princehaku/water-auto-exchange.git`。用户本次明确要求先更新 MEMORY/AGENTS 再提交推送；这不是以后每次修改自动推送的授权。
+- Git：分支 `main`，远程 `git@github.com:princehaku/water-auto-exchange.git`。用户最新持续要求：每次完成代码修改并验证后都要 commit 和 push；使用中文标准提交信息（feat:、fix: 等），提交前同步必要的项目记录。
 - `.gitignore` 排除 `logs/`、`build/`、`tools/vendor/` 及固件二进制。此次同步代码、测试和文档，不把工具包、驱动、日志或临时照片加入仓库；其他机器按 README 重建本地 LuaTools 项目。
 
 详细使用见 [自动换水说明](docs/water-control.md)，硬件依据见 [板级分析](docs/board-control-analysis.md)，原始诊断过程见 [诊断历史](docs/diagnostic-history.md)。
+
+## 网站部署接续（2026-09-06）
+
+- 仓库已克隆到 `E:\water-auto-exchange`，分支 `main`。
+- 新增独立入口 `https://bytegallop.com/water/`；当前为静态项目页，设备网络接入和网页控制尚未配置。网站健康状态不表示设备在线。
+- 部署资料统一放在 `deploy/` 和 [docs/deployment.md](docs/deployment.md)，包含环境路径、SSH 端口、更新、备份和回滚；后续部署先读该文档。
+- 网站上线不改变板端源码版本、刷写状态或 GPIO 配置。原有硬件约束继续有效。
+- 已验证公网跳转、页面/健康文件内容、缺失资源 404 和 `/sms` 健康；Nginx 配置检查通过，浏览器确认入口正常显示。

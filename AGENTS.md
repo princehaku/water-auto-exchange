@@ -15,7 +15,7 @@
 - 纯状态机 `water_cycle` 用冒号方法；硬件适配器 `water_control.new(config,deps)` 返回无 self 的点调用方法。使用 V2.4.4 `rtos.tick()/16` 毫秒时基并处理 32 位回绕。读取/时钟异常清除稳定样本，恢复后须重新完整防抖才能 RESET。关断错误须附加显示，不能被原故障原因覆盖。
 - LuaTools `tools/vendor/luatools/project/water-exchange.ini` 已换成 `main.lua/water_config.lua/water_cycle.lua/water_control.lua/water_usb.lua` 五文件，保留 CORE/default_lib。工具 vendor 目录被 Git 忽略，其他机器须按 README 重建项目清单。旧 motor/probe 源码及测试保留供历史查阅。
 - **板上状态与本地版本区分：尚未下载 0.3.0；最近实读板上是已 STOP 的 0.2.8。** 旧版重启仍会扫描，不能据新源码宣称板上已待机。用户亲自点击 LuaTools“下载脚本”，不要替用户刷写；若界面文件清单未更新需先重新载入项目。
-- 使用说明见 `docs/water-control.md`；原 README 完整保留在 `docs/diagnostic-history.md`。用户最新明确要求“push到远程，记得更新memory和agent再推送”，本次已授权整理记录、提交并推送；不自动提交/推送以后未获授权的更改。
+- 使用说明见 `docs/water-control.md`；原 README 完整保留在 `docs/diagnostic-history.md`。用户最新明确要求“push到远程，记得更新memory和agent再推送”，本次已授权整理记录、提交并推送；用户最新持续要求每次修改验证后都要 commit 和 push，使用中文标准提交信息。
 - 0.3.0 本地检查已完成：Lua 5.1 测试 82/82（状态机17、硬件适配器24、USB/启动14、旧电机/USB15、旧诊断12），官方 LuaFLOAT 语法、PowerShell 解析、LuaTools 五文件/依赖/CORE/版本及 UTF-8 文档核对通过。未操作真实串口/输出，未刷写。模拟测试不能当作硬件联调结果。
 
 ## 实际应用目标：水位监测与自动换水
@@ -197,6 +197,13 @@
 - 首次 Git 初始化按用户要求设置 `origin=git@github.com:princehaku/water-auto-exchange.git`，把分支从 master 改为 main，并成功 `git push -u origin main`；当时提交为 `9fa230d`（`feat: new`）。这是历史提交，不表示当前本地全部更改已同步。
 - 2026-09-06 用户明确授权本次先更新 memory 和 agent，再提交推送现有项目成果。`MEMORY.md` 记录当前接续状态，`AGENTS.md` 保留完整规则和证据；提交成功与远程同步结果须据实际 Git 输出核对，不提前写成成功。
 - `.gitignore` 排除 `logs/`、`build/`、`tools/vendor/` 及固件二进制；不要把本地驱动、工具大包、日志和设备身份数据顺手提交。
-- 需要提交或推送时先读取最新 Git 状态，保留用户改动；这份摘要不代表要求每次修改都自动提交或推送。
+- 需要提交或推送时先读取最新 Git 状态，保留用户改动；按用户最新持续要求，每次修改验证后都要 commit 和 push，使用中文标准提交信息。
 - 现行源码 0.3.0 已完成、默认 UNCONFIGURED、开机只打印状态；最近实测板上仍为 0.2.8，已核对 3 候选、30000 ms 并 STOP，旧固件重启仍会扫描。接续硬件联调先确认泵/阀规格、输出有效电平与液位板隔离反馈接线，再填写 `water_config.lua`；不能把 Git 推送或源码更新当作已刷写。
 - GPIO23 列为 DO2 强候选；若继续实测，应单独区分 LOW 与释放后的关断效果，不能把两阶段均 12V 写成高低开关验证成功。用户已选择跳过 RD2D 近照辨认，不再要求近照，不复扫旧 20 脚，不默认拉高 GPIO5。GPIO5/12 的功能观察、低电平未确认状态及 RD2D 候选继续保留；历史电机 3 秒通断测试不得替代自动换水逻辑。
+
+## 网站与部署约定（2026-09-06）
+
+- 本地项目目录为 `E:\water-auto-exchange`；网站入口为 `https://bytegallop.com/water/`。
+- 当前网站仅为独立静态项目页，尚无 Web 后端或网络设备控制。不得将网站可访问当作设备在线、0.3.0 已刷写或实际换水验证。
+- 部署资料见 [docs/deployment.md](docs/deployment.md)，静态页及脚本在 `deploy/`；沿用现有 Nginx HTTPS 站点，与 `/sms/` 分开。修改站点配置须先备份、`nginx -t` 后 reload，并回归 `/sms/api/health`。
+- 私钥、密码、Token、日志和工具包不得提交。后续修改验证完成后按用户持续要求 commit 并 push。

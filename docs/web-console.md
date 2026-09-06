@@ -1,10 +1,10 @@
 # Web 控制台与 4G 接入
 
-设备通过 Air724UG 自带 4G 网络直接访问 `https://bytegallop.com/water/`，无需电脑常开。网页提供管理密钥登录、在线状态、补水请求、软件输出、故障说明、START / FILL / STOP / RESET 和最近 60 条操作记录。当前为单设备控制台，不配置未经确认的定时换水或自动补水规则。
+设备通过 Air724UG 自带 4G 网络建立 WSS 长连接，网页入口为 `https://bytegallop.com/water/`，无需电脑常开。网页提供管理密钥登录、在线状态、补水请求、软件输出、故障说明、START / FILL / STOP / RESET 和最近 60 条操作记录。当前为单设备控制台，不配置未经确认的定时换水或自动补水规则。
 
 ## 软件与实板边界
 
-本轮板端源码为 **0.4.0**，板上最近历史实读仍为已 STOP 的 0.2.8。默认 GPIO 配置继续禁用。本轮未刷写、未启动泵，电脑未枚举到串口；网页可访问不能证明设备在线。接线、启停电平、液位反馈和真实水流仍需实测。
+本轮板端源码为 **0.5.0**，板上最近历史实读仍为已 STOP 的 0.2.8。默认 GPIO 配置继续禁用。本轮未刷写、未启动泵，电脑未枚举到串口；网页可访问不能证明设备在线。接线、启停电平、液位反馈和真实水流仍需实测。
 
 ## 管理员登录
 
@@ -17,42 +17,46 @@
 1. 准备可联网的 SIM、天线和供电；板端输出仍保持禁用，先验证网络及状态上报。GPIO23 复用 SIM 在位检测的硬件约束继续有效，不能据此猜测泵映射。
 2. 本轮已提供 `build/device.private.json`。后续使用自己的 JSON 文件，格式为 `{"url":"https://bytegallop.com/water","device_key":"填入设备密钥"}`。
 3. 在仓库运行 `python tools/build-firmware.py --config build/device.private.json`。脚本复制源码到 `build/firmware/`，仅在该目录启用联网并填入设备密钥，源文件与 GPIO 配置保持原状。
-4. 在 LuaTools 的 water-exchange 项目中，删除旧文件条目，再按 `build/firmware/flash-files.txt` 加入 **7 个 Lua 文件和 1 个 CA 证书**。全部路径均来自同一个生成目录。保留现有 CORE、默认 LuaTask V2.4.4 库及 USB trace。每条 require 独占一行；JSON 为 CORE 内置全局模块。
-5. 用户亲自点“下载脚本”。下载后核对 `project=water_auto_exchange version=0.4.0`、`UNCONFIGURED`、零输出配置，并查看登录后的网页是否出现真实上报。网络启用后自动建立会话，约每 2 秒轮询一次；TLS/PDP 初始化时间取决于网络。
+4. 在 LuaTools 的 water-exchange 项目中，删除旧文件条目，再按 `build/firmware/flash-files.txt` 加入 **8 个 Lua 文件和 1 个 CA 证书**。全部路径均来自同一个生成目录。保留现有 CORE、默认 LuaTask V2.4.4 库及 USB trace。每条 require 独占一行；JSON 为 CORE 内置全局模块。
+5. 用户亲自点“下载脚本”。下载后核对 `project=water_auto_exchange version=0.5.0`、`UNCONFIGURED`、零输出配置，并查看登录后的网页是否出现真实上报。网络启用后自动建立 WSS 长连接，空闲每 30 秒应用心跳，状态变化立即上报；TLS/PDP 初始化时间取决于网络。
 6. 只有确认输出启停、液位板隔离反馈接线与超时参数后，才修改 `src/water_config.lua`，重新生成整包、验证、提交并推送，再由用户刷写。不能直接在生成目录内做长期配置修改，重新生成会覆盖该目录文件。
 
-下载清单：`main.lua`、`water_config.lua`、`water_cycle.lua`、`water_control.lua`、`water_usb.lua`、`water_network.lua`、`water_network_config.lua`、`water-ca.crt`。
+下载清单：`main.lua`、`water_config.lua`、`water_cycle.lua`、`water_control.lua`、`water_usb.lua`、`water_network.lua`、`water_network_config.lua`、`water_ws_transport.lua`、`water-ca.crt`。
 
-TLS 强制提供 CA 文件并开启 SNI。CA 来源与指纹见 [证书说明](../certs/README.md)。当前证书链已在服务器侧验证；Air724UG 实板 TLS 握手仍待验证。禁止通过删除 CA 配置来绕过证书校验。网络依赖按 [合宙 HTTP API](https://docs.openluat.com/air724ug/luatos/app/socket/http/) 和本机 V2.4.4 `http.lua` / `socket4G.lua` 核对。
+TLS 强制提供 CA 文件并开启 SNI。CA 来源与指纹见 [证书说明](../certs/README.md)。当前证书链已在服务器侧验证；Air724UG 实板 TLS 握手仍待验证。禁止通过删除 CA 配置来绕过证书校验。网络接口按本机 V2.4.4 `sys.lua` / `socket4G.lua` 核对：connect/send 超时单位为秒，recv 为毫秒。
 
-## 操作和故障语义
+## WSS 通信与操作语义
 
-- 上报超过 10 秒未更新，网页显示离线，服务器拒绝所有新控制命令；不缓存离线启动请求。
-- START 需要待机或 DONE、输入稳定、无补水请求且输出记录确定；FILL 需要补水请求有效。板端在执行时再次检查所有条件。
-- 命令有效期 8 秒，交付一次。网页提交仅代表入队；设备回执决定最终结果。回执丢失会显示“结果待核实”，禁止自动重发 START/FILL。
-- STOP 优先领取并取消仍在排队的命令。已交付动作仍须等待实际 STOP 回执；不能把点击按钮当作已经断电。
-- 4G 请求的本地总截止为 5 秒；请求失败或超过截止会尝试停止由远程命令启动的周期。另有 10 秒通信看门狗。USB 独立启动的本地周期保留其原有超时保护。
-- 重连建立新会话，服务端取消旧会话未完成命令；旧会话最近仍有通信时最多等待 15 秒再允许替换。断电/服务重启不恢复泵运行。
-- USB STOP 会作废在途远程响应并切换会话；过期 HTTP 回调和重复命令 ID 不启动输出。
-- HTTP 库每个子过程各有超时，因此程序另外设置总截止；一次只保留一个请求。若库异常永久不回调，网络控制保持停机，需排查日志后重启，不持续创建新协程。
-- RESET 仍由板端检查故障与稳定输入；清除成功后保持待机。
-- 网络 STOP 写入失败会打印 `stop_unconfirmed`，硬件适配器保留输出不确定/故障信息。软件无法替代独立硬件断流。
+设备连接 `wss://bytegallop.com/water/api/device/ws`。服务端主动推送命令，设备空闲每 30 秒发送小型应用心跳；状态变化立即上报。换水期间每 2 秒发送小心跳，10 秒收不到服务器有效回复会尝试停止远程启动的周期。网页自身的 HTTP 刷新发生在浏览器与服务器之间，不触发设备轮询。
+
+- 状态不变时不重复上传完整状态，不自动回退到 HTTP 轮询。断线立即标记离线，半开连接空闲最多 75 秒判离线；活动状态最多 10 秒。
+- 握手后先认证，设备密钥只在 TLS 加密消息中传送，不放 URL；认证前不读取设备状态、不交付命令。诊断 `probe` 只检查鉴权，不注册设备或更改线上记录。
+- 命令有效期仍为 8 秒。服务器推送 offer，设备发送 claim 并记录本地单调时钟；服务器检查剩余有效期后返回 execute。设备再检查 claim 往返耗时与剩余有效期，避免延迟缓存的旧命令启动输出。命令交付、执行与设备回执分别记录，回执丢失显示“结果待核实”，不自动重发 START/FILL。
+- START/FILL/RESET 仍由原控制器检查液位、防抖、互锁、超时和故障。STOP 优先，取消仍排队的命令；设备收到 STOP offer 会清除尚未执行的其他 claim。
+- USB STOP 会作废在途远程响应并关闭当前连接；新连接创建新会话，旧命令不能恢复泵。远程 STOP 保留连接以便立即回传结果。
+- `water_ws_transport.lua` 的单一任务持有 socket；connect/send/recv/close 直接在该任务中执行，不放进外层 pcall。业务调用 send 只入队，不直接等待底层 SOCKET_SEND。
+- 收发支持 TCP 分包、粘包、126 字节边界、WebSocket 分片及 Ping/Pong。每条消息上限 8192 字节，发送队列上限 8 条；异常输入、队列失败及超时会断线并尝试关闭远程输出。应用/传输层不打印认证消息，认证固定前缀避免底层 socket 调试预览包含密钥。
+- 失败重连按 1、2、4 秒逐步延长，最多 60 秒；连接稳定达到 60 秒后重置退避。连接失败和身份拒绝不会每秒重新握手。不可恢复的任务异常或时钟异常停止网络控制，需排查后重启。
+- 初期 TLS 握手依然有流量开销。长连接避免每 2 秒重复 TCP/TLS/HTTP 请求；实际运营商流量仍需实板测量，不据模拟测试填写节省百分比。
+- TLS 必须携带 CA、SNI，并设置 `insist=0` 拒绝证书域名校验失败。板端实际 TLS 握手与长时间在线仍待用户刷写验证。
+- 网络 STOP 写入失败会打印 `stop_unconfirmed`，硬件适配器继续显示输出不确定或故障；软件无法替代独立硬件断流。
 
 ## USB 调试网关（可选）
 
-独立 4G 是当前主接入方式。USB 工具用于本地调试，支持 0.3.0/0.4.0 协议；不要与板端 4G 同时连接同一控制台，也不要与 LuaTools/其他串口工具争用用户口。
+独立 4G 是当前主接入方式。USB 工具用于本地调试，支持 0.3.0/0.5.0 协议；不要与板端 4G 同时连接同一控制台，也不要与 LuaTools/其他串口工具争用用户口。
 
 ```powershell
 python -m pip install -r tools/requirements-gateway.txt
 python tools/water-gateway.py --port COM4 --config build/device.private.json
 ```
 
-先重新枚举并确认用户串口。网关启动、断网或退出时尝试 STOP；仅在识别出正确项目和支持版本后发送控制命令。当前 0.4.0 纯 USB 主机命令使用 `tools/water-command.ps1`。
+先重新枚举并确认用户串口。网关启动、断网或退出时尝试 STOP；仅在识别出正确项目和支持版本后发送控制命令。当前 0.5.0 纯 USB 主机命令使用 `tools/water-command.ps1`。
 
 ## 验证
 
 ```powershell
-python -m unittest discover -s tests -p test_web.py
+python -m pip install -r server/requirements.txt websocket-client
+python -m unittest discover -s tests -p "test_web*.py"
 # 以下测试工具可安装到 .venv，避免改变全局环境。
 python -m pip install lupa playwright
 python tools/test-lua.py

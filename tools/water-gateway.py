@@ -13,7 +13,7 @@ def parse_status(line):
     if not line.startswith('OK STATUS '):
         raise ValueError('status_missing')
     result = dict(word.split('=', 1) for word in line.split()[2:] if '=' in word)
-    if result.get('project') != 'water_auto_exchange' or result.get('version') not in ('0.3.0', '0.4.0'):
+    if result.get('project') != 'water_auto_exchange' or result.get('version') not in ('0.3.0', '0.4.0', '0.5.0'):
         raise ValueError('firmware_mismatch')
     return result
 

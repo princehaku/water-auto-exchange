@@ -33,7 +33,7 @@ def main():
     server.origin = 'http://127.0.0.1:' + str(server.server_port)
     worker = threading.Thread(target=server.serve_forever, daemon=True)
     worker.start()
-    status = dict(project='water_auto_exchange', version='0.4.0', state='IDLE', reason='ready',
+    status = dict(project='water_auto_exchange', version='0.5.0', state='IDLE', reason='ready',
                   ready='1', fill='0', drain='0', outputs_known='1', need_fill='0',
                   overflow='0', cycle='0', overflow_protection='0')
     device = 'a' * 32

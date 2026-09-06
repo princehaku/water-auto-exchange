@@ -1,0 +1,178 @@
+-- Bounded WSS client for LuatOS-Air. All yielding socket calls run in ONE task.
+local M = {}
+local LIMIT = 8192
+
+local function xor(a, b)
+    local value, place = 0, 1
+    for _ = 1, 8 do
+        if a % 2 ~= b % 2 then value = value + place end
+        a, b, place = math.floor(a / 2), math.floor(b / 2), place * 2
+    end
+    return value
+end
+
+function M.frame(data, opcode, mask)
+    assert(type(data) == "string" and #data <= LIMIT and #mask == 4, "invalid_frame")
+    local header = string.char(128 + (opcode or 1))
+    if #data < 126 then header = header .. string.char(128 + #data)
+    else header = header .. string.char(254, math.floor(#data / 256), #data % 256) end
+    local parts = {header, mask}
+    for i = 1, #data do parts[#parts + 1] = string.char(xor(data:byte(i), mask:byte((i - 1) % 4 + 1))) end
+    return table.concat(parts)
+end
+
+function M.parser()
+    local buffer, fragments, fragment_size, fragment_opcode = "", {}, 0, nil
+    return function(chunk)
+        buffer = buffer .. chunk
+        local events = {}
+        while #buffer >= 2 do
+            local a, b = buffer:byte(1, 2)
+            local fin, opcode = a >= 128, a % 16
+            assert(math.floor(a / 16) % 8 == 0 and b < 128, "invalid_server_frame")
+            local size, offset = b, 2
+            if size == 127 then error("frame_too_large") end
+            if size == 126 then
+                if #buffer < 4 then break end
+                size, offset = buffer:byte(3) * 256 + buffer:byte(4), 4
+                assert(size >= 126, "nonminimal_length")
+            end
+            assert(size <= LIMIT and (opcode < 8 or (fin and size <= 125)), "frame_too_large")
+            if #buffer < offset + size then break end
+            local payload = buffer:sub(offset + 1, offset + size)
+            buffer = buffer:sub(offset + size + 1)
+            if opcode == 8 or opcode == 9 or opcode == 10 then
+                assert(opcode ~= 8 or #payload ~= 1, "invalid_close")
+                events[#events + 1] = {opcode = opcode, data = payload}
+            else
+                assert(opcode == 0 or opcode == 1 or opcode == 2, "unsupported_opcode")
+                if opcode == 0 then assert(fragment_opcode, "unexpected_continuation")
+                else assert(not fragment_opcode, "unfinished_message"); fragment_opcode = opcode end
+                fragment_size = fragment_size + #payload
+                assert(fragment_size <= LIMIT, "message_too_large")
+                fragments[#fragments + 1] = payload
+                if fin then
+                    events[#events + 1] = {opcode = fragment_opcode, data = table.concat(fragments)}
+                    fragments, fragment_size, fragment_opcode = {}, 0, nil
+                end
+            end
+        end
+        assert(#buffer <= LIMIT + 4, "buffer_too_large")
+        return events
+    end
+end
+
+local function unhex(value)
+    return (value:gsub("..", function(pair) return string.char(tonumber(pair, 16)) end))
+end
+
+function M.new(config, callbacks, deps)
+    deps = deps or {}
+    local sys = deps.sys or require "sys"
+    local socket = deps.socket or require "socket"
+    local crypto = deps.crypto or _G.crypto
+    local client = {queue = {}, connected = false, cancelled = false}
+    local event, serial = "WATER_WS_WAKE", 0
+    local function random_bytes(length)
+        serial = serial + 1
+        local value = config.device_key .. ":" .. tostring(os.time()) .. ":" .. tostring(rtos.tick()) .. ":" .. serial
+        return unhex(crypto.sha1(value, #value)):sub(1, length)
+    end
+    local function notify(name, ...)
+        if callbacks[name] then
+            local ok = pcall(callbacks[name], ...)
+            if not ok then client.cancelled = true end
+        end
+    end
+    function client:send(value)
+        if not self.connected or self.cancelled or #self.queue >= 8 or type(value) ~= "string" or #value > LIMIT then return false end
+        self.queue[#self.queue + 1] = value
+        sys.publish(event)
+        return true
+    end
+    function client:close(permanent)
+        if permanent then self.stopped = true end
+        self.cancelled = true
+        self.queue = {}
+        sys.publish(event)
+    end
+    local function run_connection(io)
+        local host, path = config.url:match("^wss://([%w%.%-]+)(/.*)$")
+        if not io:connect(host, 443, 10) or client.cancelled then return end
+        local key = crypto.base64_encode(random_bytes(16), 16)
+        local request = "GET " .. path .. " HTTP/1.1\r\nHost: " .. host .. "\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: " .. key .. "\r\n\r\n"
+        if not io:send(request, 5) then return end
+        local response, boundary = "", nil
+        -- recv is milliseconds; connect/send use seconds in socket4G V2.4.4.
+        local started = rtos.tick() % 4294967296
+        repeat
+            local ok, chunk = io:recv(1000, event)
+            if ok then response = response .. chunk
+            elseif chunk ~= "timeout" and chunk ~= event then return end
+            if #response > 16384 or client.cancelled then return end
+            boundary = response:find("\r\n\r\n", 1, true)
+            if (rtos.tick() - started) % 4294967296 >= 160000 then return end
+        until boundary
+        local headers = response:sub(1, boundary + 3)
+        local accept_source = key .. "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+        local expected = crypto.base64_encode(unhex(crypto.sha1(accept_source, #accept_source)), 20)
+        local fields = {}
+        for name, value in headers:gmatch("\r\n([^:]+):%s*([^\r\n]+)") do fields[name:lower()] = value end
+        if not headers:match("^HTTP/1%.1 101 ") or fields["sec-websocket-accept"] ~= expected
+            or (fields.upgrade or ""):lower() ~= "websocket"
+            or not (fields.connection or ""):lower():find("upgrade",1,true) then return end
+        client.connected = true
+        client.connected_at = rtos.tick()
+        notify("open")
+        local parse = M.parser()
+        local pending = response:sub(boundary + 4)
+        while not client.cancelled do
+            if #pending > 0 then
+                local ok, events = pcall(parse, pending)
+                if not ok then return end
+                for _, item in ipairs(events) do
+                    if item.opcode == 8 then return
+                    elseif item.opcode == 9 then
+                        if not io:send(M.frame(item.data, 10, random_bytes(4)), 5) then return end
+                    elseif item.opcode == 1 or item.opcode == 2 then notify("message", item.data) end
+                    if client.cancelled then return end
+                end
+            end
+            while #client.queue > 0 and not client.cancelled do
+                local value = table.remove(client.queue, 1)
+                if not io:send(M.frame(value, 1, random_bytes(4)), 5) then return end
+            end
+            local ok, chunk = io:recv(1000, event)
+            pending = ok and chunk or ""
+            if not ok and chunk ~= "timeout" and chunk ~= event then return end
+        end
+    end
+    function client:start()
+        self.task = sys.taskInit(function()
+            local backoff = 1000
+            while not client.stopped do
+                client.cancelled = false
+                while not socket.isReady() and not client.stopped do sys.wait(1000) end
+                if client.stopped then return end
+                local io = socket.tcp(true, {caCert = config.ca_cert, hostNameFlag = 1, insist = 0})
+                if io then
+                    -- Never put these yielding operations inside pcall/xpcall.
+                    run_connection(io)
+                    io:close()
+                end
+                local stable = client.connected and (rtos.tick() - client.connected_at) % 4294967296 >= 960000
+                client.connected, client.queue = false, {}
+                notify("close")
+                if stable then backoff = 1000 end
+                sys.wait(backoff)
+                backoff = math.min(backoff * 2, 60000)
+            end
+        end)
+    end
+    function client:failed()
+        return type(self.task) == "thread" and coroutine.status(self.task) == "dead" and not self.stopped
+    end
+    return client
+end
+
+return M

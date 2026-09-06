@@ -1,0 +1,4 @@
+# Last wsproto/h11 releases supporting the host's Python 3.6 runtime.
+wsproto==1.0.0
+h11==0.12.0
+dataclasses==0.8; python_version < "3.7"

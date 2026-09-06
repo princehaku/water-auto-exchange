@@ -5,7 +5,7 @@
 公网入口为 https://bytegallop.com/water/，`/water` 使用 308 跳转到带斜杠路径并保留查询参数。
 当前上线内容是 Web 控制台和 Python/SQLite API，支持设备通过 4G 独立接入。`health.json` 与 `/water/api/health` 仅说明网站/API 可用；设备在线状态来自登录后的 `/water/api/status`。完整流程见 [Web 与 4G 接入](web-console.md)。
 
-板端源码为 0.4.0，最近历史实读板端为已 STOP 的 0.2.8。本次部署不刷写板端、不改变 GPIO 配置。
+板端源码为 0.5.0，最近历史实读板端为已 STOP 的 0.2.8。本次部署不刷写板端、不改变 GPIO 配置。
 
 ## 环境与路径
 
@@ -76,3 +76,14 @@ ls -lt /root/apps/water-auto-exchange/backups/
 ## 控制台上线验收
 
 2026-09-07（北京时间）：已部署并实测公网 HTTPS 登录/退出、设备离线与控制禁用、空操作记录及桌面/手机布局；四个静态文件与本地逐字节一致。API health 200、匿名 status 401、缺失资源 404、/water 308 保留查询参数，主站及 /sms 健康正常，Nginx 检查通过、water-console 服务 active。未向线上设备发送测试命令。部署备份：`/root/apps/water-auto-exchange/backups/20260906T182029Z-1468822/`。
+
+
+## WSS 升级（2026-09-07）
+
+新增 `/water/api/device/ws` 精确路由，Nginx 转发 HTTP/1.1 Upgrade，关闭缓冲，读超时 90 秒。API 版本 1.1.0，设备主连接为 WSS；旧 HTTP 接口仅用于手动 USB 调试网关兼容。
+
+新增 `/opt/water-console/ws_endpoint.py`；固定依赖见 `server/requirements.txt`，安装到独立 `/opt/water-console/vendor`，通过 systemd PYTHONPATH 加载。宿主 Python 3.6 对应 wsproto 1.0.0 / h11 0.12.0 / dataclasses 0.8，安装使用 HTTPS 软件源，不改变 /sms 的依赖。
+
+部署备份和回滚现在包含 ws_endpoint.py。公网验证 101 升级、已鉴权 probe 和错误密钥拒绝；probe 不登记设备、不添加命令。管理登录密码配置在升级中保留。
+
+WSS 最终部署备份：`/root/apps/water-auto-exchange/backups/20260906T185244Z-1474880/`；重复部署保留凭据、依赖和数据，部署后再次验证公网鉴权 probe 及 /sms 健康。

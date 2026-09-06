@@ -1,4 +1,4 @@
-"""Single-controller console. Python 3.6+, standard library only."""
+"""Single-controller console. Python 3.6+, wsproto for WebSocket framing."""
 import hashlib
 import hmac
 import json
@@ -23,7 +23,7 @@ class Problem(Exception):
 def validate_status(value):
     if not isinstance(value, dict):
         raise Problem(400, 'invalid_status')
-    if value.get('project') != 'water_auto_exchange' or value.get('version') not in ('0.3.0', '0.4.0'):
+    if value.get('project') != 'water_auto_exchange' or value.get('version') not in ('0.3.0', '0.4.0', '0.5.0'):
         raise Problem(409, 'firmware_mismatch')
     if value.get('state') not in ('UNCONFIGURED', 'IDLE', 'DONE', 'FAULT') + ACTIVE:
         raise Problem(400, 'invalid_state')
@@ -59,6 +59,7 @@ class Store:
         self.db.commit()
         self.status, self.seen, self.gateway = None, None, None
         self.gateway_seen = 0
+        self.ws_gateway = None
 
     def expire(self):
         now = self.clock()
@@ -66,7 +67,8 @@ class Store:
         self.db.commit()
 
     def online(self):
-        return self.seen is not None and self.clock() - self.seen <= 10
+        limit = 75 if self.ws_gateway and self.status and self.status['state'] not in ACTIVE else 10
+        return self.seen is not None and self.clock() - self.seen <= limit
 
     def snapshot(self):
         with self.lock:
@@ -109,7 +111,7 @@ class Store:
             raise Problem(400, 'invalid_gateway')
         with self.lock:
             now = self.clock()
-            if self.gateway is not None and self.gateway != gateway and self.gateway_seen > now - 15:
+            if self.ws_gateway or (self.gateway is not None and self.gateway != gateway and self.gateway_seen > now - 15):
                 raise Problem(409, 'another_gateway_active')
             # A new gateway does not inherit a previous session's pending work.
             if self.gateway != gateway:
@@ -130,13 +132,69 @@ class Store:
     def hello(self):
         with self.lock:
             now = self.clock()
-            if self.gateway is not None and self.gateway_seen > now - 15:
+            if self.ws_gateway or (self.gateway is not None and self.gateway_seen > now - 15):
                 raise Problem(409, 'previous_session_active')
             self.db.execute("UPDATE commands SET status='uncertain', result='device_reconnected', finished=? WHERE status IN ('queued','delivered')", (now,))
             self.db.commit()
             self.gateway = secrets.token_hex(16)
             self.gateway_seen, self.seen = now, None
             return dict(gateway=self.gateway)
+
+    def ws_open(self, status):
+        status = validate_status(status)
+        with self.lock:
+            if self.ws_gateway or (self.gateway and self.gateway_seen > self.clock() - 15):
+                raise Problem(409, 'another_device_active')
+            self.ws_gateway = self.gateway = secrets.token_hex(16)
+            self.db.execute("UPDATE commands SET status='uncertain', result='device_reconnected' WHERE status IN ('queued','delivered')")
+            self.db.commit()
+            self.status, self.seen = status, self.clock()
+            self.gateway_seen = self.seen
+            return self.ws_gateway
+
+    def ws_touch(self, session, status=None, ack=None):
+        with self.lock:
+            if session != self.ws_gateway:
+                raise Problem(409, 'stale_session')
+            if status is not None:
+                self.status = validate_status(status)
+            if ack is not None:
+                if not isinstance(ack, dict) or ack.get('status') not in ('succeeded', 'rejected', 'uncertain') or not isinstance(ack.get('result'), str) or len(ack['result']) > 256 or not isinstance(ack.get('id'), str):
+                    raise Problem(400, 'invalid_ack')
+                self.db.execute("UPDATE commands SET status=?, result=?, finished=? WHERE id=? AND status IN ('delivered','uncertain')", (ack['status'], ack['result'], self.clock(), ack['id']))
+                self.db.commit()
+            self.seen = self.gateway_seen = self.clock()
+
+    def ws_offer(self, session):
+        with self.lock:
+            if session != self.ws_gateway:
+                return None
+            self.expire()
+            row = self.db.execute("SELECT * FROM commands WHERE status='queued' ORDER BY CASE command WHEN 'STOP' THEN 0 ELSE 1 END, created LIMIT 1").fetchone()
+            if not row:
+                return None
+            self.db.execute("UPDATE commands SET status='delivered' WHERE id=?", (row['id'],))
+            self.db.commit()
+            return dict(type='offer', id=row['id'], command=row['command'])
+
+    def ws_claim(self, session, command_id):
+        with self.lock:
+            if session != self.ws_gateway or not isinstance(command_id, str):
+                raise Problem(409, 'stale_session')
+            self.expire()
+            row = self.db.execute("SELECT * FROM commands WHERE id=? AND status='delivered'", (command_id,)).fetchone()
+            if not row:
+                return dict(type='expired', id=command_id)
+            return dict(type='execute', id=row['id'], command=row['command'], ttl_ms=max(0, int((row['expires'] - self.clock()) * 1000)))
+
+    def ws_close(self, session):
+        with self.lock:
+            if session != self.ws_gateway:
+                return
+            self.db.execute("UPDATE commands SET status='uncertain', result='device_disconnected', finished=? WHERE status IN ('queued','delivered')", (self.clock(),))
+            self.db.commit()
+            self.ws_gateway = self.gateway = None
+            self.gateway_seen, self.seen = 0, None
 
 
 class Server(ThreadingMixIn, HTTPServer):
@@ -150,6 +208,8 @@ class Server(ThreadingMixIn, HTTPServer):
 
 
 class Handler(BaseHTTPRequestHandler):
+    # Avoid buffering WS frame bytes while the HTTP upgrade headers are parsed.
+    rbufsize = 0
     def log_message(self, *_):
         pass  # Never log credentials, bodies or URLs.
 
@@ -173,7 +233,14 @@ class Handler(BaseHTTPRequestHandler):
         if not 0 < length <= 8192:
             raise Problem(413, 'invalid_body_size')
         try:
-            value = json.loads(self.rfile.read(length).decode('utf-8'))
+            chunks, remaining = [], length
+            while remaining:
+                chunk = self.rfile.read(remaining)
+                if not chunk:
+                    raise Problem(400, 'incomplete_body')
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            value = json.loads(b''.join(chunks).decode('utf-8'))
         except (ValueError, UnicodeError):
             raise Problem(400, 'invalid_json')
         if not isinstance(value, dict):
@@ -196,8 +263,14 @@ class Handler(BaseHTTPRequestHandler):
         self.connection.settimeout(10)
         path = self.path.split('?')[0]
         post = self.command == 'POST'
+        if path == '/water/api/device/ws' and not post:
+            if __package__:
+                from .ws_endpoint import serve
+            else:
+                from ws_endpoint import serve
+            return serve(self)
         if path == '/water/api/health' and not post:
-            return self.respond(200, dict(ok=True, service='water-console', version='1.0.0'))
+            return self.respond(200, dict(ok=True, service='water-console', version='1.1.0', device_transport='wss'))
         if path in ('/water/api/device/poll', '/water/api/device/hello') and post:
             auth = self.headers.get('Authorization', '')
             if not hmac.compare_digest(auth, 'Bearer ' + self.server.device_key):

@@ -14,6 +14,7 @@ cp -p "$site" "$backup/bytegallop.conf"
 if [ -f "$snippet" ]; then cp -p "$snippet" "$backup/nginx-water.conf"; fi
 cp -a "$web" "$backup/web"
 if [ -f "$app" ]; then cp -p "$app" "$backup/app.py"; fi
+if [ -f /opt/water-console/ws_endpoint.py ]; then cp -p /opt/water-console/ws_endpoint.py "$backup/ws_endpoint.py"; fi
 if [ -f "$unit" ]; then cp -p "$unit" "$backup/water-console.service"; fi
 python3 - "$backup" <<'PY'
 import os
@@ -40,6 +41,7 @@ rollback() {
         if [ -f "$backup/web/$name" ]; then cp -p "$backup/web/$name" "$web/$name"; else rm -f -- "$web/$name"; fi
     done
     if [ -f "$backup/app.py" ]; then cp -p "$backup/app.py" "$app"; fi
+    if [ -f "$backup/ws_endpoint.py" ]; then cp -p "$backup/ws_endpoint.py" /opt/water-console/ws_endpoint.py; else rm -f /opt/water-console/ws_endpoint.py; fi
     if [ -f "$backup/water-console.service" ]; then
         cp -p "$backup/water-console.service" "$unit"
         systemctl daemon-reload
@@ -67,6 +69,10 @@ if not os.path.exists(path):
         f.write('WATER_ORIGIN=https://bytegallop.com\n')
 PY
 install -m 644 server/app.py "$app"
+install -m 644 server/ws_endpoint.py /opt/water-console/ws_endpoint.py
+if ! PYTHONPATH=/opt/water-console/vendor python3 -c 'import wsproto, h11; assert wsproto.__version__ == "1.0.0" and h11.__version__ == "0.12.0"' 2>/dev/null; then
+    python3 -m pip install --disable-pip-version-check --index-url https://mirrors.aliyun.com/pypi/simple/ --target /opt/water-console/vendor -r server/requirements.txt
+fi
 install -m 644 deploy/water-console.service "$unit"
 systemctl daemon-reload
 systemctl enable water-console

@@ -8,6 +8,7 @@ User=waterconsole
 Group=waterconsole
 EnvironmentFile=/etc/water-console.env
 Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONPATH=/opt/water-console/vendor
 ExecStart=/usr/bin/python3 /opt/water-console/app.py
 Restart=on-failure
 RestartSec=3

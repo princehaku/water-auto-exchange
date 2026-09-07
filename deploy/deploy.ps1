@@ -11,9 +11,9 @@ $bundle = Join-Path $buildDir "water-deploy.tar.gz"
 $remote = "${SshUser}@${ServerHost}"
 & tar -czf $bundle --exclude=__pycache__ --exclude=*.pyc -C $projectRoot deploy server docs/deployment.md docs/web-console.md README.md MEMORY.md AGENTS.md
 if ($LASTEXITCODE -ne 0) { throw "Archive failed" }
-& ssh -p $SshPort $remote "mkdir -p /root/apps/water-auto-exchange"
+& ssh -p $SshPort $remote "mkdir -p /apps/water-auto-exchange"
 if ($LASTEXITCODE -ne 0) { throw "Remote directory setup failed" }
-& scp -P $SshPort $bundle "${remote}:/root/apps/water-auto-exchange/deploy.tar.gz"
+& scp -P $SshPort $bundle "${remote}:/apps/water-auto-exchange/deploy.tar.gz"
 if ($LASTEXITCODE -ne 0) { throw "Upload failed" }
-& ssh -p $SshPort $remote "cd /root/apps/water-auto-exchange && tar -xzf deploy.tar.gz && bash deploy/install.sh"
+& ssh -p $SshPort $remote "cd /apps/water-auto-exchange && tar -xzf deploy.tar.gz && bash deploy/install.sh"
 if ($LASTEXITCODE -ne 0) { throw "Deployment failed" }

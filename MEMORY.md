@@ -1,5 +1,13 @@
 # 项目记忆
 
+## 2026-09-08 最新接续：集中目录与 Docker 部署
+
+- 用户要求服务器文件统一放 `/apps/water-auto-exchange` 并通过 Docker 启动。现行入口为 `deploy/deploy.ps1` → `/apps/water-auto-exchange/deploy/install.sh`；部署细节见 docs/deployment.md。本节优先于下方分散路径/systemd 历史记录。
+- 真实 Docker Engine 29.8.0 专用实例放 runtime/，使用独立 socket；服务器默认 docker 命令仍属 Podman，请用 `bash /apps/water-auto-exchange/deploy/docker.sh ...` 管理本项目。保留其他 Podman 业务及网络。
+- 容器 water-console 使用 Python 3.12、UID 10001、只读根目录、host 网络，仅监听 127.0.0.1:8790；unless-stopped 自动启动。数据 data/、私有配置 config/water.env、网页 www/water/、Nginx 项目配置 config/nginx-water.conf；共用宿主 Nginx/TLS，仅在系统目录保留项目符号链接。
+- 保留管理员密码与设备密钥，旧 systemd 应用服务停用；旧部署目录、应用、数据库、静态文件、私有配置和单元迁至 backups/legacy-systemd/。更新会先构建，再停旧服务、备份、重建容器并检测；自动回滚保留旧镜像。
+- Python 3.12 容器内 39 项 API/WS/网关测试通过，容器重启及重复部署验证通过。首次容器部署备份 backups/20260907T171333Z-1711105/；公网 WSS probe/鉴权拒绝、Web 登录/离线/退出、静态资源一致、/sms 健康和凭据一致检查通过。本轮未操作真实设备。
+
 ## 2026-09-08 最新接续：0.5.1 每秒心跳
 
 - 按用户要求，空闲与换水期间的 WSS 应用心跳统一为 1000ms，状态变化继续立即上报。活动通信超时仍为 10 秒，空闲半开检测仍为 75 秒；每秒心跳不表示一秒断网停机。

@@ -1,113 +1,73 @@
 #!/usr/bin/env bash
 set -euo pipefail
-cd -- "$(dirname -- "$0")/.."
-site=/etc/nginx/conf.d/bytegallop.conf
-snippet=/etc/nginx/snippets/water-auto-exchange.conf
-web=/var/www/water-auto-exchange/water
-app=/opt/water-console/app.py
-unit=/etc/systemd/system/water-console.service
+root=/apps/water-auto-exchange
+cd "$root"
+test "$(pwd -P)" = "$root"
+test -f /etc/nginx/snippets/water-auto-exchange.conf
+bash deploy/setup-docker.sh
+docker() { bash "$root/deploy/docker.sh" "$@"; }
+if ! docker image inspect python:3.12-slim >/dev/null 2>&1; then
+    if command -v podman >/dev/null && podman image exists docker.1ms.run/library/python:3.12-slim; then
+        podman save docker.1ms.run/library/python:3.12-slim | docker load
+        docker tag docker.1ms.run/library/python:3.12-slim python:3.12-slim
+    else
+        docker pull python:3.12-slim
+    fi
+fi
 stamp=$(date -u +%Y%m%dT%H%M%SZ)-$$
-backup="/root/apps/water-auto-exchange/backups/$stamp"
-test -f "$site"
-mkdir -p "$backup" /etc/nginx/snippets "$web" /opt/water-console
-cp -p "$site" "$backup/bytegallop.conf"
-if [ -f "$snippet" ]; then cp -p "$snippet" "$backup/nginx-water.conf"; fi
-cp -a "$web" "$backup/web"
-if [ -f "$app" ]; then cp -p "$app" "$backup/app.py"; fi
-if [ -f /opt/water-console/ws_endpoint.py ]; then cp -p /opt/water-console/ws_endpoint.py "$backup/ws_endpoint.py"; fi
-if [ -f "$unit" ]; then cp -p "$unit" "$backup/water-console.service"; fi
-python3 - "$backup" <<'PY'
-import os
-import sqlite3
-import sys
-source = '/var/lib/water-console/water.db'
-if os.path.isfile(source):
-    # backup() arrived in Python 3.7; use the SQLite CLI-independent SQL dump on 3.6.
-    connection = sqlite3.connect(source)
-    destination = os.path.join(sys.argv[1], 'water-db.sql')
-    fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(fd, 'w') as output:
-        for statement in connection.iterdump():
-            output.write(statement + '\n')
-    connection.close()
-PY
-was_active=0
-if systemctl is-active --quiet water-console; then was_active=1; fi
+image="water-console:$stamp"
+# Exclude runtime, data, backups and credentials from the build context.
+tar -cf - server deploy/Dockerfile | DOCKER_BUILDKIT=0 "$root/runtime/bin/docker" --host unix:///run/water-docker/docker.sock build --network host -f deploy/Dockerfile -t "$image" -
+backup="$root/backups/$stamp"
+install -d -m 700 "$backup" "$root/config"
+cp -L /etc/nginx/snippets/water-auto-exchange.conf "$backup/nginx-water.conf"
+if [ -d "$root/www" ]; then cp -a "$root/www" "$backup/www"; fi
+old_image=$(docker inspect --format '{{.Config.Image}}' water-console 2>/dev/null || true)
+printf '%s\n' "$old_image" > "$backup/previous-image.txt"
+old_active=0
+if systemctl is-active --quiet water-console; then old_active=1; fi
+run_container() {
+    docker run -d --name water-console --restart unless-stopped --network host \
+        --read-only --cap-drop ALL --security-opt no-new-privileges \
+        --tmpfs /tmp:rw,noexec,nosuid,size=16m --log-opt max-size=5m --log-opt max-file=3 \
+        --env-file "$root/config/water.env" -v "$root/data:/data" "$1"
+}
 rollback() {
     trap - ERR
-    cp -p "$backup/bytegallop.conf" "$site"
-    if [ -f "$backup/nginx-water.conf" ]; then cp -p "$backup/nginx-water.conf" "$snippet"; else rm -f -- "$snippet"; fi
-    for name in index.html health.json style.css app.js; do
-        if [ -f "$backup/web/$name" ]; then cp -p "$backup/web/$name" "$web/$name"; else rm -f -- "$web/$name"; fi
-    done
-    if [ -f "$backup/app.py" ]; then cp -p "$backup/app.py" "$app"; fi
-    if [ -f "$backup/ws_endpoint.py" ]; then cp -p "$backup/ws_endpoint.py" /opt/water-console/ws_endpoint.py; else rm -f /opt/water-console/ws_endpoint.py; fi
-    if [ -f "$backup/water-console.service" ]; then
-        cp -p "$backup/water-console.service" "$unit"
-        systemctl daemon-reload
-        if [ "$was_active" = 1 ]; then systemctl restart water-console; else systemctl stop water-console; fi
-    else
-        systemctl disable --now water-console || true
-        rm -f -- "$unit"
-        systemctl daemon-reload
-    fi
+    docker rm -f water-console >/dev/null 2>&1 || true
+    cp "$backup/nginx-water.conf" "$root/config/nginx-water.conf"
+    ln -sfn "$root/config/nginx-water.conf" /etc/nginx/snippets/water-auto-exchange.conf
+    if [ -d "$backup/www" ]; then cp -a "$backup/www/." "$root/www/"; fi
+    if [ -n "$old_image" ]; then run_container "$old_image"; fi
+    if [ "$old_active" = 1 ]; then systemctl start water-console; fi
     nginx -t && systemctl reload nginx
-    printf 'Installation failed; restored backup: %s\n' "$backup" >&2
+    echo "Deployment failed; restored previous service. Backup: $backup" >&2
 }
-trap 'rollback' ERR
-if ! id waterconsole >/dev/null 2>&1; then useradd --system --no-create-home --shell /sbin/nologin waterconsole; fi
-install -d -m 700 -o waterconsole -g waterconsole /var/lib/water-console
-python3 - <<'PY'
-import os
-import secrets
-path = '/etc/water-console.env'
-if not os.path.exists(path):
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(fd, 'w') as f:
-        f.write('WATER_ADMIN_KEY=' + secrets.token_hex(32) + '\n')
-        f.write('WATER_DEVICE_KEY=' + secrets.token_hex(32) + '\n')
-        f.write('WATER_ORIGIN=https://bytegallop.com\n')
-PY
-install -m 644 server/app.py "$app"
-install -m 644 server/ws_endpoint.py /opt/water-console/ws_endpoint.py
-if ! PYTHONPATH=/opt/water-console/vendor python3 -c 'import wsproto, h11; assert wsproto.__version__ == "1.0.0" and h11.__version__ == "0.12.0"' 2>/dev/null; then
-    python3 -m pip install --disable-pip-version-check --index-url https://mirrors.aliyun.com/pypi/simple/ --target /opt/water-console/vendor -r server/requirements.txt
+trap rollback ERR
+if [ ! -f "$root/config/water.env" ]; then
+    install -m 600 /etc/water-console.env "$root/config/water.env"
 fi
-install -m 644 deploy/water-console.service "$unit"
-systemctl daemon-reload
-systemctl enable water-console
-systemctl restart water-console
-python3 - <<'PY'
-import json
-import time
-import urllib.request
-for attempt in range(20):
-    try:
-        with urllib.request.urlopen('http://127.0.0.1:8790/water/api/health', timeout=2) as r:
-            assert json.load(r)['ok'] is True
-        break
-    except Exception:
-        if attempt == 19:
-            raise
-        time.sleep(0.5)
-PY
-install -m 644 deploy/nginx-water.conf "$snippet"
-python3 - "$site" <<'PY'
-from pathlib import Path
-import sys
-p = Path(sys.argv[1])
-text = p.read_text()
-include = '    include /etc/nginx/snippets/water-auto-exchange.conf;'
-if include not in text:
-    if 'location = /water' in text or 'location /water' in text or 'location ^~ /water' in text:
-        raise SystemExit('Existing water route needs review before installation')
-    anchor = '    # Central SMS device API and management console.'
-    if text.count(anchor) != 1:
-        raise SystemExit('Expected HTTPS insertion anchor was not found exactly once')
-    p.write_text(text.replace(anchor, include + '\n\n' + anchor))
-PY
-for name in index.html health.json style.css app.js; do install -m 644 "deploy/www/$name" "$web/$name"; done
+# Stop the existing writer before copying SQLite and its WAL together.
+if [ "$old_active" = 1 ]; then systemctl stop water-console; fi
+if [ -n "$old_image" ]; then docker stop water-console; fi
+install -d -m 700 -o 10001 -g 10001 "$root/data"
+if [ ! -f "$root/data/water.db" ]; then cp -a /var/lib/water-console/. "$root/data/"; fi
+cp -a "$root/data" "$backup/data"
+chown -R 10001:10001 "$root/data"
+chmod 700 "$root/data"
+docker rm water-console >/dev/null 2>&1 || true
+run_container "$image"
+for attempt in $(seq 1 30); do
+    if curl -fsS http://127.0.0.1:8790/water/api/health >/dev/null; then break; fi
+    sleep 1
+done
+curl -fsS http://127.0.0.1:8790/water/api/health >/dev/null
+install -d -m 755 "$root/www/water"
+for name in index.html health.json style.css app.js; do install -m 644 "deploy/www/$name" "$root/www/water/$name"; done
+install -m 644 deploy/nginx-water.conf "$root/config/nginx-water.conf"
+ln -sfn "$root/config/nginx-water.conf" /etc/nginx/snippets/water-auto-exchange.conf
 nginx -t
 systemctl reload nginx
+systemctl disable water-console 2>/dev/null || true
 trap - ERR
-printf 'Deployed water console. Backup: %s\n' "$backup"
+printf 'Deployed Docker container water-console. Backup: %s\n' "$backup"

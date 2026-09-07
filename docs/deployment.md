@@ -1,3 +1,60 @@
+# Docker 部署
+
+## 当前部署（2026-09-08）
+
+所有本项目的服务代码、网页、配置、数据库、Docker 运行目录和备份集中在 `/apps/water-auto-exchange`。API 使用真实 Docker Engine 29.8.0 运行，容器名 `water-console`，Python 3.12，UID/GID 为 10001。原 systemd 应用服务已停用并归档。
+
+| 内容 | 路径 |
+| --- | --- |
+| 应用源码 / 镜像构建 | `server/`、`deploy/Dockerfile` |
+| 网页 | `www/water/` |
+| 私有配置 | `config/water.env`，root 600 |
+| 数据库 | `data/water.db`，容器挂载到 `/data` |
+| Nginx 项目配置 | `config/nginx-water.conf` |
+| Docker 二进制、引擎数据与服务定义 | `runtime/` |
+| 备份 | `backups/`，目录权限 700 |
+| 旧部署归档 | `backups/legacy-systemd/` |
+
+共享 Nginx 继续负责主站 TLS 和静态文件服务，通过 `/etc/nginx/snippets/water-auto-exchange.conf` 的符号链接加载项目配置。API 仅监听宿主 `127.0.0.1:8790`，容器使用 host 网络；WSS 地址保持 `wss://bytegallop.com/water/api/device/ws`。
+
+本机 `/usr/bin/docker` 实际调用 Podman，已有其他业务依赖它。本项目通过 `deploy/docker.sh` 选择专用 Docker 二进制及 `/run/water-docker/docker.sock`。独立 daemon 禁用 bridge 和防火墙修改，保留现有 Podman 服务。`water-docker.service` 仅负责启动 Docker 引擎，应用由 Docker 的 `unless-stopped` 策略启动。容器根文件系统只读、无额外 capabilities，日志自动轮换；数据通过宿主目录持久化。
+
+## 更新与运维
+
+本地执行：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File E:\water-auto-exchange\deploy\deploy.ps1
+```
+
+脚本上传到 `/apps/water-auto-exchange`。先构建新镜像，再停止旧写入进程，备份 SQLite 主文件和 WAL，保留凭据，替换容器并验证健康，最后检查及重载 Nginx。失败时恢复上一个容器镜像和网页/Nginx 配置。构建上下文只包含后端代码及 Dockerfile，不包含凭据、数据和备份。脚本针对已有站点进行迁移与重复部署。
+
+首次安装专用 Docker 时，从 Docker 官方 HTTPS 地址下载固定版本。若服务器访问失败，可从可信本机下载同一地址的安装包，上传并解压到 `runtime/bin/` 后重试。官方安装依据：https://docs.docker.com/engine/install/binaries/ 。静态安装的版本更新需后续显式维护。
+
+服务器上执行：
+
+```bash
+cd /apps/water-auto-exchange
+bash deploy/docker.sh ps
+bash deploy/docker.sh logs --tail 50 water-console
+bash deploy/docker.sh restart water-console
+curl -f http://127.0.0.1:8790/water/api/health
+```
+
+修改 `config/water.env` 后，重新运行 `bash deploy/install.sh` 重建容器以加载环境变量；单纯 restart 不会重新读取 env 文件。不要执行会输出完整容器环境变量的 inspect，也不要输出私有配置内容。
+
+## 回滚与验证
+
+每次部署保存 `backups/<时间戳>/data/`、Nginx 配置及已有网页；旧镜像保留在 Docker 中。回滚时先停止容器，选择该次旧镜像并沿用 install.sh 中的挂载和安全参数。仅在确认需要恢复历史数据库时恢复对应 data 快照；恢复前另备份当前数据。禁止直接覆盖运行中的 SQLite 文件。
+
+首次迁移前的代码、数据、私有配置和 systemd 单元统一归档在 `backups/legacy-systemd/`。旧路径已迁出；恢复历史 systemd 部署需按归档单元中的路径复原相关文件。
+
+Python 3.12 容器内 39 项测试通过，重复部署及容器重启通过。已验证容器健康、公网 WSS 101、鉴权 probe、错误密钥拒绝、Web 登录/离线/退出、手机布局与静态资源一致；凭据保留、/sms 健康通过。未发送设备命令、未刷写板端，网站健康仍不能证明实板联网和关泵。
+
+## 历史部署记录
+
+以下保留迁移前记录，路径和 systemd 命令不再作为现行运维入口。
+
 # 网站入口部署
 
 ## 当前范围

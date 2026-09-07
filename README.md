@@ -72,4 +72,4 @@ Lua 5.1 模拟测试全部通过：换水状态机 17 项、硬件适配器 24 �
 
 ## 4G 与 Web
 
-完整操作见 [Web 与 4G 接入](docs/web-console.md)。板端独立联网，USB 网关作为调试工具保留。设备使用 WSS 长连接，空闲和活动期间均每 1 秒心跳，状态变化立即上报。后端使用 Python、wsproto 和 SQLite，绑定服务器 127.0.0.1:8790；Nginx 代理 /water/api/。设备密钥与管理密钥分开保存。默认 GPIO 配置仍禁用，定时计划仍待用户明确规则。
+完整操作见 [Web 与 4G 接入](docs/web-console.md)。板端独立联网，USB 网关作为调试工具保留。设备使用 WSS 长连接，空闲和活动期间均每 1 秒心跳，状态变化立即上报。后端使用 Python、wsproto 和 SQLite，通过 Docker 启动，部署目录统一为 `/apps/water-auto-exchange`，绑定服务器 127.0.0.1:8790；Nginx 代理 /water/api/。设备密钥与管理密钥分开保存。默认 GPIO 配置仍禁用，定时计划仍待用户明确规则。

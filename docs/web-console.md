@@ -8,7 +8,7 @@
 
 ## 管理员登录
 
-部署时在服务器 `/etc/water-console.env` 自动生成两个独立随机密钥，已有密钥会保留：`WATER_ADMIN_KEY` 用于网页登录，`WATER_DEVICE_KEY` 用于设备认证。该文件权限为 600，禁止提交 Git。管理会话有效期 8 小时，Cookie 使用 Secure / HttpOnly / SameSite=Strict；变更请求校验 Origin。登录入口每分钟最多 10 次尝试。
+服务器凭据集中保存在 `/apps/water-auto-exchange/config/water.env`，Docker 迁移保留已有两个独立密钥：`WATER_ADMIN_KEY` 用于网页登录，`WATER_DEVICE_KEY` 用于设备认证。该文件权限为 600，禁止提交 Git。管理会话有效期 8 小时，Cookie 使用 Secure / HttpOnly / SameSite=Strict；变更请求校验 Origin。登录入口每分钟最多 10 次尝试。
 
 本轮提供的本地登录说明位于被 Git 忽略的 `build/console-access.private.txt`，设备配置位于 `build/device.private.json`。这些文件含凭据，请勿分享或提交；聊天记录和日志不打印密钥。
 

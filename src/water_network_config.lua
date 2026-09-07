@@ -4,8 +4,8 @@ return {
     url = "wss://bytegallop.com/water/api/device/ws",
     device_key = "",
     ca_cert = "water-ca.crt",
-    heartbeat_ms = 30000,
-    active_heartbeat_ms = 2000,
+    heartbeat_ms = 1000,
+    active_heartbeat_ms = 1000,
     offline_stop_ms = 10000,
     idle_timeout_ms = 75000
 }

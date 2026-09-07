@@ -4,7 +4,7 @@
 
 ## 软件与实板边界
 
-本轮板端源码为 **0.5.0**，板上最近历史实读仍为已 STOP 的 0.2.8。默认 GPIO 配置继续禁用。本轮未刷写、未启动泵，电脑未枚举到串口；网页可访问不能证明设备在线。接线、启停电平、液位反馈和真实水流仍需实测。
+本轮板端源码为 **0.5.1**，板上最近历史实读仍为已 STOP 的 0.2.8。默认 GPIO 配置继续禁用。本轮未刷写、未启动泵，电脑未枚举到串口；网页可访问不能证明设备在线。接线、启停电平、液位反馈和真实水流仍需实测。
 
 ## 管理员登录
 
@@ -18,7 +18,7 @@
 2. 本轮已提供 `build/device.private.json`。后续使用自己的 JSON 文件，格式为 `{"url":"https://bytegallop.com/water","device_key":"填入设备密钥"}`。
 3. 在仓库运行 `python tools/build-firmware.py --config build/device.private.json`。脚本复制源码到 `build/firmware/`，仅在该目录启用联网并填入设备密钥，源文件与 GPIO 配置保持原状。
 4. 在 LuaTools 的 water-exchange 项目中，删除旧文件条目，再按 `build/firmware/flash-files.txt` 加入 **8 个 Lua 文件和 1 个 CA 证书**。全部路径均来自同一个生成目录。保留现有 CORE、默认 LuaTask V2.4.4 库及 USB trace。每条 require 独占一行；JSON 为 CORE 内置全局模块。
-5. 用户亲自点“下载脚本”。下载后核对 `project=water_auto_exchange version=0.5.0`、`UNCONFIGURED`、零输出配置，并查看登录后的网页是否出现真实上报。网络启用后自动建立 WSS 长连接，空闲每 30 秒应用心跳，状态变化立即上报；TLS/PDP 初始化时间取决于网络。
+5. 用户亲自点“下载脚本”。下载后核对 `project=water_auto_exchange version=0.5.1`、`UNCONFIGURED`、零输出配置，并查看登录后的网页是否出现真实上报。网络启用后自动建立 WSS 长连接，空闲每 1 秒应用心跳，状态变化立即上报；TLS/PDP 初始化时间取决于网络。
 6. 只有确认输出启停、液位板隔离反馈接线与超时参数后，才修改 `src/water_config.lua`，重新生成整包、验证、提交并推送，再由用户刷写。不能直接在生成目录内做长期配置修改，重新生成会覆盖该目录文件。
 
 下载清单：`main.lua`、`water_config.lua`、`water_cycle.lua`、`water_control.lua`、`water_usb.lua`、`water_network.lua`、`water_network_config.lua`、`water_ws_transport.lua`、`water-ca.crt`。
@@ -27,7 +27,7 @@ TLS 强制提供 CA 文件并开启 SNI。CA 来源与指纹见 [证书说明](.
 
 ## WSS 通信与操作语义
 
-设备连接 `wss://bytegallop.com/water/api/device/ws`。服务端主动推送命令，设备空闲每 30 秒发送小型应用心跳；状态变化立即上报。换水期间每 2 秒发送小心跳，10 秒收不到服务器有效回复会尝试停止远程启动的周期。网页自身的 HTTP 刷新发生在浏览器与服务器之间，不触发设备轮询。
+设备连接 `wss://bytegallop.com/water/api/device/ws`。服务端主动推送命令，设备空闲每 1 秒发送小型应用心跳；状态变化立即上报。换水期间每 1 秒发送小心跳，10 秒收不到服务器有效回复会尝试停止远程启动的周期。网页自身的 HTTP 刷新发生在浏览器与服务器之间，不触发设备轮询。
 
 - 状态不变时不重复上传完整状态，不自动回退到 HTTP 轮询。断线立即标记离线，半开连接空闲最多 75 秒判离线；活动状态最多 10 秒。
 - 握手后先认证，设备密钥只在 TLS 加密消息中传送，不放 URL；认证前不读取设备状态、不交付命令。诊断 `probe` 只检查鉴权，不注册设备或更改线上记录。
@@ -43,14 +43,14 @@ TLS 强制提供 CA 文件并开启 SNI。CA 来源与指纹见 [证书说明](.
 
 ## USB 调试网关（可选）
 
-独立 4G 是当前主接入方式。USB 工具用于本地调试，支持 0.3.0/0.5.0 协议；不要与板端 4G 同时连接同一控制台，也不要与 LuaTools/其他串口工具争用用户口。
+独立 4G 是当前主接入方式。USB 工具用于本地调试，支持 0.3.0/0.5.1 协议；不要与板端 4G 同时连接同一控制台，也不要与 LuaTools/其他串口工具争用用户口。
 
 ```powershell
 python -m pip install -r tools/requirements-gateway.txt
 python tools/water-gateway.py --port COM4 --config build/device.private.json
 ```
 
-先重新枚举并确认用户串口。网关启动、断网或退出时尝试 STOP；仅在识别出正确项目和支持版本后发送控制命令。当前 0.5.0 纯 USB 主机命令使用 `tools/water-command.ps1`。
+先重新枚举并确认用户串口。网关启动、断网或退出时尝试 STOP；仅在识别出正确项目和支持版本后发送控制命令。当前 0.5.1 纯 USB 主机命令使用 `tools/water-command.ps1`。
 
 ## 验证
 

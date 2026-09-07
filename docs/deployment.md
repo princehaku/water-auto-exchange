@@ -5,7 +5,7 @@
 公网入口为 https://bytegallop.com/water/，`/water` 使用 308 跳转到带斜杠路径并保留查询参数。
 当前上线内容是 Web 控制台和 Python/SQLite API，支持设备通过 4G 独立接入。`health.json` 与 `/water/api/health` 仅说明网站/API 可用；设备在线状态来自登录后的 `/water/api/status`。完整流程见 [Web 与 4G 接入](web-console.md)。
 
-板端源码为 0.5.0，最近历史实读板端为已 STOP 的 0.2.8。本次部署不刷写板端、不改变 GPIO 配置。
+板端源码为 0.5.1，最近历史实读板端为已 STOP 的 0.2.8。本次部署不刷写板端、不改变 GPIO 配置。
 
 ## 环境与路径
 

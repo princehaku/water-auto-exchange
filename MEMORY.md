@@ -1,6 +1,13 @@
 # 项目记忆
 
-## 2026-09-12 当前接续：真实板端仍为0.3.0，准备0.5.2联网包
+## 2026-09-12 最新接续：0.5.2 已上板，纠正下载项目
+
+- 用户下载后仍显示“等待设备连接”。真实 COM4 STATUS 已确认 `water_auto_exchange 0.5.2 state=UNCONFIGURED`，替代下方板上0.3.0快照；尚未证明板端联网。
+- LuaTools 00:49:53 下载成功，但界面仍选 `water-exchange`，清单指向 `src`。最新 `_temp/script/temp_script/water_network_config.lua` 实际为 `enabled=false`、空 device_key，且该目录无CA；版本更新不等于联网配置已下载。trace 在下载后重新接入，只见周期 WATER STATUS，未捕获开机联网日志。
+- 已通过界面“刷新列表”并选中 `water-online-0.5.2`，现场确认清单为 `build/firmware` 下8 Lua+1 CA；无需关闭重开工具。联网启用、设备凭据与私有配置一致、CA及9项清单检查通过，未打印或提交密钥。
+- 已通知用户在当前项目亲自点“下载脚本”，助手没有点击刷写。接下来核对实际新打包配置、板端WATER NET/WS日志和服务端在线状态；不能提前写成已连通。不需要仅为切项目修改版本或重复部署后端。
+
+## 2026-09-12 前次接续：准备0.5.2联网包（板端0.3.0为历史快照）
 
 - 远程已拉到7482969。COM4实际STATUS为water_auto_exchange 0.3.0、UNCONFIGURED，USB识别正常；该版本没有4G/WSS，替代此前0.2.8板上记录。
 - 用户确认网络指示灯GPIO12/物理53/SPI1_DIN，按netLed.setup(true,pio.P0_12)实现；联网启用时初始化，GPIO12从控制器输入/输出集合移除。泵及液位映射仍禁用、未确认，不靠网络灯推定WSS认证成功。

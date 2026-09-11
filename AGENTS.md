@@ -1,5 +1,13 @@
 # 项目约定与本轮对话摘要
 
+## 2026-09-12 下载项目纠正与最新板端状态
+
+- 用户反馈下载后仍“等待设备连接”。真实 COM4 STATUS 已为 `water_auto_exchange 0.5.2 state=UNCONFIGURED`，替代下节0.3.0快照；GPIO映射仍禁用，未发送泵控制命令。
+- LuaTools日志显示00:49:53下载成功，但现场界面当前项目仍为 `water-exchange`、文件来自 `src`。最近生成的 `_temp/script/temp_script/water_network_config.lua` 明确为 `enabled=false`、空设备密钥，该目录无CA。已证实该次更新了版本却未使用启用联网的生成包。LuaTools会剥离注释，其他文件字节差异本身不能作为混包证据。
+- 用 computer-use 刷新项目列表并选中现有 `water-online-0.5.2`，现场核对 `build/firmware` 的8 Lua+1 CA共9项。独立检查启用标志、凭据与私有配置一致、CA与仓库公开证书一致、项目清单/文件存在/版本通过；无需重启工具才能刷新项目。
+- 已通知用户现在可点“下载脚本”；助手未点击刷写。下载后还需核对最新打包配置和板端WATER NET/WS、服务端在线。此前trace在00:50:04才重新接入，仅见5秒WATER STATUS，没捕获开机消息；不能把没有早期日志当作已定位SIM或TLS故障。
+- 本次只调整本地已忽略的工具项目选择并更新记录，应用代码和生成包未改，不重复运行上一轮124+39项测试或部署。尚无真实4G/WSS成功证据。
+
 ## 2026-09-12 实板接入排查：0.5.2
 
 - 已 fast-forward 拉取远程 `7482969`。本次通过真实 COM4 的 STATUS 确认板上为 `water_auto_exchange 0.3.0 state=UNCONFIGURED`，替代此前“最近板上0.2.8”快照；0.3.0 没有 4G/WSS，网页等待设备连接不是电脑未识别 USB。运行态 COM3/4/5/6 均正常。

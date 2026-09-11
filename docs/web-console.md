@@ -1,5 +1,15 @@
 # Web 控制台与 4G 接入
 
+## 2026-09-12 实板接入排查（0.5.2）
+
+本机 COM4 已读到真实板端 `water_auto_exchange 0.3.0`、`UNCONFIGURED`；该版本没有 4G/WSS 功能，网页等待设备连接符合当前状态。公网 HTTPS/WSS 握手与现有设备密钥 probe 通过，服务器尚无设备上报，未发送控制命令。
+
+0.5.2 增加本板网络指示灯 `netLed.setup(true, pio.P0_12)`，GPIO12/物理53脚专用于该灯，不能配置为泵或液位输入。网络启用时初始化灯，未启用时保持不配置 GPIO。灯表示移动网络/socket 状态；WSS 认证成功须以 `WATER WS online` 和网页真实上报为准。
+
+本机已准备 LuaTools 项目 `water-online-0.5.2`，指向 `build/firmware/` 中的完整 9 项；关闭并重新打开 LuaTools 后选择它，再由用户点击“下载脚本”。服务器已部署该版本兼容，包内 CA 对当前站点的 TLS1.2/域名校验通过。
+
+新版打印 `waiting_pdp`、`connecting_tls`、`upgrading_http`、`upgraded; authenticating` 及失败阶段；`WATER NET disabled` 表示下载了未启用网络的源码配置，应使用生成包。源码不含设备密钥。当前下载目标 **0.5.2**，清单仍为生成目录中的 8 个 Lua 文件和 1 个 CA，按下述准备步骤操作。控制 GPIO 保持禁用；除明确的网络灯外不配置输出。下方 0.5.1/0.2.8 为此前版本记录，不能替代本次 COM4 实读。
+
 设备通过 Air724UG 自带 4G 网络建立 WSS 长连接，网页入口为 `https://bytegallop.com/water/`，无需电脑常开。网页提供管理密钥登录、在线状态、补水请求、软件输出、故障说明、START / FILL / STOP / RESET 和最近 60 条操作记录。当前为单设备控制台，不配置未经确认的定时换水或自动补水规则。
 
 ## 软件与实板边界

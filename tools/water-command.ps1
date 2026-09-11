@@ -29,15 +29,15 @@ function Invoke-WaterCommand([string]$Value) {
         if ($match.Success) { return $match.Groups[1].Value }
         Start-Sleep -Milliseconds 25
     }
-    throw "No water controller response on $Port. Confirm version 0.5.1 is flashed and the USB user port is available."
+    throw "No water controller response on $Port. Confirm version 0.5.2 is flashed and the USB user port is available."
 }
 
 try {
     $serial.Open()
     # Identify the application before sending any command that changes state.
     $status = Invoke-WaterCommand 'STATUS'
-    if ($status -notmatch '^OK STATUS project=water_auto_exchange version=0\.5\.1(?: |$)') {
-        throw 'The selected port did not identify as water_auto_exchange version 0.5.1.'
+    if ($status -notmatch '^OK STATUS project=water_auto_exchange version=0\.5\.2(?: |$)') {
+        throw 'The selected port did not identify as water_auto_exchange version 0.5.2.'
     }
     Write-Output $status
     if ($Command -ne 'STATUS') {

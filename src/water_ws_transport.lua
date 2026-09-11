@@ -98,20 +98,23 @@ function M.new(config, callbacks, deps)
     end
     local function run_connection(io)
         local host, path = config.url:match("^wss://([%w%.%-]+)(/.*)$")
-        if not io:connect(host, 443, 10) or client.cancelled then return end
+        print("WATER WS connecting_tls", host)
+        if not io:connect(host, 443, 10) then print("WATER WS tls_connect_failed"); return end
+        if client.cancelled then return end
+        print("WATER WS upgrading_http")
         local key = crypto.base64_encode(random_bytes(16), 16)
         local request = "GET " .. path .. " HTTP/1.1\r\nHost: " .. host .. "\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: " .. key .. "\r\n\r\n"
-        if not io:send(request, 5) then return end
+        if not io:send(request, 5) then print("WATER WS upgrade_send_failed"); return end
         local response, boundary = "", nil
         -- recv is milliseconds; connect/send use seconds in socket4G V2.4.4.
         local started = rtos.tick() % 4294967296
         repeat
             local ok, chunk = io:recv(1000, event)
             if ok then response = response .. chunk
-            elseif chunk ~= "timeout" and chunk ~= event then return end
+            elseif chunk ~= "timeout" and chunk ~= event then print("WATER WS upgrade_receive_failed"); return end
             if #response > 16384 or client.cancelled then return end
             boundary = response:find("\r\n\r\n", 1, true)
-            if (rtos.tick() - started) % 4294967296 >= 160000 then return end
+            if (rtos.tick() - started) % 4294967296 >= 160000 then print("WATER WS upgrade_timeout"); return end
         until boundary
         local headers = response:sub(1, boundary + 3)
         local accept_source = key .. "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
@@ -120,7 +123,11 @@ function M.new(config, callbacks, deps)
         for name, value in headers:gmatch("\r\n([^:]+):%s*([^\r\n]+)") do fields[name:lower()] = value end
         if not headers:match("^HTTP/1%.1 101 ") or fields["sec-websocket-accept"] ~= expected
             or (fields.upgrade or ""):lower() ~= "websocket"
-            or not (fields.connection or ""):lower():find("upgrade",1,true) then return end
+            or not (fields.connection or ""):lower():find("upgrade",1,true) then
+            print("WATER WS upgrade_rejected", headers:match("^HTTP/1%.1 (%d%d%d)") or "invalid")
+            return
+        end
+        print("WATER WS upgraded; authenticating")
         client.connected = true
         client.connected_at = rtos.tick()
         notify("open")
@@ -152,18 +159,24 @@ function M.new(config, callbacks, deps)
             local backoff = 1000
             while not client.stopped do
                 client.cancelled = false
-                while not socket.isReady() and not client.stopped do sys.wait(1000) end
+                local waiting = 0
+                while not socket.isReady() and not client.stopped do
+                    if waiting % 5 == 0 then print("WATER WS waiting_pdp; check SIM, antenna and registration") end
+                    waiting = waiting + 1
+                    sys.wait(1000)
+                end
                 if client.stopped then return end
                 local io = socket.tcp(true, {caCert = config.ca_cert, hostNameFlag = 1, insist = 0})
                 if io then
                     -- Never put these yielding operations inside pcall/xpcall.
                     run_connection(io)
                     io:close()
-                end
+                else print("WATER WS socket_create_failed") end
                 local stable = client.connected and (rtos.tick() - client.connected_at) % 4294967296 >= 960000
                 client.connected, client.queue = false, {}
                 notify("close")
                 if stable then backoff = 1000 end
+                print("WATER WS retry_ms=" .. backoff)
                 sys.wait(backoff)
                 backoff = math.min(backoff * 2, 60000)
             end

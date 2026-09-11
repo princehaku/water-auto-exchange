@@ -179,6 +179,8 @@ test("GPIO conflicts and invalid electrical settings are rejected before initial
         function(c) c.inputs.overflow.enabled = true; c.inputs.overflow.gpio = c.inputs.need_fill.gpio end,
         function(c) c.outputs.fill.gpio = 0 end,
         function(c) c.outputs.fill.gpio = 29 end,
+        function(c) c.outputs.fill.gpio = 12 end,
+        function(c) c.inputs.need_fill.gpio = 12 end,
         function(c) c.outputs.fill.off_level = c.outputs.fill.on_level end,
         function(c) c.inputs.need_fill.active_level = true end,
         function(c) c.inputs.need_fill.pull = "INVALID" end,

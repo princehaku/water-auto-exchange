@@ -1,5 +1,15 @@
 # 项目约定与本轮对话摘要
 
+## 2026-09-12 实板接入排查：0.5.2
+
+- 已 fast-forward 拉取远程 `7482969`。本次通过真实 COM4 的 STATUS 确认板上为 `water_auto_exchange 0.3.0 state=UNCONFIGURED`，替代此前“最近板上0.2.8”快照；0.3.0 没有 4G/WSS，网页等待设备连接不是电脑未识别 USB。运行态 COM3/4/5/6 均正常。
+- 用户明确网络灯为 `netLed.setup(true, pio.P0_12)`，对应 GPIO12/物理53/SPI1_DIN。0.5.2 在联网启用时初始化该灯，适配器从允许集合排除 GPIO12，避免泵/传感器冲突。库默认闪烁表示注册/socket 状态，不等于服务器应用认证成功；不得外推其他 GPIO 映射。
+- 新增无密钥的联网阶段日志，区分 waiting_pdp、connecting_tls、upgrading_http、认证与重试；关闭网络的源码明确打印 disabled。主机、服务端和网关支持 0.5.2，控制 GPIO 配置仍禁用。源码零控制输出与网络灯初始化分别记录。
+- 已读服务器健康，公网 HTTPS/WSS 及既有设备密钥 probe 通过；登录后状态为离线、device=null、命令数0。未向生产服务填入模拟设备状态、未发泵命令，probe 不证明板端4G已通。
+- 从既有服务器配置提取设备凭据到忽略的 `build/device.private.json`，不展示值。使用 tools/build-firmware.py 生成同目录 8 Lua + CA 共9项，不能继续用旧 src 项目或旧5文件清单。用户仍亲自下载；本次联调尚须下载后实读版本和联网状态。
+- 本地已通过 124 项 Lua 5.1、39 项 Python API/WS/网关测试，以及生成包官方 LuaFLOAT 语法检查。旧 tools/vendor/python 的二进制不适配当前 Python3.10，测试依赖放忽略目录 build/debug-python（不要改全局解释器或提交依赖包）。
+- 服务器已部署0.5.2兼容，备份 `/apps/water-auto-exchange/backups/20260911T163813Z-3487003`，容器healthy，公网API及/sms健康正常；生成包CA配合TLS1.2/域名校验成功。新LuaTools项目为 `water-online-0.5.2`，配置文件在工具project目录，指向生成包9项；用户关闭重开LuaTools后选该项目亲自下载，再核对真实版本/在线。此记录不表示下载已发生。
+
 ## 持续要求：每次修改后提交并推送
 
 - 每次完成本仓库的代码、配置或文档修改并通过相应验证后，必须主动执行 `git commit` 和 `git push`，无需用户再次提醒。

@@ -11,7 +11,7 @@ local function contains(actual, expected)
 end
 
 local function fixture(real_controller)
-    for _, name in ipairs({"sys", "log", "pins", "water_config", "water_control", "water_cycle", "water_usb", "water_network_config", "water_network"}) do
+    for _, name in ipairs({"sys", "log", "pins", "netLed", "water_config", "water_control", "water_cycle", "water_usb", "water_network_config", "water_network"}) do
         package.loaded[name] = nil
     end
     local f = {rx = {}, replies = {}, calls = {}, logs = {}, setups = {}, timers = {}, gpio_calls = 0}
@@ -20,7 +20,16 @@ local function fixture(real_controller)
         error("unconfigured application must not access GPIO")
     end
     package.preload.pins = function() forbidden() end
-    _G.pio = {pin = {setval = forbidden, getval = forbidden, close = forbidden}}
+    _G.pio = {P0_12 = 12, pin = {setval = forbidden, getval = forbidden, close = forbidden}}
+    package.preload.netLed = function()
+        return {setup = function(enabled, gpio, lte)
+            equal(enabled, true)
+            equal(gpio, 12, "network indicator must use GPIO12")
+            equal(lte, nil, "no second LED GPIO may be claimed")
+            if f.led_failure then error("injected LED failure") end
+            f.led_gpio = gpio
+        end}
+    end
     _G.pmd = {ldoset = forbidden}
     _G.rtos = {tick = forbidden}
     package.preload.sys = function()
@@ -43,7 +52,7 @@ local function fixture(real_controller)
             f.trace = true
         end}
     end
-    _G.PROJECT, _G.VERSION = "water_auto_exchange", "0.5.1"
+    _G.PROJECT, _G.VERSION = "water_auto_exchange", "0.5.2"
     _G.uart = {
         USB = 0x81, PAR_NONE = 0, STOP_1 = 1,
         setup = function(id, baud, bits, parity, stop)
@@ -128,7 +137,7 @@ test("fragmented STATUS is read-only and unknown water level is explicit", funct
     f.feed("STA")
     equal(#f.replies, 1)
     f.feed("TUS\r")
-    contains(f.replies[2], "OK STATUS project=water_auto_exchange version=0.5.1")
+    contains(f.replies[2], "OK STATUS project=water_auto_exchange version=0.5.2")
     contains(f.replies[2], "ready=0 fill=0 drain=0 outputs_known=0 need_fill=unknown")
     f.feed("\n")
     equal(#f.replies, 2, "CRLF must yield one reply")
@@ -245,16 +254,18 @@ test("boot prints immediately and every 5 seconds without starting outputs", fun
     local f = fixture()
     f.boot()
     equal(PROJECT, "water_auto_exchange")
-    equal(VERSION, "0.5.1")
+    equal(VERSION, "0.5.2")
     equal(f.sys_init[1], 0)
     equal(f.sys_init[2], 0)
     equal(f.sys_run, true)
     equal(f.trace, true)
+    equal(f.led_gpio, nil, "source without networking must not initialize the LED")
+    contains(table.concat(f.logs), "WATER NET disabled")
     equal(f.calls.init, 1)
     equal(f.calls.start, nil)
     equal(f.calls.fill, nil)
     equal(f.gpio_calls, 0)
-    contains(table.concat(f.logs), "WATER STATUS project=water_auto_exchange version=0.5.1")
+    contains(table.concat(f.logs), "WATER STATUS project=water_auto_exchange version=0.5.2")
     equal(#f.timers, 1)
     equal(f.timers[1].ms, 5000)
     local replies, status_calls = #f.replies, f.calls.status
@@ -324,6 +335,22 @@ test("network starts after USB and controller initialization", function()
     end}
     f.boot()
     assert(f.network_started and f.sys_run)
+    equal(f.led_gpio, 12)
+    contains(table.concat(f.logs), "WATER NET started transport=wss")
+end)
+
+test("LED failure or missing pin does not claim the library default or block networking", function()
+    for _, cause in ipairs({"setup", "missing_pin"}) do
+        local f = fixture()
+        if cause == "setup" then f.led_failure = true else _G.pio.P0_12 = nil end
+        package.loaded.water_network_config = {enabled = true}
+        package.loaded.water_network = {start = function() f.network_started = true; return true end}
+        f.boot()
+        assert(f.network_started and f.sys_run)
+        equal(f.led_gpio, nil)
+        contains(table.concat(f.logs), "setup_failed")
+        equal(f.gpio_calls, 0)
+    end
 end)
 
 test("network startup failure keeps USB STOP available", function()

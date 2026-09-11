@@ -1,5 +1,15 @@
 # 项目记忆
 
+## 2026-09-12 当前接续：真实板端仍为0.3.0，准备0.5.2联网包
+
+- 远程已拉到7482969。COM4实际STATUS为water_auto_exchange 0.3.0、UNCONFIGURED，USB识别正常；该版本没有4G/WSS，替代此前0.2.8板上记录。
+- 用户确认网络指示灯GPIO12/物理53/SPI1_DIN，按netLed.setup(true,pio.P0_12)实现；联网启用时初始化，GPIO12从控制器输入/输出集合移除。泵及液位映射仍禁用、未确认，不靠网络灯推定WSS认证成功。
+- 当前源码0.5.2，增加PDP/TLS/HTTP升级/认证/重试阶段日志，源码网络关闭会明确打印disabled。后端/USB工具/调试网关增加版本兼容。
+- 服务器容器健康、公网HTTPS与WSS+既有设备密钥probe通过；认证后的网页状态离线、device=null、命令数0，未填入模拟设备/未发送控制命令。真实4G还需下载后验证。
+- build/device.private.json从既有服务器提取设备凭据；生成包build/firmware/flash-files.txt仍是8 Lua+1 CA共9项，勿分享/提交凭据。用户必须下载完整生成包，不能沿用旧src清单。
+- 124项Lua与39项Python测试通过，生成包LuaFLOAT语法通过。当前Python3.10所需测试依赖放build/debug-python，目录被Git忽略。
+- 服务器已部署0.5.2兼容，备份/apps/water-auto-exchange/backups/20260911T163813Z-3487003，容器/API/sms健康与包内CA的TLS1.2校验通过。本地新增LuaTools项目water-online-0.5.2，9项均指向build/firmware；已通知用户关闭重开工具后选择该项目下载，尚待下载后的实板验证。
+
 ## 2026-09-08 最新接续：集中目录与 Docker 部署
 
 - 用户要求服务器文件统一放 `/apps/water-auto-exchange` 并通过 Docker 启动。现行入口为 `deploy/deploy.ps1` → `/apps/water-auto-exchange/deploy/install.sh`；部署细节见 docs/deployment.md。本节优先于下方分散路径/systemd 历史记录。

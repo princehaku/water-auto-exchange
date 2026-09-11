@@ -1,5 +1,5 @@
 PROJECT = "water_auto_exchange"
-VERSION = "0.5.1"
+VERSION = "0.5.2"
 
 local sys = require "sys"
 local log = require "log"
@@ -29,6 +29,14 @@ else
 end
 
 if call_ok and ready and network_config.enabled == true then
+    -- GK21.5PTM rev0.3 routes the marked network indicator to Air724UG
+    -- physical pin 53, SPI1_DIN/GPIO12. Never fall back to the library default.
+    local led_ok = pcall(function()
+        assert(pio and pio.P0_12 ~= nil, "network_led_pin_unavailable")
+        local netLed = require "netLed"
+        netLed.setup(true, pio.P0_12)
+    end)
+    print("WATER NET LED gpio=12 physical=53", led_ok and "enabled" or "setup_failed")
     local ok, started, detail = pcall(function()
         local network = require "water_network"
         return network.start(controller, network_config)
@@ -36,7 +44,11 @@ if call_ok and ready and network_config.enabled == true then
     if not ok or not started then
         pcall(controller.stop)
         print("WATER NET unavailable", ok and tostring(detail) or "initialization_failed")
+    else
+        print("WATER NET started transport=wss; waiting for PDP/TLS/auth")
     end
+elseif network_config.enabled ~= true then
+    print("WATER NET disabled; flash the generated build/firmware package for 4G")
 end
 
 -- Trace remains independent from USB writes; no automatic START/FILL/PROBE.

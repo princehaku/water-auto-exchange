@@ -2,7 +2,8 @@
 local cycle = require "water_cycle"
 local M = {}
 local fixed_gpio = {}
-for _, id in ipairs({5,9,10,11,12,13,14,15,17,18,19,22,23}) do fixed_gpio[id] = true end
+-- GPIO12 is reserved for this board's confirmed network indicator.
+for _, id in ipairs({5,9,10,11,13,14,15,17,18,19,22,23}) do fixed_gpio[id] = true end
 
 local function copy(value)
     if type(value) ~= "table" then return value end

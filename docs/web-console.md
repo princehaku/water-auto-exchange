@@ -1,6 +1,14 @@
 # Web 控制台与 4G 接入
 
-## 2026-09-12 实板接入排查（0.5.2）
+## 2026-09-12 当前状态：0.5.3 计时修正，待上板
+
+真实板端0.5.2已通过4G/TLS/WSS认证，服务器收到了UNCONFIGURED状态；向真实板下发的一条STOP已回执 `OK STOP stopped`。原“等待设备连接”的直接原因是LuaTools选了src项目，联网关闭、设备密钥为空。改用生成包后可连接，但旧tick换算导致本应1秒的心跳拖到约80秒，先被服务器75秒超时断开。不能把短暂online描述成稳定运行。
+
+0.5.3统一按Air724接口规定每tick为5ms计算心跳、命令有效期、控制器防抖/排补超时、HTTP升级超时及稳定连接退避。同时允许仍有效的较早心跳回执，避免4G回包晚于下一次ping时被误判；每约5秒打印seq、ack和回执年龄。依据：[官方rtos接口](https://doc.openluat.com/wiki/21?wiki_page_id=2247)。V2.4.4旧patch.lua中的 `/16` 不能作为本平台时基，旧记录以本节更正为准。
+
+修正版已通过130项Lua、39项Python测试与LuaFLOAT语法检查。生成目录仍为 `build/firmware`，本机新项目 `water-online-0.5.3` 已写入工具project目录，需“刷新列表”后选择。用户本次已授权助手自行刷写测试，覆盖之前由用户点击的限制；computer-use在检查浏览器网址时停止了本轮界面操作，因此0.5.3尚未下载，仍缺修正版连续心跳及断线恢复的实板验证。详情见[联调记录](verification-20260912.md)。
+
+## 2026-09-12 前次排查记录（0.5.2，以下版本快照属历史）
 
 本机 COM4 已读到真实板端 `water_auto_exchange 0.3.0`、`UNCONFIGURED`；该版本没有 4G/WSS 功能，网页等待设备连接符合当前状态。公网 HTTPS/WSS 握手与现有设备密钥 probe 通过，服务器尚无设备上报，未发送控制命令。
 
@@ -14,7 +22,7 @@
 
 ## 软件与实板边界
 
-本轮板端源码为 **0.5.1**，板上最近历史实读仍为已 STOP 的 0.2.8。默认 GPIO 配置继续禁用。本轮未刷写、未启动泵，电脑未枚举到串口；网页可访问不能证明设备在线。接线、启停电平、液位反馈和真实水流仍需实测。
+当前源码0.5.3、真实板端0.5.2，详情以上方最新记录为准。默认GPIO配置继续禁用，只有已确认的GPIO12网络灯启用。接线、启停电平、液位反馈和真实水流仍需实测；网络联调不能作为泵控制验证。
 
 ## 管理员登录
 
@@ -27,13 +35,13 @@
 1. 准备可联网的 SIM、天线和供电；板端输出仍保持禁用，先验证网络及状态上报。GPIO23 复用 SIM 在位检测的硬件约束继续有效，不能据此猜测泵映射。
 2. 本轮已提供 `build/device.private.json`。后续使用自己的 JSON 文件，格式为 `{"url":"https://bytegallop.com/water","device_key":"填入设备密钥"}`。
 3. 在仓库运行 `python tools/build-firmware.py --config build/device.private.json`。脚本复制源码到 `build/firmware/`，仅在该目录启用联网并填入设备密钥，源文件与 GPIO 配置保持原状。
-4. 在 LuaTools 的 water-exchange 项目中，删除旧文件条目，再按 `build/firmware/flash-files.txt` 加入 **8 个 Lua 文件和 1 个 CA 证书**。全部路径均来自同一个生成目录。保留现有 CORE、默认 LuaTask V2.4.4 库及 USB trace。每条 require 独占一行；JSON 为 CORE 内置全局模块。
-5. 用户亲自点“下载脚本”。下载后核对 `project=water_auto_exchange version=0.5.1`、`UNCONFIGURED`、零输出配置，并查看登录后的网页是否出现真实上报。网络启用后自动建立 WSS 长连接，空闲每 1 秒应用心跳，状态变化立即上报；TLS/PDP 初始化时间取决于网络。
+4. 本机LuaTools“刷新列表”后选 `water-online-0.5.3`。其他机器按 `build/firmware/flash-files.txt` 创建项目并加入 **8个Lua文件和1个CA证书**，全部来自同一个生成目录。保留现有CORE、默认LuaTask V2.4.4库及USB trace。每条require独占一行；JSON为CORE内置全局模块。
+5. 按当前用户授权点击“下载脚本”。下载后核对 `project=water_auto_exchange version=0.5.3`、`UNCONFIGURED` 和生成配置，并查看服务器是否收到真实上报。持续观察至少跨过原75秒断线窗口，确认5秒日志中的心跳seq/ack继续增长、服务器last_seen持续刷新，再验证重连。仅版本号或一次online不足以通过联调。
 6. 只有确认输出启停、液位板隔离反馈接线与超时参数后，才修改 `src/water_config.lua`，重新生成整包、验证、提交并推送，再由用户刷写。不能直接在生成目录内做长期配置修改，重新生成会覆盖该目录文件。
 
 下载清单：`main.lua`、`water_config.lua`、`water_cycle.lua`、`water_control.lua`、`water_usb.lua`、`water_network.lua`、`water_network_config.lua`、`water_ws_transport.lua`、`water-ca.crt`。
 
-TLS 强制提供 CA 文件并开启 SNI。CA 来源与指纹见 [证书说明](../certs/README.md)。当前证书链已在服务器侧验证；Air724UG 实板 TLS 握手仍待验证。禁止通过删除 CA 配置来绕过证书校验。网络接口按本机 V2.4.4 `sys.lua` / `socket4G.lua` 核对：connect/send 超时单位为秒，recv 为毫秒。
+TLS强制提供CA文件并开启SNI。CA来源与指纹见[证书说明](../certs/README.md)。0.5.2实板TLS与WSS认证已通过，0.5.3持续连接仍待验证。禁止通过删除CA配置绕过校验。网络接口按本机V2.4.4 `sys.lua` / `socket4G.lua` 核对：connect/send超时单位为秒，recv为毫秒；Air724的 `rtos.tick()` 每计数为5ms。
 
 ## WSS 通信与操作语义
 

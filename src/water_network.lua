@@ -45,13 +45,15 @@ function M.start(controller, config, deps)
         if previous ~= nil then
             local delta = (current - previous) % 4294967296
             assert(delta < 2147483648, "network_clock_discontinuity")
-            elapsed = elapsed + delta / 16
+            -- Air724UG ticks are 5 ms, not the legacy 2G library timebase.
+            elapsed = elapsed + delta * 5
         end
         previous = current
         return elapsed
     end
     local client, ready, opened, owned, enabled = nil, false, false, false, true
-    local last_ok, last_ping, ping_seq, signature = 0, 0, 0, nil
+    local last_ok, last_ping, ping_seq, pong_seq, signature = 0, 0, 0, 0, nil
+    local pings, report_steps = {}, 0
     local pending, seen, seen_count = {}, {}, 0
     local raw_stop = controller.stop
     local function stop_outputs()
@@ -60,12 +62,12 @@ function M.start(controller, config, deps)
     end
     local function lost(reason)
         if owned then stop_outputs() end
-        ready, opened, owned, pending = false, false, false, {}
+        ready, opened, owned, pending, pings = false, false, false, {}, {}
         if client then client:close(not enabled) end
         print("WATER WS", reason)
     end
     controller.stop = function()
-        ready, opened, owned, pending = false, false, false, {}
+        ready, opened, owned, pending, pings = false, false, false, {}, {}
         if client then client:close() end
         return raw_stop()
     end
@@ -93,7 +95,15 @@ function M.start(controller, config, deps)
             return
         end
         if value.type == "pong" then
-            if value.seq == ping_seq then last_ok = time end
+            local sent_at = pings[value.seq]
+            local active = ACTIVE[telemetry().state] == true
+            local limit = active and config.offline_stop_ms or config.idle_timeout_ms
+            -- A cellular reply can arrive after the next ping was queued.
+            -- Accept fresh outstanding replies once, never an old-session pong.
+            if sent_at and value.seq > pong_seq and time - sent_at < limit then
+                last_ok, pong_seq = time, value.seq
+                for seq in pairs(pings) do if seq <= pong_seq then pings[seq] = nil end end
+            end
         elseif value.type == "received" then last_ok = time
         elseif value.type == "offer" then
             if type(value.id) ~= "string" or #value.id ~= 32 or not value.id:match("^[a-f0-9]+$") or not ALLOWED[value.command] then
@@ -131,7 +141,8 @@ function M.start(controller, config, deps)
     client = transport.new(config, {
         open = function()
             if not enabled then client:close(); return end
-            ready, opened, pending, seen, seen_count = false, true, {}, {}, 0
+            ready, opened, pending, seen, seen_count, pings = false, true, {}, {}, 0, {}
+            pong_seq = ping_seq
             last_ok, last_ping = now(), now()
             local status, text = telemetry()
             signature = text
@@ -161,7 +172,17 @@ function M.start(controller, config, deps)
         local interval = active and config.active_heartbeat_ms or config.heartbeat_ms
         if time - last_ping >= interval then
             ping_seq, last_ping = ping_seq + 1, time
+            pings[ping_seq] = time
             send({type = "ping", seq = ping_seq})
+        end
+        for seq, sent_at in pairs(pings) do
+            if time - sent_at >= limit then pings[seq] = nil end
+        end
+        report_steps = report_steps + 1
+        if report_steps >= 10 then
+            report_steps = 0
+            print("WATER WS heartbeat seq=" .. ping_seq .. " ack=" .. pong_seq
+                .. " age_ms=" .. math.floor(time - last_ok))
         end
         for id, item in pairs(pending) do if time - item.started >= 5000 then pending[id] = nil end end
         if seen_count >= 2048 and not active then lost("session_refresh") end

@@ -1,5 +1,5 @@
 PROJECT = "water_auto_exchange"
-VERSION = "0.5.2"
+VERSION = "0.5.3"
 
 local sys = require "sys"
 local log = require "log"

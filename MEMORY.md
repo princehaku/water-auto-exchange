@@ -1,5 +1,14 @@
 # 项目记忆
 
+## 2026-09-12 最新：真实WSS及STOP已通，0.5.3修正版待刷写
+
+- 用户明确“我要去睡觉了，你自己用computer use测试，一定要测完”，已授权本次助手点击下载并联调，覆盖早先“用户亲自刷写”的限制。01:26:12通过computer-use下载完整0.5.2包成功，原CORE保留；不是src禁用网络包。
+- 板端01:26:25及01:27:45等真实 `WATER WS online`，服务器收到0.5.2/UNCONFIGURED状态；真实远程STOP一次回执succeeded/`OK STOP stopped`，未发送START/FILL，泵及液位GPIO仍禁用。
+- 稳定性发现缺陷：认证后没有每秒心跳，约75秒断开并重连。官方Air724文档明确 `rtos.tick()` 单位5ms（wiki_page_id=2247），原 `/16` 错误使1秒心跳变约80秒，同样影响控制超时。旧MEMORY/AGENTS中按patch.lua认定16ticks/ms的描述作废。
+- 当前源码/生成包0.5.3已改为tick差值乘5；同时修复延迟pong、重复/过期/旧会话pong处理，打印每约5秒seq/ack/age_ms。130项Lua+39项Python、LuaFLOAT及PowerShell检查通过。build/firmware仍8Lua+1CA，私有凭据未提交。本地已准备water-online-0.5.3.ini，需刷新项目列表选择。
+- **0.5.3尚未刷入。** computer-use检查Chrome时因无法确认当前URL自动停止本轮界面操作，未重试或绕过界面限制；后续用日志、服务器接口及本地测试完成能继续的工作。板上仍为有心跳缺陷的0.5.2，不能说稳定性测试完成。待恢复工具后刷0.5.3，验证连续心跳、75秒以上稳定连接、重连及实际tick计数。完整证据见docs/verification-20260912.md。
+- 服务器已部署0.5.3兼容，备份 `/apps/water-auto-exchange/backups/20260911T175713Z-3513927`。容器healthy、公网API和/sms均200、既有凭据WSS probe通过；容器内无副作用校验确认接受0.5.3。此为后端验证，不表示修正版已上板。
+
 ## 2026-09-12 最新接续：0.5.2 已上板，纠正下载项目
 
 - 用户下载后仍显示“等待设备连接”。真实 COM4 STATUS 已确认 `water_auto_exchange 0.5.2 state=UNCONFIGURED`，替代下方板上0.3.0快照；尚未证明板端联网。

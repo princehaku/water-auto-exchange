@@ -106,7 +106,7 @@ local function fixture(cfg)
         local item = cfg.inputs[name]
         h.levels[item.gpio] = active and item.active_level or (1 - item.active_level)
     end
-    function h.elapse(ms) h.tick = h.tick + ms * 16 end
+    function h.elapse(ms) h.tick = h.tick + ms / 5 end
     function h.pending()
         local result
         for id, timer in pairs(h.timers) do
@@ -247,7 +247,7 @@ test("relay debounce, switch deadtime and C threshold complete exactly one excha
     local stopped_at = h.tick
     h.poll(199); state(h, "SETTLING")
     h.poll(1); state(h, "FILLING", true)
-    equal(h.tick - stopped_at, 200 * 16)
+    equal(h.tick - stopped_at, 200 / 5)
     h.sensor("need_fill", false); h.poll(100); state(h, "FILLING", true)
     h.poll(100); equal(state(h, "DONE").cycle, 1)
     local done_events = #h.events
@@ -450,21 +450,21 @@ test("timer rescheduling failure during active work stops outputs and forbids re
     equal(#h.events, stopped)
 end)
 
-test("tick conversion uses sixteen ticks per millisecond", function()
+test("Air724 raw ticks advance five milliseconds each", function()
     local h = fixture(); assert(h.controller.init())
-    h.poll(99); equal(h.controller.status().ready, false)
-    h.poll(1); equal(h.controller.status().ready, true)
+    h.tick = 19; h.poll(0); equal(h.controller.status().ready, false)
+    h.tick = 20; h.poll(0); equal(h.controller.status().ready, true)
     assert(h.controller.start())
-    h.poll(999); state(h, "DRAINING", false, true)
-    h.poll(1); equal(state(h, "FAULT").reason, "drain_timeout")
+    h.tick = 219; h.poll(0); state(h, "DRAINING", false, true)
+    h.tick = 220; h.poll(0); equal(state(h, "FAULT").reason, "drain_timeout")
 end)
 
 test("signed tick boundary and complete 32-bit rollover preserve deadlines", function()
     for _, start_tick in ipairs({ 2147483008, 4294966400 }) do
         local h = fixture(); h.signed = true; h.tick = start_tick
         h.ready(false); assert(h.controller.start())
-        h.poll(999); state(h, "DRAINING", false, true)
-        h.poll(1); equal(state(h, "FAULT").reason, "drain_timeout")
+        h.poll(995); state(h, "DRAINING", false, true)
+        h.poll(5); equal(state(h, "FAULT").reason, "drain_timeout")
     end
 end)
 

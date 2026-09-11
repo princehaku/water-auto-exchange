@@ -9,7 +9,7 @@ import websocket
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from server.app import Server, Store, Problem
 
-STATUS = dict(project='water_auto_exchange', version='0.5.2', state='IDLE', reason='ready',
+STATUS = dict(project='water_auto_exchange', version='0.5.3', state='IDLE', reason='ready',
               ready='1', fill='0', drain='0', outputs_known='1', need_fill='0', overflow='0',
               cycle='0', overflow_protection='0')
 

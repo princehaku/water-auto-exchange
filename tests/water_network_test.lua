@@ -23,7 +23,7 @@ local function fixture()
         sys={timerLoopStart=function(fn) f.step=fn; return 1 end},
         transport={new=function(_,callbacks) f.callbacks=callbacks; return f.client end},
         json={encode=function(value) return value end,decode=function() if f.decode_fail then error("decode") end; return f.decoded end},
-        usb={format_status=function() return "project=water_auto_exchange version=0.5.2 state="..f.state end},
+        usb={format_status=function() return "project=water_auto_exchange version=0.5.3 state="..f.state end},
         read_cert=function() return f.no_cert and "" or "-----BEGIN CERTIFICATE-----" end}
     -- Ordinary messages use fake JSON tokens; auth concatenation needs strings.
     local serial=0
@@ -37,7 +37,7 @@ local function fixture()
     function f.start() return network.start(f.controller,f.config,f.deps) end
     function f.reply(value) f.decoded=value; f.callbacks.message("{}"); end
     function f.connect() assert(f.start()); f.callbacks.open(); f.reply({type="ready",session=string.rep("a",32)}) end
-    function f.advance(ms) f.tick=(f.tick+ms*16)%4294967296;f.step() end
+    function f.advance(ms) f.tick=(f.tick+ms/5)%4294967296;f.step() end
     function f.last() return f.messages[f.sent[#f.sent]] end
     function f.offer(command,id) f.reply({type="offer",command=command,id=id or string.rep("b",32)}) end
     function f.execute(command,ttl,id) f.reply({type="execute",command=command,id=id or string.rep("b",32),ttl_ms=ttl or 8000}) end
@@ -51,6 +51,40 @@ test("plaintext and old HTTP URL rejected",function() local f=fixture();f.config
 test("missing CA prevents connection",function() local f=fixture();f.no_cert=true;assert(not f.start());assert(not f.started) end)
 test("auth key has a fixed nonsecret prefix",function() local f=fixture();f.connect();assert(f.sent[1]:find('{"type":"auth","protocol":"water-ws-v1","key"',1,true)==1) end)
 test("idle heartbeat follows one second boundaries",function() local f=fixture();f.connect();for i=1,5 do local n=#f.sent;f.advance(500);assert(#f.sent==n);f.advance(500);assert(#f.sent==n+1 and f.last().type=="ping");f.reply({type="pong",seq=f.last().seq}) end end)
+
+test("Air724 200 raw ticks produce a one second heartbeat",function()
+    local f=fixture();f.connect();local n=#f.sent
+    f.tick=199;f.step();assert(#f.sent==n)
+    f.tick=200;f.step();assert(#f.sent==n+1 and f.last().type=="ping")
+end)
+
+test("delayed cellular pong remains valid after the next ping",function()
+    local f=fixture();f.connect();f.offer("START");f.execute("START")
+    f.advance(1000);local previous=f.last().seq
+    for i=1,15 do
+        f.advance(1000);local latest=f.last().seq
+        f.reply({type="pong",seq=previous});previous=latest
+    end
+    assert(not f.closed and #f.calls==1)
+end)
+
+test("expired and duplicate pongs cannot renew active deadline",function()
+    local f=fixture();f.connect();f.offer("START");f.execute("START")
+    f.advance(1000);local seq=f.last().seq;f.reply({type="pong",seq=seq})
+    f.advance(8000);f.reply({type="pong",seq=seq})
+    f.advance(2000);assert(f.closed and f.calls[2]=="STOP")
+    local g=fixture();g.connect();g.offer("START");g.execute("START")
+    g.advance(1000);seq=g.last().seq
+    -- Deliver the expired reply before the watchdog next runs.
+    g.tick=g.tick+2000;g.reply({type="pong",seq=seq});g.step()
+    assert(g.closed and g.calls[2]=="STOP")
+end)
+
+test("a pong from a previous connection cannot renew deadline",function()
+    local f=fixture();f.connect();f.advance(1000);local seq=f.last().seq
+    f.callbacks.close();f.closed=false;f.callbacks.open();f.reply({type="ready",session=string.rep("c",32)})
+    f.advance(74000);f.reply({type="pong",seq=seq});f.advance(1000);assert(f.closed)
+end)
 test("state changes are immediately reported",function() local f=fixture();f.connect();f.state="FAULT";f.advance(500);assert(f.last().type=="status") end)
 test("offer alone cannot start outputs",function() local f=fixture();f.connect();f.offer("START");assert(f.last().type=="claim" and #f.calls==0) end)
 test("claim execute and ack completes",function() local f=fixture();f.connect();f.offer("START");f.execute("START");assert(f.calls[1]=="START");assert(f.last().ack.status=="succeeded") end)

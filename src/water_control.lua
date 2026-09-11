@@ -91,13 +91,15 @@ function M.new(config, dependencies)
     local function now()
         local raw = tick_fn()
         assert(type(raw) == "number" and raw == raw and math.abs(raw) < math.huge, "invalid_clock")
-        -- V2.4.4 patch.lua defines os.clockms() as rtos.tick()/16.
+        -- Air724UG rtos.tick() counts 5 ms ticks. The legacy library's
+        -- os.clockms() implementation using /16 is incompatible here.
+        -- https://doc.openluat.com/wiki/21?wiki_page_id=2247
         -- Normalize signed/unsigned 32-bit ticks and accumulate across rollover.
         local current = raw % 4294967296
         if previous_tick ~= nil then
             local delta = (current - previous_tick) % 4294967296
             assert(delta < 2147483648, "clock_discontinuity")
-            elapsed_ms = elapsed_ms + delta / 16
+            elapsed_ms = elapsed_ms + delta * 5
         end
         previous_tick = current
         return math.floor(elapsed_ms)

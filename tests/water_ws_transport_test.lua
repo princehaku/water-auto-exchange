@@ -57,4 +57,45 @@ test("socket operations may yield in the owner coroutine",function()
     io.connect=function() error("injected owner failure") end
     local ok=coroutine.resume(co);assert(not ok and client:failed())
 end)
+local function timed_fixture()
+    local f={tick=0,opened=false}
+    _G.rtos={tick=function() return f.tick end}
+    local io={connect=function() return coroutine.yield("CONNECT") end,
+        send=function() return coroutine.yield("SEND") end,
+        recv=function() return coroutine.yield("RECV") end,
+        close=function() coroutine.yield("CLOSE") end}
+    local sys={taskInit=function(fn) f.co=coroutine.create(fn);return f.co end,
+        publish=function() end,wait=function(ms) coroutine.yield("WAIT",ms) end}
+    f.client=ws.new({url="wss://example.test/water/api/device/ws",device_key=string.rep("k",32),ca_cert="water-ca.crt"},
+        {open=function() f.opened=true end},{sys=sys,
+        socket={isReady=function() return true end,tcp=function() return io end},
+        crypto={sha1=function() return string.rep("0",40) end,base64_encode=function(_,size) return "base64_"..size end}})
+    function f.resume(expected,...)
+        local ok,phase,value=coroutine.resume(f.co,...)
+        assert(ok,tostring(phase));assert(phase==expected,tostring(phase));return value
+    end
+    function f.upgrade()
+        f.resume("SEND",true);f.resume("RECV",true)
+        f.resume("RECV",true,"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: base64_20\r\n\r\n")
+        assert(f.opened)
+    end
+    f.client:start();f.resume("CONNECT")
+    return f
+end
+
+test("HTTP upgrade deadline is 2000 Air724 ticks",function()
+    local f=timed_fixture();f.resume("SEND",true);f.resume("RECV",true)
+    f.tick=1999;f.resume("RECV",false,"timeout")
+    f.tick=2000;f.resume("CLOSE",false,"timeout")
+    assert(f.resume("WAIT")==1000 and not f.opened)
+end)
+
+test("backoff resets only after 60 real seconds online",function()
+    for _,ticks in ipairs({11999,12000}) do
+        local f=timed_fixture();f.resume("CLOSE",false)
+        assert(f.resume("WAIT")==1000);f.resume("CONNECT");f.upgrade()
+        f.tick=ticks;f.resume("CLOSE",false,"closed")
+        assert(f.resume("WAIT")==(ticks==12000 and 1000 or 2000))
+    end
+end)
 print("water_ws_transport: "..count.." tests passed")

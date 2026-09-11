@@ -114,7 +114,7 @@ function M.new(config, callbacks, deps)
             elseif chunk ~= "timeout" and chunk ~= event then print("WATER WS upgrade_receive_failed"); return end
             if #response > 16384 or client.cancelled then return end
             boundary = response:find("\r\n\r\n", 1, true)
-            if (rtos.tick() - started) % 4294967296 >= 160000 then print("WATER WS upgrade_timeout"); return end
+            if ((rtos.tick() - started) % 4294967296) * 5 >= 10000 then print("WATER WS upgrade_timeout"); return end
         until boundary
         local headers = response:sub(1, boundary + 3)
         local accept_source = key .. "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
@@ -172,7 +172,7 @@ function M.new(config, callbacks, deps)
                     run_connection(io)
                     io:close()
                 else print("WATER WS socket_create_failed") end
-                local stable = client.connected and (rtos.tick() - client.connected_at) % 4294967296 >= 960000
+                local stable = client.connected and ((rtos.tick() - client.connected_at) % 4294967296) * 5 >= 60000
                 client.connected, client.queue = false, {}
                 notify("close")
                 if stable then backoff = 1000 end

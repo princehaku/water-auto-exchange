@@ -100,6 +100,36 @@ class WebSocketTests(unittest.TestCase):
     def test_slow_send_firmware_manual_roundtrip(self):
         self.manual_roundtrip('0.7.5')
 
+    def test_traffic_firmware_manual_roundtrip(self):
+        self.manual_roundtrip('0.7.6')
+
+    def test_live_traffic_report_and_repeated_report_are_acknowledged(self):
+        c=self.connect(status=dict(STATUS,version='0.7.6',control_mode='manual'))
+        value=dict(type='traffic',meter='a'*32,total_bytes=4096,interval_bytes=4096,interval_seconds=60)
+        for _ in range(2):
+            c.send(json.dumps(value))
+            self.assertEqual(json.loads(c.recv())['type'],'received')
+        self.assertEqual(self.store.snapshot()['traffic']['total_bytes'],4096)
+
+    def test_cellular_authentication_can_arrive_after_the_former_five_seconds(self):
+        c=self.connect(False)
+        time.sleep(5.2)
+        c.send(json.dumps(dict(type='auth', key='b'*32, status=STATUS)))
+        self.assertEqual(json.loads(c.recv())['type'],'ready')
+
+    def test_previous_owner_can_reconnect_without_waiting_for_old_socket_timeout(self):
+        first=self.connect()
+        old_session=self.store.ws_gateway
+        self.store.enqueue('DRAIN','d'*32)
+        second=self.connect(False)
+        second.send(json.dumps(dict(type='auth',key='b'*32,status=STATUS,previous_session=old_session)))
+        ready=json.loads(second.recv());self.assertEqual(ready['type'],'ready')
+        self.assertNotEqual(old_session,ready['session'])
+        self.assertEqual(self.store.snapshot()['commands'][0]['status'],'uncertain')
+        first.close()
+        second.send(json.dumps(dict(type='ping',seq=1)))
+        self.assertEqual(json.loads(second.recv()),dict(type='pong',seq=1))
+
     def manual_roundtrip(self, version):
         status=dict(STATUS,version=version,control_mode='manual',need_fill='unknown')
         c=self.connect(status=status)

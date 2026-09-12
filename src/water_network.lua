@@ -38,6 +38,10 @@ function M.start(controller, config, deps)
         or send_ms < 5000 or send_ms > 60000) then
         return false, "network_send_timeout_invalid"
     end
+    local auth_ms = config.auth_timeout_ms == nil and 30000 or config.auth_timeout_ms
+    if type(auth_ms) ~= "number" or auth_ms % 1000 ~= 0 or auth_ms < 5000 or auth_ms > 60000 then
+        return false, "network_auth_timeout_invalid"
+    end
     for _, key in ipairs({"heartbeat_ms", "active_heartbeat_ms", "offline_stop_ms", "idle_timeout_ms"}) do
         if type(config[key]) ~= "number" or config[key] % 1 ~= 0 or config[key] < 500 or config[key] > 75000 then
             return false, "network_timing_invalid"
@@ -83,6 +87,9 @@ function M.start(controller, config, deps)
     local client, ready, opened, owned, enabled = nil, false, false, false, true
     local last_ok, last_ping, ping_seq, pong_seq, signature = 0, 0, 0, 0, nil
     local pings, report_steps = {}, 0
+    local meter_id, traffic_total, traffic_seq, traffic_sent = nil, 0, 0, 0
+    local previous_session
+    local traffic_bytes, traffic_seconds, traffic_at = 0, 60, now()
     local pending, seen, seen_count = {}, {}, 0
     local raw_stop = controller.stop
     local function stop_outputs()
@@ -120,6 +127,9 @@ function M.start(controller, config, deps)
         if not ready then
             if value.type ~= "ready" or type(value.session) ~= "string" or #value.session ~= 32 then lost("auth_failed"); return end
             ready, last_ok, last_ping = true, time, time
+            -- Keep one server-issued meter id across reconnects, until reboot.
+            meter_id = meter_id or value.session
+            previous_session = value.session
             print("WATER WS online")
             return
         end
@@ -171,13 +181,15 @@ function M.start(controller, config, deps)
         open = function()
             if not enabled then client:close(); return end
             ready, opened, pending, seen, seen_count, pings = false, true, {}, {}, 0, {}
+            traffic_sent = 0
             pong_seq = ping_seq
             last_ok, last_ping = now(), now()
             local status, text = telemetry()
             signature = text
             -- Fixed prefix keeps credentials outside socket4G's 30-byte debug preview.
             local auth = '{"type":"auth","protocol":"water-ws-v1","key":' .. json.encode(config.device_key)
-                .. ',"status":' .. json.encode(status) .. '}'
+                .. ',"status":' .. json.encode(status)
+                .. (previous_session and ',"previous_session":' .. json.encode(previous_session) or '') .. '}'
             if client:send(auth, "auth") ~= true then lost("auth_send_failed") end
         end,
         message = function(body)
@@ -194,9 +206,14 @@ function M.start(controller, config, deps)
         local status, text = telemetry()
         local active = ACTIVE[status.state] == true
         if owned and not active then owned = false end
-        local limit = (not ready or active) and config.offline_stop_ms or config.idle_timeout_ms
-        if time - last_ok >= limit then lost("heartbeat_timeout"); return end
+        local limit = not ready and auth_ms or (active and config.offline_stop_ms or config.idle_timeout_ms)
+        if time - last_ok >= limit then lost(not ready and "auth_timeout" or "heartbeat_timeout"); return end
         if not ready then return end
+        if traffic_seq > traffic_sent then
+            if send({type="traffic", meter=meter_id, total_bytes=traffic_total,
+                interval_bytes=traffic_bytes, interval_seconds=traffic_seconds}) then traffic_sent=traffic_seq end
+            if not ready then return end
+        end
         if text ~= signature then if send({type = "status", status = status}) then signature = text end end
         local interval = active and config.active_heartbeat_ms or config.heartbeat_ms
         if time - last_ping >= interval then
@@ -225,6 +242,23 @@ function M.start(controller, config, deps)
     if not ok or not timer or timer == 0 then
         enabled = false; controller.stop = raw_stop
         return false, "network_timer_failed"
+    end
+    if config.traffic_enabled == true then
+        local accounting_ok = pcall(function()
+            local accounting = deps.socket or require "socket"
+            assert(type(accounting.setIpStatis) == "function")
+            sys.subscribe("LIB_IP_STATIS_RPT", function(bytes)
+                if type(bytes) ~= "number" or bytes % 1 ~= 0 or bytes < 0
+                    or traffic_total + bytes > 9007199254740991 then return end
+                local clock_ok, time = pcall(now)
+                if not clock_ok then return end
+                traffic_total, traffic_bytes = traffic_total + bytes, bytes
+                traffic_seconds = math.max(1, math.floor((time - traffic_at) / 1000))
+                traffic_at, traffic_seq = time, traffic_seq + 1
+            end)
+            accounting.setIpStatis(60)
+        end)
+        print("WATER NET traffic=" .. (accounting_ok and "estimated interval_s=60" or "unavailable"))
     end
     client:start()
     return true, "network_started"

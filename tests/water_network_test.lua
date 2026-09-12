@@ -24,7 +24,7 @@ local function fixture()
         sys={timerLoopStart=function(fn) f.step=fn; return 1 end},
         transport={new=function(_,callbacks) f.callbacks=callbacks; return f.client end},
         json={encode=function(value) return value end,decode=function() if f.decode_fail then error("decode") end; return f.decoded end},
-        usb={format_status=function() return "project=water_auto_exchange version=0.7.5 state="..f.state end},
+        usb={format_status=function() return "project=water_auto_exchange version=0.7.6 state="..f.state end},
         read_cert=function() return f.no_cert and "" or "-----BEGIN CERTIFICATE-----" end}
     -- Ordinary messages use fake JSON tokens; auth concatenation needs strings.
     local serial=0
@@ -193,4 +193,82 @@ test("reversed clock stops and disables",function() local f=fixture();f.connect(
 test("standalone USB cycle survives unrelated WS failure",function() local f=fixture();f.connect();f.controller.start();f.callbacks.close();assert(#f.calls==1) end)
 test("timer failure does not start owner task",function() local f=fixture();f.deps.sys.timerLoopStart=function() return nil end;assert(not f.start());assert(not f.started) end)
 test("dead transport owner stops remote cycle",function() local f=fixture();f.connect();f.offer("START");f.execute("START");f.client.failed=function() return true end;f.advance(500);assert(f.calls[2]=="STOP" and f.closed) end)
+test("authentication budget tolerates delayed ready but is still bounded",function()
+    local f=fixture();assert(f.start());f.callbacks.open()
+    f.advance(15000);assert(not f.closed)
+    f.reply({type="ready",session=string.rep("a",32)})
+    f.offer("FILL");f.execute("FILL");f.advance(10000)
+    assert(f.closed and f.calls[2]=="STOP")
+    local g=fixture();assert(g.start());g.callbacks.open();g.advance(29995);assert(not g.closed)
+    g.advance(5);assert(g.closed and #g.calls==0)
+    for _,value in ipairs({false,0,"30000",5500,61000,math.huge,0/0}) do
+        local h=fixture();h.config.auth_timeout_ms=value
+        local ok,reason=h.start();assert(not ok and reason=="network_auth_timeout_invalid")
+    end
+end)
+
+local function metered_fixture()
+    local f=fixture();f.config.traffic_enabled=true
+    f.deps.sys.subscribe=function(event,callback) assert(event=="LIB_IP_STATIS_RPT");f.report_flow=callback end
+    f.deps.socket={setIpStatis=function(interval) assert(interval==60);f.accounting_started=true end}
+    function f.traffic_messages()
+        local result={}
+        for _,token in ipairs(f.sent) do
+            local item=f.messages[token]
+            if type(item)=="table" and item.type=="traffic" then result[#result+1]=item end
+        end
+        return result
+    end
+    return f
+end
+
+test("IP accounting reports cumulative bytes only after a sample and authenticated ready",function()
+    local f=metered_fixture();f.connect();assert(f.accounting_started)
+    f.advance(59000);assert(#f.traffic_messages()==0)
+    f.advance(1000);f.report_flow(1024);f.step()
+    local samples=f.traffic_messages();assert(#samples==1)
+    assert(samples[1].total_bytes==1024 and samples[1].interval_bytes==1024 and samples[1].interval_seconds==60)
+    for _=1,10 do f.step() end
+    assert(#f.traffic_messages()==1 and #f.calls==0)
+end)
+
+test("accounting survives reconnect and offline samples without resetting meter id",function()
+    local f=metered_fixture();f.connect();f.advance(60000);f.report_flow(1024);f.step()
+    f.callbacks.close();f.closed=false
+    f.advance(60000);f.report_flow(2048);f.step()
+    assert(#f.traffic_messages()==1)
+    f.callbacks.open();f.reply({type="ready",session=string.rep("c",32)});f.step()
+    local samples=f.traffic_messages();assert(#samples==2)
+    assert(samples[2].meter==samples[1].meter and samples[2].total_bytes==3072 and samples[2].interval_seconds==60)
+end)
+
+test("unavailable accounting never prevents network start and invalid samples are ignored",function()
+    local f=metered_fixture();f.deps.socket={};f.connect();assert(f.started and not f.accounting_started)
+    local g=metered_fixture();g.connect()
+    for _,bytes in ipairs({-1,false,"100",0/0,math.huge,1.5}) do g.report_flow(bytes) end
+    g.step();assert(#g.traffic_messages()==0)
+end)
+
+test("healthy heartbeats keep one authenticated connection open for ten minutes",function()
+    local f=fixture();f.connect()
+    for _=1,600 do f.advance(1000);f.reply({type="pong",seq=f.last().seq}) end
+    assert(not f.closed and #f.calls==0)
+    local auths=0;for _,kind in ipairs(f.kinds) do if kind=="auth" then auths=auths+1 end end
+    assert(auths==1)
+end)
+
+test("reconnect auth carries the previous server session without replaying a command",function()
+    local f=fixture();f.connect()
+    assert(not f.sent[1]:find('"previous_session"',1,true))
+    f.offer("FILL");f.execute("FILL");f.callbacks.close();assert(f.calls[2]=="STOP")
+    f.callbacks.open()
+    local auth=f.sent[#f.sent];assert(auth:find('"previous_session"',1,true))
+    local token=auth:match('"previous_session":([^}]+)')
+    assert(f.messages[token]==string.rep("a",32))
+    f.reply({type="ready",session=string.rep("c",32)})
+    f.callbacks.close();f.callbacks.open()
+    token=f.sent[#f.sent]:match('"previous_session":([^}]+)')
+    assert(f.messages[token]==string.rep("c",32) and #f.calls==2)
+end)
+
 print("water_network: "..count.." tests passed")

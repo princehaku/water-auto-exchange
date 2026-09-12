@@ -24,7 +24,7 @@ class Problem(Exception):
 def validate_status(value):
     if not isinstance(value, dict):
         raise Problem(400, 'invalid_status')
-    if value.get('project') != 'water_auto_exchange' or value.get('version') not in ('0.3.0', '0.4.0', '0.5.0', '0.5.1', '0.5.2', '0.5.3', '0.6.0', '0.7.0', '0.7.1', '0.7.2', '0.7.3', '0.7.4', '0.7.5'):
+    if value.get('project') != 'water_auto_exchange' or value.get('version') not in ('0.3.0', '0.4.0', '0.5.0', '0.5.1', '0.5.2', '0.5.3', '0.6.0', '0.7.0', '0.7.1', '0.7.2', '0.7.3', '0.7.4', '0.7.5', '0.7.6'):
         raise Problem(409, 'firmware_mismatch')
     if value.get('state') not in ('UNCONFIGURED', 'IDLE', 'DONE', 'FAULT') + ACTIVE:
         raise Problem(400, 'invalid_state')
@@ -40,7 +40,7 @@ def validate_status(value):
             raise Problem(400, 'invalid_flag')
     if result['need_fill'] not in ('0', '1', 'unknown') or not result['cycle'].isdigit():
         raise Problem(400, 'invalid_level_or_cycle')
-    if result['version'] in ('0.7.0', '0.7.1', '0.7.2', '0.7.3', '0.7.4', '0.7.5'):
+    if result['version'] in ('0.7.0', '0.7.1', '0.7.2', '0.7.3', '0.7.4', '0.7.5', '0.7.6'):
         if value.get('control_mode') not in ('manual', 'automatic'):
             raise Problem(400, 'invalid_control_mode')
         result['control_mode'] = value['control_mode']
@@ -61,6 +61,12 @@ class Store:
             CREATE TABLE IF NOT EXISTS admin_sessions (
               token_hash TEXT PRIMARY KEY, expires REAL NOT NULL,
               admin_key_hash TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS connection_events (
+              id INTEGER PRIMARY KEY, at REAL NOT NULL, state TEXT NOT NULL, reason TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS device_snapshot (id INTEGER PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS traffic_meters (
+              id TEXT PRIMARY KEY, total INTEGER NOT NULL, interval_bytes INTEGER NOT NULL,
+              interval_seconds INTEGER NOT NULL, updated REAL NOT NULL);
         ''')
         # Restart never resurrects commands or claims that old telemetry is live.
         self.db.execute("UPDATE commands SET status='uncertain', result='server_restarted' WHERE status IN ('queued','delivered')")
@@ -68,6 +74,61 @@ class Store:
         self.status, self.seen, self.gateway = None, None, None
         self.gateway_seen = 0
         self.ws_gateway = None
+        self.connection_state, self.connection_since, self.connection_reason = 'offline', None, 'never_connected'
+        saved = self.db.execute('SELECT value FROM device_snapshot WHERE id=1').fetchone()
+        if saved:
+            previous = json.loads(saved['value'])
+            self.status, self.seen = previous.get('device'), previous.get('last_seen')
+        event = self.db.execute('SELECT * FROM connection_events ORDER BY id DESC LIMIT 1').fetchone()
+        if event:
+            self.connection_state, self.connection_since, self.connection_reason = event['state'], event['at'], event['reason']
+            if self.connection_state == 'online':
+                self.connection_event(False, 'server_restarted')
+
+    def connection_event(self, online, reason):
+        state = 'online' if online else 'offline'
+        if state == self.connection_state:
+            return
+        self.connection_state, self.connection_since, self.connection_reason = state, self.clock(), reason
+        self.db.execute('INSERT INTO connection_events(at,state,reason) VALUES(?,?,?)',
+                        (self.connection_since, state, reason))
+        self.db.execute('DELETE FROM connection_events WHERE id NOT IN (SELECT id FROM connection_events ORDER BY id DESC LIMIT 60)')
+        self.save_device_snapshot()
+
+    def save_device_snapshot(self):
+        self.db.execute('INSERT OR REPLACE INTO device_snapshot VALUES(1,?)',
+                        (json.dumps(dict(device=self.status, last_seen=self.seen)),))
+        self.db.commit()
+
+    def traffic_report(self, session, value):
+        with self.lock:
+            if session != self.ws_gateway or session is None:
+                raise Problem(409, 'stale_session')
+            meter = value.get('meter')
+            if not isinstance(meter, str) or len(meter) != 32 or any(c not in '0123456789abcdef' for c in meter):
+                raise Problem(400, 'invalid_traffic')
+            numbers = [value.get(k) for k in ('total_bytes', 'interval_bytes', 'interval_seconds')]
+            if any(type(n) not in (int, float) or not 0 <= n <= 9007199254740991 or n % 1 for n in numbers):
+                raise Problem(400, 'invalid_traffic')
+            total, interval, seconds = map(int, numbers)
+            if interval > total or not 1 <= seconds <= 31536000:
+                raise Problem(400, 'invalid_traffic')
+            previous = self.db.execute('SELECT total FROM traffic_meters WHERE id=?', (meter,)).fetchone()
+            # Cumulative boot counters make lost receipts and reconnect replay idempotent.
+            if previous is None or total > previous['total']:
+                self.db.execute('INSERT OR REPLACE INTO traffic_meters VALUES(?,?,?,?,?)',
+                                (meter, total, interval, seconds, self.clock()))
+                self.db.commit()
+            self.ws_touch(session)
+
+    def traffic_snapshot(self):
+        latest = self.db.execute('SELECT * FROM traffic_meters ORDER BY updated DESC, rowid DESC LIMIT 1').fetchone()
+        total = self.db.execute('SELECT SUM(total) FROM traffic_meters').fetchone()[0]
+        return dict(available=latest is not None, total_bytes=total,
+                    boot_bytes=latest['total'] if latest else None,
+                    interval_bytes=latest['interval_bytes'] if latest else None,
+                    interval_seconds=latest['interval_seconds'] if latest else None,
+                    last_report_at=latest['updated'] if latest else None)
 
     def prune_admin_sessions(self, admin_key):
         with self.lock:
@@ -104,13 +165,20 @@ class Store:
         self.db.commit()
 
     def online(self):
-        limit = 75 if self.ws_gateway and self.status and self.status['state'] not in ACTIVE else 10
-        return self.seen is not None and self.clock() - self.seen <= limit
+        with self.lock:
+            limit = 75 if self.ws_gateway and self.status and self.status['state'] not in ACTIVE else 10
+            online = self.gateway is not None and self.seen is not None and self.clock() - self.seen <= limit
+            self.connection_event(online, 'connected' if online else 'heartbeat_timeout')
+            return online
 
     def snapshot(self):
         with self.lock:
             self.expire()
-            return dict(online=self.online(), last_seen=self.seen, device=self.status,
+            online = self.online()
+            return dict(online=online, last_seen=self.seen, device=self.status, server_time=self.clock(),
+                        connection=dict(state=self.connection_state, since=self.connection_since, reason=self.connection_reason,
+                                        events=[dict(r) for r in self.db.execute('SELECT at,state,reason FROM connection_events ORDER BY id DESC LIMIT 60')]),
+                        traffic=self.traffic_snapshot(),
                         commands=[dict(r) for r in self.db.execute('SELECT * FROM commands ORDER BY created DESC, rowid DESC LIMIT 60')])
 
     def enqueue(self, command, request_id):
@@ -126,7 +194,7 @@ class Store:
             if not self.online():
                 raise Problem(409, 'device_offline')
             s = self.status
-            if command == 'DRAIN' and s['version'] not in ('0.6.0', '0.7.0', '0.7.1', '0.7.2', '0.7.3', '0.7.4', '0.7.5'):
+            if command == 'DRAIN' and s['version'] not in ('0.6.0', '0.7.0', '0.7.1', '0.7.2', '0.7.3', '0.7.4', '0.7.5', '0.7.6'):
                 raise Problem(409, 'firmware_upgrade_required')
             if command == 'START' and s.get('control_mode') == 'manual':
                 raise Problem(409, 'automatic_mode_required')
@@ -164,6 +232,7 @@ class Store:
                     raise Problem(400, 'invalid_ack')
                 self.db.execute("UPDATE commands SET status=?, result=?, finished=? WHERE id=? AND status IN ('delivered','uncertain')", (ack['status'], ack['result'], now, ack.get('id')))
             self.status, self.seen = status, now
+            self.connection_event(True, 'connected')
             row = self.db.execute("SELECT * FROM commands WHERE status='queued' ORDER BY CASE command WHEN 'STOP' THEN 0 ELSE 1 END, created LIMIT 1").fetchone()
             if row:
                 self.db.execute("UPDATE commands SET status='delivered' WHERE id=?", (row['id'],))
@@ -181,9 +250,15 @@ class Store:
             self.gateway_seen, self.seen = now, None
             return dict(gateway=self.gateway)
 
-    def ws_open(self, status):
+    def ws_open(self, status, previous_session=None):
         status = validate_status(status)
         with self.lock:
+            # Only the authenticated previous owner can replace its half-open
+            # session immediately; another client still cannot evict a live owner.
+            if self.ws_gateway and isinstance(previous_session, str) and hmac.compare_digest(previous_session, self.ws_gateway):
+                self.ws_close(self.ws_gateway, 'session_replaced')
+            elif self.ws_gateway and not self.online():
+                self.ws_close(self.ws_gateway, 'heartbeat_timeout')
             if self.ws_gateway or (self.gateway and self.gateway_seen > self.clock() - 15):
                 raise Problem(409, 'another_device_active')
             self.ws_gateway = self.gateway = secrets.token_hex(16)
@@ -191,6 +266,7 @@ class Store:
             self.db.commit()
             self.status, self.seen = status, self.clock()
             self.gateway_seen = self.seen
+            self.connection_event(True, 'connected')
             return self.ws_gateway
 
     def ws_touch(self, session, status=None, ack=None):
@@ -205,6 +281,7 @@ class Store:
                 self.db.execute("UPDATE commands SET status=?, result=?, finished=? WHERE id=? AND status IN ('delivered','uncertain')", (ack['status'], ack['result'], self.clock(), ack['id']))
                 self.db.commit()
             self.seen = self.gateway_seen = self.clock()
+            self.connection_event(True, 'connected')
 
     def ws_offer(self, session):
         with self.lock:
@@ -228,14 +305,16 @@ class Store:
                 return dict(type='expired', id=command_id)
             return dict(type='execute', id=row['id'], command=row['command'], ttl_ms=max(0, int((row['expires'] - self.clock()) * 1000)))
 
-    def ws_close(self, session):
+    def ws_close(self, session, reason='connection_closed'):
         with self.lock:
             if session != self.ws_gateway:
                 return
             self.db.execute("UPDATE commands SET status='uncertain', result='device_disconnected', finished=? WHERE status IN ('queued','delivered')", (self.clock(),))
             self.db.commit()
             self.ws_gateway = self.gateway = None
-            self.gateway_seen, self.seen = 0, None
+            self.gateway_seen = 0
+            self.connection_event(False, reason)
+            self.save_device_snapshot()
 
 
 class Server(ThreadingMixIn, HTTPServer):

@@ -1,12 +1,12 @@
 # Air724UG 自动换水
 
-> 2026-09-12：源码 **0.7.5** 将WSS发送等待从5秒改为默认30秒，合并积压心跳，并在发送帧之间处理接收数据。183项Lua、58项后端及浏览器联调通过。用户17:22日志确认实板0.7.4已就绪并曾认证上线，但随后发送超时；0.7.5待下载和实板验证，不能声称网络已稳定。
+> 2026-09-12：源码 **0.7.6** 新增Web在线/离线详情、持久连接记录与设备估算流量，放宽认证等待并回收超时旧会话。189项Lua、70项Python及桌面/手机浏览器联调通过。实板保存日志已是0.7.5；0.7.6需下载后验证真实流量上报与4G稳定性。
 
-`water_auto_exchange 0.7.5` 默认采用手动模式：FILL开启补水，DRAIN开启冲水（排水），STOP关闭。两路互锁，单次默认最多120秒；自动液位模式须显式配置。本地USB控制不需要SIM，4G远程控制需要可用数据连接。
+`water_auto_exchange 0.7.6` 默认采用手动模式：FILL开启补水，DRAIN开启冲水（排水），STOP关闭。两路互锁，单次默认最多120秒；自动液位模式须显式配置。本地USB控制不需要SIM，4G远程控制需要可用数据连接。
 
 上电待机，立即打印状态，之后每 5 秒打印一次。USB 支持 `STATUS`、`START`、`FILL`、`DRAIN`、`STOP`、`RESET`。已实现输入防抖、进排水互锁、阶段超时、故障锁存及可选超高水位输入。当前由手动命令开启/关闭对应输出，尚未设置定时计划。
 
-**实板最近已确认0.7.4/manual/IDLE/ready=1/outputs_known=1，0.7.5待下载。** 两路配置延续补水DO2/GPIO23、排水出纸口/GPIO5；关断沿用旧扫描中用户测过的“写LOW后pins.close”，开机关闭两路，开启命令才重新配置并拉高。手动模式不要求液位反馈。WSS保留可选证书、60秒建连、每秒心跳、活动10秒失联停止及重连不重开水；见[网络恢复与配置](docs/network-recovery.md)。
+**实板最近保存日志确认0.7.5/manual/IDLE/ready=1/outputs_known=1，0.7.6待下载。** 两路配置延续补水DO2/GPIO23、排水出纸口/GPIO5；关断沿用旧扫描中用户测过的“写LOW后pins.close”，开机关闭两路，开启命令才重新配置并拉高。手动模式不要求液位反馈。WSS保留可选证书、60秒建连、每秒心跳、活动10秒失联停止及重连不重开水；见[网络恢复与配置](docs/network-recovery.md)。
 
 ## 配置与使用
 
@@ -33,7 +33,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\water-command.ps1 -P
 
 ## 下载
 
-在 LuaTools `water-online-0.7.5` 项目中保留 `LuatOS-Air_V4035_RDA8910_TTS_NOLVGL_FLOAT` CORE 和默认 LuaTask V2.4.4 库。项目配置已改为下载包清单中的 8 个 Lua 文件和 1 个 CA 证书；若界面仍显示旧清单，重新载入项目核对后，由用户点击“下载脚本”：
+在 LuaTools `water-online-0.7.6` 项目中保留 `LuatOS-Air_V4035_RDA8910_TTS_NOLVGL_FLOAT` CORE 和默认 LuaTask V2.4.4 库。项目配置已改为下载包清单中的 8 个 Lua 文件和 1 个 CA 证书；若界面仍显示旧清单，重新载入项目核对后，由用户点击“下载脚本”：
 
 ```text
 build/firmware/main.lua
@@ -49,11 +49,11 @@ build/firmware/water-ca.crt
 
 4G 上板使用同一生成目录中的整包文件，操作步骤见 [Web 与 4G 接入](docs/web-console.md)，避免把已含密钥的配置提交到 src。
 
-下载后通过 `STATUS` 确认 `project=water_auto_exchange version=0.7.5`。默认应为 `state=IDLE reason=ready ready=1 outputs_known=1 control_mode=manual`、两路输出为0（字段顺序可不同）。旧 `motor-command.ps1` 和 `gpio-probe.ps1` 用于历史诊断，不操作新版。
+下载后通过 `STATUS` 确认 `project=water_auto_exchange version=0.7.6`。默认应为 `state=IDLE reason=ready ready=1 outputs_known=1 control_mode=manual`、两路输出为0（字段顺序可不同）。旧 `motor-command.ps1` 和 `gpio-probe.ps1` 用于历史诊断，不操作新版。
 
 ## 本地验证
 
-Lua 5.1模拟183项、Python后端58项和本地Edge浏览器联调通过。测试未控制实板GPIO；实板最近0.7.4，新版0.7.5网络恢复效果仍待下载验证。
+Lua 5.1模拟189项、Python后端70项和本地Edge浏览器联调通过。测试未控制实板GPIO；实板最近0.7.5，新版0.7.6网络恢复及流量上报效果仍待下载验证。
 
 ## 硬件依据与记录
 
@@ -71,7 +71,7 @@ Lua 5.1模拟183项、Python后端58项和本地Edge浏览器联调通过。测�
 
 ## 网站入口
 
-项目入口：https://bytegallop.com/water/ 。现已实现带鉴权的控制台、状态/故障展示、命令与回执记录，以及 Air724UG 4G 独立接入。当前下载目标为0.7.5，实板上线仍需核对版本及持续心跳回执。部署脚本、Nginx 片段及操作说明见 [网站部署](docs/deployment.md)。本地仓库位于 `E:\water-auto-exchange`。
+项目入口：https://bytegallop.com/water/ 。现已实现带鉴权的控制台、状态/故障展示、命令与回执记录，以及 Air724UG 4G 独立接入。当前下载目标为0.7.6，实板上线仍需核对版本及持续心跳回执。部署脚本、Nginx 片段及操作说明见 [网站部署](docs/deployment.md)。本地仓库位于 `E:\water-auto-exchange`。
 
 ## 4G 与 Web
 

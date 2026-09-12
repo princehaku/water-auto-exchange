@@ -11,7 +11,7 @@ errors.firmware_upgrade_required='请先更新设备固件，再使用单独冲�
 reasons.manual_filling='补水已打开，可点击开关关闭';
 reasons.manual_draining='冲水已打开，可点击开关关闭';
 reasons.ready='已就绪，可以操作';
-let snapshot=null, signedIn=false, busy=false, refreshing=false, lastSuccess=0, submittedId=null;
+let snapshot=null, lastSnapshot=null, signedIn=false, busy=false, refreshing=false, lastSuccess=0, submittedId=null;
 function message(text){$('message').textContent=text;}
 async function api(path, body){
   const response=await fetch('./api/'+path,{method:body===undefined?'GET':'POST',credentials:'same-origin',cache:'no-store',headers:body===undefined?{}:{'Content-Type':'application/json'},body:body===undefined?undefined:JSON.stringify(body),signal:AbortSignal.timeout(6000)});
@@ -19,14 +19,40 @@ async function api(path, body){
   if(!response.ok){if(response.status===401 && path!=='login')showLogin();throw new Error(errors[data.error]||'操作失败：'+(data.error||response.status));}
   return data;
 }
-function showLogin(){signedIn=false;snapshot=null;$('console').hidden=true;$('login-panel').hidden=false;}
+function showLogin(){signedIn=false;snapshot=null;lastSnapshot=null;$('console').hidden=true;$('login-panel').hidden=false;}
 function timeLabel(t){return t?new Date(t*1000).toLocaleString('zh-CN',{hour12:false}):'尚未收到数据';}
+function durationLabel(seconds){if(!Number.isFinite(seconds))return '—';seconds=Math.max(0,Math.floor(seconds));if(seconds<60)return seconds+' 秒';if(seconds<3600)return Math.floor(seconds/60)+' 分 '+seconds%60+' 秒';if(seconds<86400)return Math.floor(seconds/3600)+' 小时 '+Math.floor(seconds%3600/60)+' 分';return Math.floor(seconds/86400)+' 天 '+Math.floor(seconds%86400/3600)+' 小时';}
+function bytesLabel(bytes){if(!Number.isFinite(bytes)||bytes<0)return '—';const units=['B','KB','MB','GB','TB'];let i=0;while(bytes>=1024&&i<units.length-1){bytes/=1024;i++;}return (i?bytes.toFixed(2):Math.floor(bytes))+' '+units[i];}
+const connectionReasons={connected:'设备已认证，长连接已建立',connection_closed:'连接已关闭',peer_disconnected:'设备连接已断开',peer_closed:'设备主动结束连接',heartbeat_timeout:'通信超时，等待设备重新连接',server_restarted:'服务已重启，等待设备重新连接',protocol_or_internal_error:'连接异常，等待设备重新连接',never_connected:'等待设备首次连接',auth_timeout:'认证等待超时',stale_session:'旧会话已结束',session_replaced:'设备重连，已替换上一条连接'};
+function renderConnection(data, serviceOk=true){
+  const online=data?.online===true, c=data?.connection;
+  $('connection').textContent=serviceOk?(online?'● 设备在线':'○ 设备离线'):'○ 服务连接中断';
+  $('connection').classList.toggle('online',serviceOk&&online);
+  $('connection').classList.toggle('offline',serviceOk&&!online);
+  $('connection').classList.toggle('unknown',!serviceOk);
+  $('connection-detail').textContent=serviceOk?(connectionReasons[c?.reason]||(online?'设备已连接':'设备离线，等待重新连接')):'浏览器暂时无法连接服务，设备状态未知。下方保留上次查询结果，正在自动重试。';
+  const now=(data?.server_time||Date.now()/1000)+Math.max(0,(Date.now()-lastSuccess)/1000);
+  $('connection-since').textContent=c?.since?timeLabel(c.since):'尚未建立连接';
+  $('connection-duration').textContent=serviceOk&&c?.since?durationLabel(now-c.since):'—';
+  $('connection-age').textContent=data?.last_seen?durationLabel(now-data.last_seen):'尚未收到数据';
+  $('last-seen').textContent='最近通信：'+timeLabel(data?.last_seen);
+}
+function renderNetworkHistory(data){
+  const events=data.connection?.events||[];$('connection-events').replaceChildren();
+  for(const item of events){const row=document.createElement('tr');for(const value of [timeLabel(item.at),item.state==='online'?'在线':'离线',connectionReasons[item.reason]||'连接状态变化']){const cell=document.createElement('td');cell.textContent=value;row.append(cell);}$('connection-events').append(row);}
+  $('connection-empty').hidden=events.length>0;$('connection-events-table').hidden=!events.length;
+  const t=data.traffic, available=t?.available===true;
+  $('traffic-total').textContent=available?bytesLabel(t.total_bytes):'—';
+  $('traffic-boot').textContent=available?bytesLabel(t.boot_bytes):'—';
+  $('traffic-interval').textContent=available?bytesLabel(t.interval_bytes)+' / '+durationLabel(t.interval_seconds):'—';
+  $('traffic-updated').textContent=available?'最近统计：'+timeLabel(t.last_report_at):'尚未收到流量统计，设备需运行支持统计的固件。';
+}
 function can(command){
   const d=snapshot?.device;if(!snapshot?.online||!d||Date.now()-lastSuccess>10000)return false;
   if(command==='STOP')return true;
   if(busy||snapshot.commands.some(c=>['queued','delivered'].includes(c.status)))return false;
   if(command==='RESET')return d.state==='FAULT';
-  return ['FILL','DRAIN'].includes(command)&&['0.7.0','0.7.1','0.7.2','0.7.3','0.7.4','0.7.5'].includes(d.version)&&d.control_mode==='manual'&&d.ready==='1'&&d.outputs_known==='1'&&d.overflow==='0'&&['IDLE','DONE'].includes(d.state);
+  return ['FILL','DRAIN'].includes(command)&&['0.7.0','0.7.1','0.7.2','0.7.3','0.7.4','0.7.5','0.7.6'].includes(d.version)&&d.control_mode==='manual'&&d.ready==='1'&&d.outputs_known==='1'&&d.overflow==='0'&&['IDLE','DONE'].includes(d.state);
 }
 function switchCommand(button){const d=snapshot?.device;return button.dataset.output&&d?.outputs_known==='1'&&d[button.dataset.output]==='1'?'STOP':button.dataset.command;}
 function controls(){document.querySelectorAll('[data-command]').forEach(b=>{
@@ -34,11 +60,10 @@ function controls(){document.querySelectorAll('[data-command]').forEach(b=>{
   if(b.dataset.output){const d=snapshot?.device,known=d?.outputs_known==='1',on=known&&d[b.dataset.output]==='1';b.setAttribute('aria-checked',on?'true':'false');b.classList.toggle('is-on',on);$(b.dataset.output+'-hint').textContent=known?(on?'已打开 · 点击关闭':'已关闭 · 点击打开'):'状态未知';}
 });}
 function render(data){
-  snapshot=data;const d=data.device, online=data.online;
+  snapshot=lastSnapshot=data;const d=data.device, online=data.online;
   const submitted=data.commands.find(c=>c.id===submittedId);
   if(submitted&&!['queued','delivered'].includes(submitted.status)){message(names[submitted.command]+'：'+(results[submitted.status]||submitted.status)+(submitted.result?' · '+submitted.result:''));submittedId=null;}
-  $('connection').textContent=online?'● 设备在线':'○ 设备离线';$('connection').classList.toggle('online',online);
-  $('last-seen').textContent='最近通信：'+timeLabel(data.last_seen);
+  renderConnection(data);renderNetworkHistory(data);
   $('state').textContent=d?(states[d.state]||d.state):'等待设备连接';
   $('reason').textContent=d?((online?'':'上次上报 · ')+(reasons[d.reason]||d.reason)):'设备通过 4G 接入后，状态会自动更新。';
   $('version').textContent=d?'Air724UG · v'+d.version:'尚无设备数据';
@@ -46,7 +71,7 @@ function render(data){
   for(const key of ['fill','drain'])$(key).textContent=d&&d.outputs_known==='1'?(d[key]==='1'?'开启':'关闭'):'未知';
   $('cycle').textContent=d?d.cycle:'—';
   $('protection').textContent=d?(d.overflow==='1'?'超高水位已触发，请检查现场。':d.overflow_protection==='1'?'已配置额外超高输入；软件保护生效。':'额外超高输入未启用。'):'等待保护状态';
-  $('control-hint').textContent=!online?'设备离线，连接恢复后可操作。':!['0.7.0','0.7.1','0.7.2','0.7.3','0.7.4','0.7.5'].includes(d.version)?'更新设备后可使用手动开关。':d.control_mode!=='manual'?'设备需配置为手动开关模式。':d.state==='UNCONFIGURED'?'输出引脚尚未配置。手动开关不需要水位传感器。':d.state==='FAULT'?'排除故障后复位；停止输出仍可使用。':['FILLING','DRAINING'].includes(d.state)?'请先关闭当前输出，再打开另一路。':'点击开关打开或关闭，不等待水位信号。';
+  $('control-hint').textContent=!online?'设备离线，连接恢复后可操作。':!['0.7.0','0.7.1','0.7.2','0.7.3','0.7.4','0.7.5','0.7.6'].includes(d.version)?'更新设备后可使用手动开关。':d.control_mode!=='manual'?'设备需配置为手动开关模式。':d.state==='UNCONFIGURED'?'输出引脚尚未配置。手动开关不需要水位传感器。':d.state==='FAULT'?'排除故障后复位；停止输出仍可使用。':['FILLING','DRAINING'].includes(d.state)?'请先关闭当前输出，再打开另一路。':'点击开关打开或关闭，不等待水位信号。';
   document.querySelectorAll('[data-state]').forEach(e=>e.classList.toggle('current',online&&e.dataset.state===d?.state));
   $('history').replaceChildren();
   for(const item of data.commands){const row=document.createElement('tr');for(const value of [timeLabel(item.created),names[item.command]||item.command,results[item.status]||item.status,item.result||'—']){const cell=document.createElement('td');cell.textContent=value;row.append(cell);}$('history').append(row);}
@@ -55,7 +80,7 @@ function render(data){
 async function refresh(){
   if(refreshing)return;refreshing=true;
   try{const data=await api('status');signedIn=true;lastSuccess=Date.now();$('login-panel').hidden=true;$('console').hidden=false;render(data);}
-  catch(e){if(signedIn){snapshot=null;controls();$('connection').textContent='○ 服务连接中断';$('connection').classList.remove('online');message(e.message);}}
+  catch(e){if(signedIn){snapshot=null;controls();renderConnection(lastSnapshot,false);$('control-hint').textContent='服务连接中断，暂时无法操作。';message(e.message);}}
   finally{refreshing=false;}
 }
 $('login-form').addEventListener('submit',async e=>{e.preventDefault();const button=e.target.querySelector('button');button.disabled=true;try{await api('login',{key:$('key').value});$('key').value='';message('');await refresh();}catch(e){message(e.message);}finally{button.disabled=false;}});
@@ -69,6 +94,6 @@ for(const button of document.querySelectorAll('[data-command]'))button.addEventL
   catch(e){message(e.message+' 若提交时连接中断，请先刷新操作记录核实结果。');}
   finally{busy=false;controls();}
 });
-setInterval(()=>{controls();if(signedIn&&!document.hidden)refresh();},2000);
+setInterval(()=>{controls();if(signedIn){renderConnection(lastSnapshot,snapshot!==null&&Date.now()-lastSuccess<=10000);if(!document.hidden)refresh();}},2000);
 document.addEventListener('visibilitychange',()=>{if(!document.hidden&&signedIn)refresh();});
 refresh();

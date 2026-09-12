@@ -11,6 +11,9 @@ return {
     tls_connect_timeout_ms = 60000,
     -- Allow cellular retransmission; the active-output watchdog stays at 10s.
     send_timeout_ms = 30000,
+    auth_timeout_ms = 30000,
+    -- LuaTask IP accounting is an estimate, reported at most once per minute.
+    traffic_enabled = true,
     heartbeat_ms = 1000,
     active_heartbeat_ms = 1000,
     offline_stop_ms = 10000,

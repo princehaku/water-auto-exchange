@@ -225,7 +225,7 @@ function M.new(config, callbacks, deps)
             if ok then sent_frames = sent_frames + 1 end
             if not ok or age(started) >= 1000 then
                 -- Metadata only: never log frame contents or credential fields.
-                local label = ({auth=true, ping=true, claim=true, ack=true, status=true, pong=true})[kind] and kind or "data"
+                local label = ({auth=true, ping=true, claim=true, ack=true, status=true, pong=true, traffic=true})[kind] and kind or "data"
                 print("WATER WS send_result=" .. (ok and "ok" or "failed") .. " kind=" .. label
                     .. " attempt=" .. send_attempt .. " bytes=" .. #value .. " elapsed_ms=" .. age(started)
                     .. " timeout_ms=" .. send_ms .. " queued=" .. #client.queue)

@@ -1,5 +1,13 @@
 # Web 控制台与 4G 接入
 
+## 2026-09-12 当前：0.7.6连接详情与设备估算流量
+
+连接与流量区域默认展开，显示当前状态开始时间、持续时长、最后通信距今多久以及最近60次在线/离线变化。离线时保留最近通信时间，服务重启也保留历史；服务器无法连接时显示“服务连接中断 / 设备状态未知”，不会假装确认设备已经离线，开水按钮禁用。
+
+流量显示累计已上报、本次运行及最近统计段；约每60秒刷新。旧固件/无报告显示未知，需要下载water-online-0.7.6才有板端报告。使用官方旧库socket.setIpStatis的估算值，包含固定协议开销估算，与运营商账单可能不同。统计从启用功能开始，不补造历史流量；数据上报后持久保存，重复报告和重连不重复计数，重启前未上报数据可能丢失。
+
+0.7.6也放宽认证等待至30秒，并清理超过原期限的旧会话占用，健康连接继续复用。实板最新保存日志已是0.7.5；新生成包仍8Lua+CA、保留原CORE及默认库，需要用户下载0.7.6。189项Lua、70项Python及桌面/手机浏览器联调通过；新版本实板稳定性和计数仍待验证。
+
 ## 2026-09-12 当前：0.7.5发送修正待下载，实板0.7.4就绪
 
 用户17:22日志确认0.7.4/manual/IDLE/ready=1/outputs_known=1、两路为0，且出现WATER WS online；随后底层发送超时。输出映射已经生效，网页开启仍要求设备当时在线。0.7.5保留GPIO23补水、GPIO5排水及LOW后释放的关断流程，改为默认30秒发送等待、合并积压心跳、发送帧之间收包，并增加发送进度及关闭原因诊断。活动输出10秒失联停止保持不变。详见[网络恢复](network-recovery.md)。
@@ -52,7 +60,7 @@ DRAIN要求板端0.6.0，旧版显示“更新设备后可用”，API及USB网�
 
 ## 软件与实板边界
 
-当前源码0.7.5、实板最近已确认0.7.4且ready=1，详情以上方最新记录为准。本版启用GPIO23补水和GPIO5排水，关断沿用用户测过的写LOW后释放流程，GPIO12仍专用于网络灯。未刷入本版或未进行实板输出操作前，不把模拟测试或网站在线写成实物验收完成。
+当前源码0.7.6、实板最近已确认0.7.5且ready=1，详情以上方最新记录为准。本版启用GPIO23补水和GPIO5排水，关断沿用用户测过的写LOW后释放流程，GPIO12仍专用于网络灯。未刷入本版或未进行实板输出操作前，不把模拟测试或网站在线写成实物验收完成。
 
 ## 管理员登录
 
@@ -67,8 +75,8 @@ Cookie 下发 `Max-Age=86313600`，继续使用 Secure / HttpOnly / SameSite=Str
 1. 准备可联网的 SIM、天线和供电；本版开机写LOW并释放两路输出，先核对待机状态。GPIO23 复用 SIM 在位检测的硬件约束继续有效，不能据此猜测泵映射。
 2. 本轮已提供 `build/device.private.json`。后续使用自己的 JSON 文件，格式为 `{"url":"https://bytegallop.com/water","device_key":"填入设备密钥"}`。
 3. 在仓库运行 `python tools/build-firmware.py --config build/device.private.json`。脚本复制源码到 `build/firmware/`，仅在该目录启用联网并填入设备密钥，源文件与 GPIO 配置保持原状。
-4. 本机LuaTools“刷新列表”后选 `water-online-0.7.5`。其他机器按 `build/firmware/flash-files.txt` 创建项目并加入 **8个Lua文件和1个CA证书**，全部来自同一个生成目录。保留现有CORE、默认LuaTask V2.4.4库及USB trace。每条require独占一行；JSON为CORE内置全局模块。
-5. 由用户点击“下载脚本”（此前Escape停止的UI操作尚未恢复）。下载后核对 `project=water_auto_exchange version=0.7.5`、`manual`、`ready=1`、`outputs_known=1`、初始两路为0和生成配置，并查看服务器是否收到真实上报。持续观察至少跨过原75秒断线窗口，确认5秒日志中的心跳seq/ack继续增长、服务器last_seen持续刷新，再验证重连。仅版本号或一次online不足以通过联调。
+4. 本机LuaTools“刷新列表”后选 `water-online-0.7.6`。其他机器按 `build/firmware/flash-files.txt` 创建项目并加入 **8个Lua文件和1个CA证书**，全部来自同一个生成目录。保留现有CORE、默认LuaTask V2.4.4库及USB trace。每条require独占一行；JSON为CORE内置全局模块。
+5. 由用户点击“下载脚本”（此前Escape停止的UI操作尚未恢复）。下载后核对 `project=water_auto_exchange version=0.7.6`、`manual`、`ready=1`、`outputs_known=1`、初始两路为0和生成配置，并查看服务器是否收到真实上报。持续观察至少跨过原75秒断线窗口，确认5秒日志中的心跳seq/ack继续增长、服务器last_seen持续刷新，再验证重连。仅版本号或一次online不足以通过联调。
 6. 手动模式只需确认输出启停、输出接线和超时参数后修改 `src/water_config.lua`；不要求水位传感器。自动模式另需液位板隔离反馈接线，重新生成整包、验证、提交并推送，再由用户刷写。不能直接在生成目录内做长期配置修改，重新生成会覆盖该目录文件。
 
 下载清单：`main.lua`、`water_config.lua`、`water_cycle.lua`、`water_control.lua`、`water_usb.lua`、`water_network.lua`、`water_network_config.lua`、`water_ws_transport.lua`、`water-ca.crt`。

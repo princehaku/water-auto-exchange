@@ -40,7 +40,7 @@ test("socket operations may yield in the owner coroutine",function()
         close=function() coroutine.yield("CLOSE") end}
     local sys={subscribe=function() end,taskInit=function(fn) co=coroutine.create(fn);return co end,publish=function() end,wait=function(ms) coroutine.yield("WAIT",ms) end}
     local client
-    client=ws.new({url="wss://example.test/water/api/device/ws",device_key=string.rep("k",32),ca_cert="water-ca.crt"},{
+    client=ws.new({url="wss://example.test/water/api/device/ws",device_key=string.rep("k",32),long_connection_cert={caCert="water-ca.crt",hostNameFlag=1,insist=0}},{
         open=function() opened=true;assert(client:send("queued")) end,
         message=function(value) received=value end,close=function() closed=true end},{sys=sys,
         link={shut=function() end},net={getState=function() return "REGISTERED" end},ril={request=function() end},
@@ -86,8 +86,11 @@ local function timed_fixture(options)
             f.probes_closed=f.probes_closed+1
             if options.probe_yield then coroutine.yield("PROBE_CLOSE") end
         end}
-    f.client=ws.new({url="wss://example.test/water/api/device/ws",device_key=string.rep("k",32),ca_cert="water-ca.crt",
-        tls_connect_timeout_ms=options.connect_ms},
+    f.config={url="wss://example.test/water/api/device/ws",device_key=string.rep("k",32),long_connection_cert={caCert="water-ca.crt",hostNameFlag=1,insist=0},
+        tls_connect_timeout_ms=options.connect_ms}
+    if options.no_cert then f.config.long_connection_cert=nil end
+    f.certificates={}
+    f.client=ws.new(f.config,
         {open=function() f.opened=true end,close=function() f.closed=f.closed+1 end},{sys=sys,
         link={shut=function()
             assert(not f.client.connected and #f.client.queue==0)
@@ -100,7 +103,13 @@ local function timed_fixture(options)
         socket={isReady=function() return f.ready end,tcp=function(ssl,cert)
             if options.no_socket then return end
             if not ssl then return probe end
-            assert(ssl==true and cert.caCert=="water-ca.crt" and cert.hostNameFlag==1 and cert.insist==0)
+            assert(ssl==true)
+            if options.no_cert then assert(cert==nil)
+            else
+                assert(cert.caCert=="water-ca.crt" and cert.hostNameFlag==1 and cert.insist==0)
+                f.certificates[#f.certificates+1]=cert
+                cert.caCert="/lua/"..cert.caCert -- Actual socket4G mutation.
+            end
             return io
         end},
         crypto={sha1=function() return string.rep("0",40) end,base64_encode=function(_,size) return "base64_"..size end}})
@@ -116,6 +125,18 @@ local function timed_fixture(options)
     f.client:start();f.resume((options.ready==false or options.no_socket) and "WAIT" or "CONNECT")
     return f
 end
+
+test("optional nil certificate reaches TLS socket unchanged on first connect and retry",function()
+    local f=timed_fixture({no_cert=true});assert(f.connect_seconds==60)
+    f.resume("CLOSE",false);f.resume("WAIT");f.resume("CONNECT");f.upgrade()
+    assert(f.opened and #f.certificates==0)
+end)
+
+test("strict certificate options survive socket filename mutation across reconnect",function()
+    local f=timed_fixture();f.resume("CLOSE",false);f.resume("WAIT");f.resume("CONNECT");f.upgrade()
+    assert(#f.certificates==2 and f.certificates[1]~=f.certificates[2])
+    assert(f.config.long_connection_cert.caCert=="water-ca.crt")
+end)
 
 test("slow cellular TLS may complete after ten seconds with a seconds-based budget",function()
     for _,ms in ipairs({30000,60000,120000}) do

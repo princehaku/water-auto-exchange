@@ -78,6 +78,13 @@ function M.new(config, callbacks, deps)
     local event, serial = "WATER_WS_WAKE", 0
     local last_recovery, last_diagnostic, diagnostic_pending, last_tcp_probe
     local connect_ms = config.tls_connect_timeout_ms or 60000
+    local function certificate_options()
+        if config.long_connection_cert == nil then return nil end
+        -- socket4G rewrites certificate filenames; keep config reusable on retry.
+        local cert = {}
+        for name, value in pairs(config.long_connection_cert) do cert[name] = value end
+        return cert
+    end
     local function age(tick)
         return ((rtos.tick() - tick) % 4294967296) * 5
     end
@@ -146,7 +153,10 @@ function M.new(config, callbacks, deps)
     local function run_connection(io)
         local host, path = config.url:match("^wss://([%w%.%-]+)(/.*)$")
         local connect_started = rtos.tick()
-        print("WATER WS connecting_tls host=" .. host .. " timeout_ms=" .. connect_ms .. " ca=enabled sni=enabled")
+        local cert = config.long_connection_cert
+        print("WATER WS connecting_tls host=" .. host .. " timeout_ms=" .. connect_ms
+            .. " ca=" .. (cert and cert.caCert and "enabled" or "disabled")
+            .. " sni=" .. (cert and cert.hostNameFlag == 1 and "enabled" or "disabled"))
         -- socket4G connect/send use SECONDS; recv uses milliseconds. In particular,
         -- do not pass the old websocket library's millisecond value through here.
         if not io:connect(host, 443, connect_ms / 1000) then
@@ -239,7 +249,7 @@ function M.new(config, callbacks, deps)
                 if client.stopped then return end
                 client.cancelled = false
                 client.stable_before_loss = false
-                local io = socket.tcp(true, {caCert = config.ca_cert, hostNameFlag = 1, insist = 0})
+                local io = socket.tcp(true, certificate_options())
                 local failure
                 if io then
                     -- Never put these yielding operations inside pcall/xpcall.

@@ -5,7 +5,7 @@ local count = 0
 local function test(name, fn) fn(); count=count+1; print("PASS "..name) end
 local function fixture()
     local f = {tick=0, sent={}, calls={}, state="IDLE", decoded={}}
-    f.config = {enabled=true, url="wss://example.test/water/api/device/ws",device_key=string.rep("k",32),ca_cert="water-ca.crt",
+    f.config = {enabled=true, url="wss://example.test/water/api/device/ws",device_key=string.rep("k",32),long_connection_cert={caCert="water-ca.crt",hostNameFlag=1,insist=0},
         heartbeat_ms=1000,active_heartbeat_ms=1000,offline_stop_ms=10000,idle_timeout_ms=75000}
     f.controller = {
         status=function() return {state=f.state} end,
@@ -24,7 +24,7 @@ local function fixture()
         sys={timerLoopStart=function(fn) f.step=fn; return 1 end},
         transport={new=function(_,callbacks) f.callbacks=callbacks; return f.client end},
         json={encode=function(value) return value end,decode=function() if f.decode_fail then error("decode") end; return f.decoded end},
-        usb={format_status=function() return "project=water_auto_exchange version=0.7.2 state="..f.state end},
+        usb={format_status=function() return "project=water_auto_exchange version=0.7.3 state="..f.state end},
         read_cert=function() return f.no_cert and "" or "-----BEGIN CERTIFICATE-----" end}
     -- Ordinary messages use fake JSON tokens; auth concatenation needs strings.
     local serial=0
@@ -56,6 +56,34 @@ test("remote DRAIN executes once and disconnect stops the owned drain",function(
 end)
 test("plaintext and old HTTP URL rejected",function() local f=fixture();f.config.url="https://example.test/water";assert(not f.start()) end)
 test("missing CA prevents connection",function() local f=fixture();f.no_cert=true;assert(not f.start());assert(not f.started) end)
+
+test("SMS-compatible default connects without reading a CA file",function()
+    assert(require("water_network_config").long_connection_cert==nil)
+    local f=fixture();f.config.long_connection_cert=nil
+    f.deps.read_cert=function() error("no certificate should be read") end
+    f.connect();assert(f.started)
+end)
+
+test("empty or SNI-only certificate options do not require a CA",function()
+    for _,cert in ipairs({{}, {hostNameFlag=1}}) do
+        local f=fixture();f.config.long_connection_cert=cert
+        f.deps.read_cert=function() error("CA absent") end
+        f.connect();assert(f.started)
+    end
+end)
+
+test("explicit certificate file read errors never downgrade verification",function()
+    local f=fixture();f.deps.read_cert=function(name) assert(name=="water-ca.crt");error("read failure") end
+    local ok,reason=f.start();assert(not ok and reason=="network_ca_missing" and not f.started)
+end)
+
+test("malformed optional certificate settings fail before transport starts",function()
+    for _,cert in ipairs({false,"water-ca.crt",{caCert=false},{caCert="../ca.crt"},
+        {caCert=""},{clientKey=5},{clientCert="/lua/client.crt"},{insist=2},{hostNameFlag=true},{clientPassword=42}}) do
+        local f=fixture();f.config.long_connection_cert=cert
+        local ok,reason=f.start();assert(not ok and reason=="network_cert_config_invalid" and not f.started)
+    end
+end)
 
 test("connection budget accepts bounded seconds expressed in milliseconds",function()
     assert(require("water_network_config").tls_connect_timeout_ms==60000)

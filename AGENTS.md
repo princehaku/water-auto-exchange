@@ -1,5 +1,15 @@
 # 项目约定与本轮对话摘要
 
+## 2026-09-12 最新：用户要求证书与短信项目一致，0.7.3
+
+- 已通过computer-use刷新项目列表、选water-online-0.7.3并点击下载脚本，16:29:47.736工具报告下载成功（保留CORE）。随后COM4实读0.7.3/manual/UNCONFIGURED；临时打包脚本版本、enabled=true、long_connection_cert=nil及私有密钥匹配均核对通过。
+- 16:30:08已注册并IP_READY；16:30:09.239实板打印ca=disabled sni=disabled，底层TCPSSL证书参数nil、timeout60，证明确实按SMS默认参数运行。截止最后读取16:31:01尚未看到本轮online。用户随后按物理Escape停止computer-use，立即停止所有后续UI操作，不将其写成联网修复成功。
+- 0.7.3后端/网页已部署，备份`/apps/water-auto-exchange/backups/20260912T082733Z-3791828`。四个公网静态文件一致、water/sms健康200，PC以CA/SNI及SMS式无CA/无SNI两种TLS1.2均完成凭据WSS probe，未注册模拟设备或发开水命令。后续SSH健康查询因banner超时未取得新结果；不将部署后的PC检查当板端联网证明。
+- 用户明确“改啊，也改成和sms一致”，授权WSS证书参数可选、默认不校验，覆盖此前必须保留CA/SNI的约定。src/water_network_config.lua改为long_connection_cert=nil，底层socket.tcp(true,nil)，采用旧库默认无CA校验、hostNameFlag=0/SNI不启用、insist=1。仍使用WSS加密，未引入HTTP回退。需要校验时显式填写{caCert="water-ca.crt",hostNameFlag=1,insist=0}。
+- 配置表存在CA时仍检查文件，缺失/读取失败直接报network_ca_missing，不自动降级。无表或无CA不读取CA文件；每次连接复制证书表，避免socket4G将相对路径改写后污染重试配置。日志按实际配置打印ca/sni启用状态，保留60秒连接等待、1秒心跳、活动10秒失联停止和重连不重开水。
+- 166项Lua（12+15+19+28+23+39+30）、48项Python及Edge联调通过，新增覆盖nil证书实际传参、CA读取跳过/失败、非法参数、重连配置不被改写和0.7.3兼容。生成包仍8Lua+CA共9项，CA仅为可选资源，默认不读取；water-online-0.7.3已准备。
+- 本轮USB已重现，COM4实读0.7.1/manual/UNCONFIGURED，更新之前仅COM1的快照。本轮已找到node_repl/@oai/sky工具并读取computer-use技能，随后刷写结果见本节顶部。GPIO保持未配置，不发开水命令。
+
 ## 2026-09-12 最新：对照短信项目，0.7.2放宽建连等待并分层诊断
 
 - 0.7.2兼容后端/网页已部署，备份`/apps/water-auto-exchange/backups/20260912T082015Z-3789216`。容器healthy，四个公网静态文件与本地一致，water/sms健康接口200，保留CA/SNI的TLS1.2及既有凭据WSS probe通过；probe未注册模拟设备、未提交控制命令。

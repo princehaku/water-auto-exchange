@@ -1,12 +1,12 @@
 # Air724UG 自动换水
 
-> 2026-09-12：当前源码 **0.7.2**，提供补水/冲水手动开关，不要求水位传感器。对照短信项目后将建连等待由10秒调整为60秒，加入耗时日志与受限频率的TCP诊断；CA校验和活动10秒失联停止保留。160项Lua、47项后端及本地浏览器联调通过；完整9项下载包已准备。本轮未刷写，最新实板证据为0.7.1。见[网络恢复与项目对照](docs/network-recovery.md)。
+> 2026-09-12：源码 **0.7.3** 已按用户要求将WSS证书参数改成与短信项目一致：默认long_connection_cert=nil，TLS加密但不校验服务端证书、不启用SNI。可显式填写证书表开启校验。保留60秒建连、每秒心跳和活动10秒失联停止。166项Lua、48项后端及浏览器联调通过；完整9项包已准备。见[网络恢复与配置](docs/network-recovery.md)。
 
-`water_auto_exchange 0.7.2` 默认采用手动模式：FILL开启补水，DRAIN开启冲水（排水），STOP关闭。两路互锁，单次默认最多120秒；自动液位模式须显式配置。本地USB控制不需要SIM，4G远程控制需要可用数据连接。
+`water_auto_exchange 0.7.3` 默认采用手动模式：FILL开启补水，DRAIN开启冲水（排水），STOP关闭。两路互锁，单次默认最多120秒；自动液位模式须显式配置。本地USB控制不需要SIM，4G远程控制需要可用数据连接。
 
 上电待机，立即打印状态，之后每 5 秒打印一次。USB 支持 `STATUS`、`START`、`FILL`、`DRAIN`、`STOP`、`RESET`。已实现输入防抖、进排水互锁、阶段超时、故障锁存及可选超高水位输入。当前由手动命令开启/关闭对应输出，尚未设置定时计划。
 
-**0.7.2已生成、尚未刷入。** 最新板端日志为0.7.1/UNCONFIGURED。默认输出映射仍未填写且禁用；须确认输出接线及有效电平。手动模式不要求液位反馈。
+**0.7.3已刷入并由COM4确认。** 板端日志已确认可选证书配置生效，尚未确认本轮WSS在线。默认输出映射仍未填写且禁用；须确认输出接线及有效电平。手动模式不要求液位反馈。
 
 ## 配置与使用
 
@@ -33,7 +33,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\water-command.ps1 -P
 
 ## 下载
 
-在 LuaTools `water-online-0.7.2` 项目中保留 `LuatOS-Air_V4035_RDA8910_TTS_NOLVGL_FLOAT` CORE 和默认 LuaTask V2.4.4 库。项目配置已改为下载包清单中的 8 个 Lua 文件和 1 个 CA 证书；若界面仍显示旧清单，重新载入项目核对后，由用户点击“下载脚本”：
+在 LuaTools `water-online-0.7.3` 项目中保留 `LuatOS-Air_V4035_RDA8910_TTS_NOLVGL_FLOAT` CORE 和默认 LuaTask V2.4.4 库。项目配置已改为下载包清单中的 8 个 Lua 文件和 1 个 CA 证书；若界面仍显示旧清单，重新载入项目核对后，由用户点击“下载脚本”：
 
 ```text
 build/firmware/main.lua
@@ -49,11 +49,11 @@ build/firmware/water-ca.crt
 
 4G 上板使用同一生成目录中的整包文件，操作步骤见 [Web 与 4G 接入](docs/web-console.md)，避免把已含密钥的配置提交到 src。
 
-下载后通过 `STATUS` 确认 `project=water_auto_exchange version=0.7.2`。默认应为 `state=UNCONFIGURED reason=mapping_not_confirmed`。旧 `motor-command.ps1` 和 `gpio-probe.ps1` 用于历史诊断，不操作新版。
+下载后通过 `STATUS` 确认 `project=water_auto_exchange version=0.7.3`。默认应为 `state=UNCONFIGURED reason=mapping_not_confirmed`。旧 `motor-command.ps1` 和 `gpio-probe.ps1` 用于历史诊断，不操作新版。
 
 ## 本地验证
 
-Lua 5.1模拟160项、Python后端47项和本地Edge浏览器联调通过。官方LuaFLOAT语法及下载包检查通过。测试未控制实板GPIO，本次实板网络恢复仍待刷入后确认。
+Lua 5.1模拟166项、Python后端48项和本地Edge浏览器联调通过。官方LuaFLOAT语法及下载包检查通过。测试未控制实板GPIO，本次已刷入0.7.3，实板联网恢复仍未确认。
 
 ## 硬件依据与记录
 

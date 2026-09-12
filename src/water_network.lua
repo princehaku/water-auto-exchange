@@ -7,9 +7,26 @@ function M.start(controller, config, deps)
     if type(config) ~= "table" or config.enabled ~= true then return false, "network_disabled" end
     if type(config.url) ~= "string" or not config.url:match("^wss://[%w%.%-]+/[%w/_%-]+$")
         or type(config.device_key) ~= "string" or #config.device_key < 32
-        or not config.device_key:match("^[%w_-]+$")
-        or type(config.ca_cert) ~= "string" or not config.ca_cert:match("^[%w._-]+$") then
+        or not config.device_key:match("^[%w_-]+$") then
         return false, "network_config_invalid"
+    end
+    local cert_options = config.long_connection_cert
+    if cert_options ~= nil then
+        if type(cert_options) ~= "table" then return false, "network_cert_config_invalid" end
+        for _, field in ipairs({"caCert", "clientCert", "clientKey"}) do
+            local name = cert_options[field]
+            if name ~= nil and (type(name) ~= "string" or not name:match("^[%w._-]+$")) then
+                return false, "network_cert_config_invalid"
+            end
+        end
+        for _, field in ipairs({"insist", "hostNameFlag"}) do
+            if cert_options[field] ~= nil and cert_options[field] ~= 0 and cert_options[field] ~= 1 then
+                return false, "network_cert_config_invalid"
+            end
+        end
+        if cert_options.clientPassword ~= nil and type(cert_options.clientPassword) ~= "string" then
+            return false, "network_cert_config_invalid"
+        end
     end
     local connect_ms = config.tls_connect_timeout_ms
     if connect_ms ~= nil and (type(connect_ms) ~= "number" or connect_ms % 1000 ~= 0
@@ -38,9 +55,11 @@ function M.start(controller, config, deps)
         file:close()
         return value
     end
-    local cert_ok, cert = pcall(read_cert, config.ca_cert)
-    if not cert_ok or type(cert) ~= "string" or not cert:find("-----BEGIN CERTIFICATE-----", 1, true) then
-        return false, "network_ca_missing"
+    if cert_options and cert_options.caCert then
+        local cert_ok, cert = pcall(read_cert, cert_options.caCert)
+        if not cert_ok or type(cert) ~= "string" or not cert:find("-----BEGIN CERTIFICATE-----", 1, true) then
+            return false, "network_ca_missing"
+        end
     end
     local previous, elapsed = nil, 0
     local function now()

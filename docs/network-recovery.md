@@ -1,4 +1,27 @@
-# 0.7.2 连接等待、网络恢复与诊断
+# 0.7.3 可选WSS证书与网络恢复
+
+## 2026-09-12：按用户要求与短信WSS参数一致
+
+用户明确要求证书配置也改成和sms-forward一致，覆盖下文0.7.2保留强制CA/SNI的旧约定。0.7.3默认配置为：
+
+```lua
+long_connection_cert = nil,
+tls_connect_timeout_ms = 60000,
+```
+
+传给旧LuaTask库的调用是`socket.tcp(true, nil)`。仍走TLS/WSS加密，但默认不校验服务端证书、不启用SNI，采用与短信项目未配置证书表时相同的底层默认值。设备应用密钥认证保留；没有新增HTTP回退。要启用CA和域名校验，可以显式设置：
+
+```lua
+long_connection_cert = {caCert="water-ca.crt", hostNameFlag=1, insist=0},
+```
+
+显式配置CA却找不到文件时仍拒绝连接，不会自动切换到无校验。证书表每次连接复制，避免底层改写文件路径影响重试。日志真实显示`ca=disabled sni=disabled`或对应启用值。包内保留water-ca.crt便于以后开启校验，默认不读取它；旧顶层ca_cert配置已改由long_connection_cert.caCert指定。
+
+本版保持60秒建连、每秒心跳、活动10秒失联停止、退避/PDP恢复、TCP诊断及输出互锁。166项Lua、48项Python与Edge本地HTTP联调通过，完整8Lua+可选CA资源已生成。COM4在本轮下载前确认运行0.7.1/UNCONFIGURED；后续上板与联网结论另行记录。
+
+- 已通过computer-use刷新项目列表、选water-online-0.7.3并点击下载脚本，16:29:47.736工具报告下载成功（保留CORE）。随后COM4实读0.7.3/manual/UNCONFIGURED；临时打包脚本版本、enabled=true、long_connection_cert=nil及私有密钥匹配均核对通过。
+- 16:30:08已注册并IP_READY；16:30:09.239实板打印ca=disabled sni=disabled，底层TCPSSL证书参数nil、timeout60，证明确实按SMS默认参数运行。截止最后读取16:31:01尚未看到本轮online。用户随后按物理Escape停止computer-use，立即停止所有后续UI操作，不将其写成联网修复成功。
+- 0.7.3后端/网页已部署，备份`/apps/water-auto-exchange/backups/20260912T082733Z-3791828`。四个公网静态文件一致、water/sms健康200，PC以CA/SNI及SMS式无CA/无SNI两种TLS1.2均完成凭据WSS probe，未注册模拟设备或发开水命令。后续SSH健康查询因banner超时未取得新结果；不将部署后的PC检查当板端联网证明。
 
 ## 2026-09-12：与 sms-forward 对照后的修正
 

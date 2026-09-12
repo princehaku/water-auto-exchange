@@ -51,11 +51,12 @@ function M.start(controller)
     local function execute(command)
         if command == "STATUS" then
             reply("OK STATUS " .. M.format_status(controller.status()))
-        elseif command == "START" or command == "FILL" or command == "DRAIN" or command == "STOP" or command == "RESET" then
+        elseif command == "START" or command == "FILL" or command == "DRAIN" or command == "STOP" or command == "RESET"
+            or command == "FILL_OFF" or command == "DRAIN_OFF" then
             local ok, reason = controller[command:lower()]()
             reply((ok == true and "OK " or "ERROR ") .. command .. " " .. token(reason))
         else
-            reply("ERROR unknown_command; use STATUS, START, FILL, DRAIN, STOP or RESET")
+            reply("ERROR unknown_command; use STATUS, START, FILL, DRAIN, FILL_OFF, DRAIN_OFF, STOP or RESET")
         end
     end
 

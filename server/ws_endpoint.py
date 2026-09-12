@@ -45,7 +45,7 @@ def serve(handler):
     try:
         while True:
             with store.lock:
-                active = store.status and store.status.get('state') in ('DRAINING', 'SETTLING', 'FILLING')
+                active = store.status and store.status.get('state') in ('DRAINING', 'SETTLING', 'FILLING', 'EXCHANGING')
             deadline = 10 if active else 75
             if time.monotonic() - last_rx > (deadline if authenticated else 30):
                 close_reason = 'heartbeat_timeout' if authenticated else 'auth_timeout'

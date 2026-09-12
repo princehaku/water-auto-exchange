@@ -26,8 +26,8 @@
 <button id="fill-button" class="action water-switch" data-command="FILL" data-output="fill" role="switch" aria-label="补水" aria-describedby="fill-hint" aria-checked="false" disabled><span>补水</span><small id="fill-hint">状态未知</small><i class="switch-track" aria-hidden="true"></i></button>
 <button id="drain-button" class="action water-switch" data-command="DRAIN" data-output="drain" role="switch" aria-label="冲水" aria-describedby="drain-hint" aria-checked="false" disabled><span>冲水</span><small id="drain-hint">状态未知</small><i class="switch-track" aria-hidden="true"></i></button>
 </div>
-<div class="control-bottom"><button id="stop" class="danger" data-command="STOP" disabled>停止输出</button><button id="reset" class="ghost" data-command="RESET" disabled>故障复位</button></div>
-<p class="caption">手动开关无需水位传感器。两路互锁；超时或通信中断会关闭远程开启的输出。开关状态以设备回报为准。</p></section>
+<div class="control-bottom"><button id="stop" class="danger" data-command="STOP" disabled>停止全部输出</button><button id="reset" class="ghost" data-command="RESET" disabled>故障复位</button></div>
+<p class="caption">手动开关无需水位传感器。0.8.0 起两路可同时开启、分别关闭；每路从开启时计时，任一路超时或远程通信中断会关闭全部输出。开关状态以设备回报为准。</p></section>
 </div>
 <section class="card history"><div class="section-head"><h2>操作记录</h2><span class="muted">最近 60 条</span></div><p id="empty" class="muted">还没有操作记录。</p><div class="table-wrap"><table id="history-table" hidden><thead><tr><th>提交时间</th><th>操作</th><th>结果</th><th>设备回执 / 说明</th></tr></thead><tbody id="history"></tbody></table></div></section>
 </div>

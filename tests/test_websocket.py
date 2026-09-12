@@ -106,6 +106,21 @@ class WebSocketTests(unittest.TestCase):
     def test_idle_saving_firmware_manual_roundtrip(self):
         self.manual_roundtrip('0.7.7')
 
+    def test_concurrent_outputs_and_independent_off_roundtrip(self):
+        status=dict(STATUS,version='0.8.0',control_mode='manual',need_fill='unknown')
+        c=self.connect(status=status)
+        steps=[('DRAIN','DRAINING','0','1'),('FILL','EXCHANGING','1','1'),
+               ('DRAIN_OFF','FILLING','1','0'),('FILL_OFF','IDLE','0','0')]
+        for number,(command,state,fill,drain) in enumerate(steps,1):
+            self.store.enqueue(command,format(number,'032x'))
+            offer=json.loads(c.recv());self.assertEqual(offer['command'],command)
+            c.send(json.dumps(dict(type='claim',id=offer['id'])))
+            self.assertEqual(json.loads(c.recv())['command'],command)
+            status.update(state=state,fill=fill,drain=drain)
+            c.send(json.dumps(dict(type='ack',ack=dict(id=offer['id'],status='succeeded',result='OK '+command),status=status)))
+            self.assertEqual(json.loads(c.recv())['type'],'received')
+            self.assertEqual(self.store.snapshot()['device']['state'],state)
+
     def test_five_minute_traffic_report_and_idle_push(self):
         c = self.connect(status=dict(STATUS, version='0.7.7', control_mode='manual'))
         # The server offers a command without waiting for the next idle ping.

@@ -43,7 +43,7 @@ local function fixture(cfg)
     end
     local function physical_interlock()
         local fill, drain = cfg.outputs.fill, cfg.outputs.drain
-        if h.levels[fill.gpio] == fill.on_level and h.levels[drain.gpio] == drain.on_level then
+        if cfg.mode ~= "manual" and h.levels[fill.gpio] == fill.on_level and h.levels[drain.gpio] == drain.on_level then
             error("simultaneous_physical_fill_and_drain")
         end
     end
@@ -151,7 +151,7 @@ local function state(h, name, fill, drain)
     equal(s.state, name)
     equal(s.fill, fill == true)
     equal(s.drain, drain == true)
-    assert(not (s.fill and s.drain), "commanded_interlock")
+    assert(h.config.mode == "manual" or not (s.fill and s.drain), "commanded_interlock")
     return s
 end
 local function both_off_attempted(h, since)
@@ -540,7 +540,7 @@ test("manual config requires only outputs and never configures or reads level GP
     equal(h.controller.status().control_mode,"manual")
     equal(h.controller.status().need_fill,nil)
     assert(h.controller.fill()); state(h,"FILLING",true)
-    equal(h.controller.drain(),false)
+    assert(h.controller.drain()); state(h,"EXCHANGING",true,true)
     h.poll(100); assert(h.controller.stop()); state(h,"IDLE")
     assert(h.controller.drain()); state(h,"DRAINING",false,true)
     h.poll(100); assert(h.controller.stop()); h.poll(1000); state(h,"IDLE")
@@ -593,7 +593,7 @@ test("board fill and drain reopen individually and STOP closes without stale cal
         local other = name == "fill" and 5 or 23
         assert(h.controller[name]())
         equal(h.levels[gpio], 1); equal(h.opened[other], false)
-        equal(h.controller[name == "fill" and "drain" or "fill"](), false)
+        assert(h.controller[name == "fill" and "drain" or "fill"]()); state(h,"EXCHANGING",true,true)
         local _, stale = h.pending()
         assert(h.controller.stop()); state(h, "IDLE")
         equal(h.opened[gpio], false)
@@ -670,6 +670,80 @@ test("STOP during output reopen cannot be followed by a late HIGH", function()
     h.controller.fill()
     equal(h.writes_since(0, 23, 1), 0)
     equal(h.opened[23], false); state(h, "IDLE")
+end)
+
+test("concurrent board switches leave the other output untouched and ignore stale OFF callbacks",function()
+    for _, first in ipairs({"fill","drain"}) do
+        local other=first=="fill" and "drain" or "fill"
+        local h=board_fixture();assert(h.controller.init());h.poll(500)
+        assert(h.controller[first]());local before=#h.events
+        assert(h.controller[other]());state(h,"EXCHANGING",true,true)
+        equal(h.writes_since(before,h.config.outputs[first].gpio),0)
+        local _,stale=h.pending();before=#h.events
+        assert(h.controller[first.."_off"]())
+        equal(h.opened[h.config.outputs[first].gpio],false)
+        equal(h.levels[h.config.outputs[other].gpio],1)
+        equal(h.writes_since(before,h.config.outputs[other].gpio),0)
+        before=#h.events;stale();equal(#h.events,before)
+        assert(h.controller[first]());state(h,"EXCHANGING",true,true)
+        assert(h.controller[other.."_off"]());equal(h.levels[h.config.outputs[first].gpio],1)
+        assert(h.controller.stop());state(h,"IDLE")
+    end
+end)
+
+test("concurrent board timeout and partial OFF failure attempt to shut both outputs",function()
+    for _, failure in ipairs({"timeout","close","write"}) do
+        local h=board_fixture();assert(h.controller.init());h.poll(500)
+        assert(h.controller.fill());h.poll(60000);assert(h.controller.drain())
+        if failure=="timeout" then
+            h.poll(59999);state(h,"EXCHANGING",true,true)
+            h.poll(1);equal(state(h,"FAULT").reason,"fill_timeout")
+        else
+            if failure=="close" then h.on_close=function(gpio) if gpio==23 then return false end end
+            else h.on_write=function(value,gpio) if gpio==23 and value==0 then return false end end end
+            equal(h.controller.fill_off(),false)
+            equal(h.controller.status().state,"FAULT");equal(h.controller.status().outputs_known,false)
+        end
+        equal(h.opened[5],false)
+        equal(h.controller.fill(),false);equal(h.controller.drain(),false)
+        if failure~="timeout" then
+            h.on_close,h.on_write=nil,nil;assert(h.controller.stop())
+            local ok,reason=h.controller.reset()
+            equal(ok,false);equal(reason,"poller_stopped_restart_required")
+        end
+    end
+end)
+
+test("partial OFF cancels a pending reopen without interrupting the other channel",function()
+    local h=board_fixture();assert(h.controller.init());h.poll(500);assert(h.controller.drain())
+    h.on_setup=function(gpio)
+        if gpio==23 then h.on_setup=nil;assert(h.controller.fill_off()) end
+    end
+    h.controller.fill();equal(h.opened[23],false);equal(h.levels[5],1)
+    equal(h.writes_since(0,23,1),0)
+end)
+
+test("partial OFF timer failures cannot permit an unmonitored restart",function()
+    for _,failure in ipairs({"stop","schedule"}) do
+        local h=board_fixture();assert(h.controller.init());h.poll(500)
+        assert(h.controller.fill());assert(h.controller.drain())
+        if failure=="stop" then h.on_timer_stop=function() error("timer_stop_failed") end
+        else h.on_timer_start=function() return nil end end
+        equal(h.controller.fill_off(),false);state(h,"FAULT")
+        equal(h.opened[23],false);equal(h.opened[5],false)
+        h.on_timer_stop,h.on_timer_start=nil,nil;assert(h.controller.stop())
+        local ok,reason=h.controller.reset();equal(ok,false);equal(reason,"poller_stopped_restart_required")
+    end
+end)
+
+test("STOP interleaved with an ON write faults instead of restoring a cancelled output",function()
+    local h=board_fixture();assert(h.controller.init());h.poll(500);assert(h.controller.drain())
+    h.on_write=function(value,gpio)
+        if gpio==23 and value==1 then h.on_write=nil;assert(h.controller.stop()) end
+    end
+    equal(h.controller.fill(),false);state(h,"FAULT")
+    equal(h.opened[23],false);equal(h.opened[5],false)
+    h.poll(500);state(h,"FAULT")
 end)
 
 local failures = 0

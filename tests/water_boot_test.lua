@@ -60,7 +60,7 @@ local function fixture(real_controller)
             f.trace = true
         end}
     end
-    _G.PROJECT, _G.VERSION = "water_auto_exchange", "0.7.7"
+    _G.PROJECT, _G.VERSION = "water_auto_exchange", "0.8.0"
     _G.uart = {
         USB = 0x81, PAR_NONE = 0, STOP_1 = 1,
         setup = function(id, baud, bits, parity, stop)
@@ -104,7 +104,7 @@ local function fixture(real_controller)
     function f.controller.status()
         count("status")
         return {state = "STANDBY", reason = "mapping_not_confirmed", ready = false,
-            fill = false, drain = false, need_fill = f.need_fill, overflow = false,
+            fill = f.fill == true, drain = f.drain == true, need_fill = f.need_fill, overflow = false,
             cycle = 0, overflow_protection = false, outputs_known = f.outputs_known}
     end
     for _, command in ipairs({"start", "fill", "drain", "stop", "reset"}) do
@@ -115,7 +115,7 @@ local function fixture(real_controller)
         end
     end
     if not real_controller then
-        package.loaded.water_control = {new = function() return f.controller end}
+        package.loaded.water_control = {new = function(_, deps) f.observe = deps.on_status; return f.controller end}
     end
     function f.feed(chunk)
         f.rx[#f.rx + 1] = chunk
@@ -155,7 +155,7 @@ test("fragmented STATUS is read-only and unknown water level is explicit", funct
     f.feed("STA")
     equal(#f.replies, 1)
     f.feed("TUS\r")
-    contains(f.replies[2], "OK STATUS project=water_auto_exchange version=0.7.7")
+    contains(f.replies[2], "OK STATUS project=water_auto_exchange version=0.8.0")
     contains(f.replies[2], "ready=0 fill=0 drain=0 outputs_known=0 need_fill=unknown")
     f.feed("\n")
     equal(#f.replies, 2, "CRLF must yield one reply")
@@ -272,7 +272,7 @@ test("boot prints immediately and every 5 seconds without starting outputs", fun
     local f = fixture()
     f.boot()
     equal(PROJECT, "water_auto_exchange")
-    equal(VERSION, "0.7.7")
+    equal(VERSION, "0.8.0")
     equal(f.sys_init[1], 0)
     equal(f.sys_init[2], 0)
     equal(f.sys_run, true)
@@ -283,7 +283,7 @@ test("boot prints immediately and every 5 seconds without starting outputs", fun
     equal(f.calls.start, nil)
     equal(f.calls.fill, nil)
     equal(f.gpio_calls, 0)
-    contains(table.concat(f.logs), "WATER STATUS project=water_auto_exchange version=0.7.7")
+    contains(table.concat(f.logs), "WATER STATUS project=water_auto_exchange version=0.8.0")
     equal(#f.timers, 1)
     equal(f.timers[1].ms, 5000)
     local replies, status_calls = #f.replies, f.calls.status
@@ -351,7 +351,7 @@ test("shipping config boots OFF and real USB FILL DRAIN STOP use mapped outputs"
                 assert(f.receive, "USB STOP must precede every output setup")
                 assert(gpio == 23 or gpio == 5)
                 equal(value, 0)
-                assert(not opened[gpio == 23 and 5 or 23], "release the other output first")
+                -- The two independent outputs may already be active.
                 opened[gpio], levels[gpio] = true, value
                 return function() end
             end,
@@ -362,7 +362,7 @@ test("shipping config boots OFF and real USB FILL DRAIN STOP use mapped outputs"
         assert(opened[gpio], "output mode must be restored before write")
         levels[gpio] = value
         writes[#writes + 1] = {gpio, value}
-        assert(not (levels[23] == 1 and levels[5] == 1))
+        -- Manual mode permits both confirmed outputs to be HIGH.
     end
     _G.rtos.tick = function() return raw_tick end
     local sys = require "sys"
@@ -377,7 +377,11 @@ test("shipping config boots OFF and real USB FILL DRAIN STOP use mapped outputs"
     f.feed("FILL\n"); contains(f.replies[#f.replies], "OK FILL")
     equal(levels[23], 1); equal(opened[5], false)
     for _,pattern in pairs(f.patterns) do equal(pattern[1],65535);equal(pattern[2],0) end
-    f.feed("DRAIN\n"); contains(f.replies[#f.replies], "ERROR DRAIN")
+    f.feed("DRAIN\n"); contains(f.replies[#f.replies], "OK DRAIN")
+    equal(levels[23],1);equal(levels[5],1)
+    f.feed("FILL_OFF\n");equal(opened[23],false);equal(levels[5],1)
+    equal(f.patterns.SCK[1],65535)
+    f.feed("DRAIN_OFF\n");equal(opened[5],false);equal(f.patterns.SCK[1],100)
     f.feed("STOP\n"); equal(opened[23], false)
     equal(f.patterns.SCK[1],100);equal(f.patterns.SCK[2],100)
     f.feed("DRAIN\n"); contains(f.replies[#f.replies], "OK DRAIN")
@@ -442,6 +446,44 @@ test("USB startup failure cannot start remote control", function()
     equal(f.calls.init, nil)
     contains(table.concat(f.logs), "WATER usb_unavailable")
     assert(not table.concat(f.logs):find("WATER NET",1,true))
+end)
+
+test("LED follows valid heartbeat pulses online, defaults offline and solid work has priority", function()
+    local f=fixture();package.loaded.water_network_config={enabled=true}
+    package.loaded.water_network={start=function(_,_,deps) f.net=deps;return true end}
+    local sys=require "sys";local pulses={}
+    sys.timerStart=function(callback,ms)
+        equal(ms,200);pulses[#pulses+1]=callback;return #pulses
+    end
+    sys.timerStop=function() end -- Late callbacks still need generation checks.
+    f.boot();equal(f.patterns.SCK[1],100);equal(f.patterns.SIMERR[1],300)
+    f.net.on_heartbeat();equal(#pulses,0,"offline does not invent heartbeat flashes")
+    f.net.on_connection(true);equal(f.patterns.SCK[1],0)
+    f.net.on_heartbeat();equal(f.patterns.SCK[1],65535)
+    pulses[1]();equal(f.patterns.SCK[1],0)
+    f.net.on_heartbeat();local old=pulses[2]
+    f.net.on_heartbeat();old();equal(f.patterns.SCK[1],65535)
+    f.fill,f.outputs_known=true,true;f.observe(f.controller.status())
+    pulses[3]();equal(f.patterns.SCK[1],65535,"old pulse cannot darken working LED")
+    f.net.on_heartbeat();equal(#pulses,3,"working LED does not pulse")
+    f.net.on_connection(false);equal(f.patterns.SCK[1],65535)
+    f.fill,f.drain=false,true;f.observe(f.controller.status());equal(f.patterns.SCK[1],65535)
+    f.drain=false;f.observe(f.controller.status());equal(f.patterns.SCK[1],100)
+    f.net.on_connection(true);f.net.on_heartbeat();local stale=pulses[4]
+    f.net.on_connection(false);stale();equal(f.patterns.SCK[1],100)
+    equal(f.patterns.SIMERR[1],300);equal(f.patterns.SIMERR[2],5700)
+end)
+
+test("LED pulse timer and callback failures do not affect control or networking", function()
+    local f=fixture();package.loaded.water_network_config={enabled=true}
+    package.loaded.water_network={start=function(_,_,deps) f.net=deps;return true end}
+    local sys=require "sys";local callback
+    sys.timerStart=function(fn) callback=fn;return 1 end;sys.timerStop=function() error("stop failure") end
+    f.boot();f.net.on_connection(true);f.net.on_heartbeat()
+    f.pattern_failure=true;assert(pcall(callback));f.pattern_failure=false
+    sys.timerStart=function() return nil end
+    f.net.on_heartbeat();equal(f.patterns.SCK[1],0)
+    f.feed("STOP\n");contains(f.replies[#f.replies],"OK STOP")
 end)
 
 local failures = {}

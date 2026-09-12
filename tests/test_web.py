@@ -74,7 +74,7 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(self.command('DRAIN',4)['command'],'DRAIN')
 
     def test_manual_mode_is_explicit_and_legacy_cannot_bypass_level_checks(self):
-        for version in ('0.7.0','0.7.1','0.7.2','0.7.3', '0.7.4', '0.7.5', '0.7.6', '0.7.7'):
+        for version in ('0.7.0','0.7.1','0.7.2','0.7.3', '0.7.4', '0.7.5', '0.7.6', '0.7.7', '0.8.0'):
             for mode in (None,'typo',True):
                 with self.assertRaises(Problem):
                     self.online(version=version,control_mode=mode)
@@ -99,6 +99,49 @@ class StoreTests(unittest.TestCase):
         self.store.poll(GATEWAY, status, dict(id=c['id'], status='succeeded', result='OK DRAIN drain_started'))
         self.assertEqual(self.store.snapshot()['commands'][0]['status'], 'succeeded')
         self.assertEqual(self.command('FILL', 2)['command'], 'FILL')
+
+    def test_concurrent_manual_commands_and_separate_off(self):
+        status = dict(STATUS, version='0.8.0', control_mode='manual', need_fill='unknown')
+        self.store.poll(GATEWAY, status)
+        steps = [('FILL', 'FILLING', '1', '0'), ('DRAIN', 'EXCHANGING', '1', '1'),
+                 ('FILL_OFF', 'DRAINING', '0', '1'), ('FILL', 'EXCHANGING', '1', '1'),
+                 ('DRAIN_OFF', 'FILLING', '1', '0'), ('STOP', 'IDLE', '0', '0')]
+        for number, (command, state, fill, drain) in enumerate(steps, 1):
+            item = self.command(command, number)
+            self.assertEqual(self.store.poll(GATEWAY, status)['command']['command'], command)
+            status.update(state=state, fill=fill, drain=drain)
+            self.store.poll(GATEWAY, status, dict(id=item['id'], status='succeeded', result='OK '+command))
+            self.assertEqual(self.store.snapshot()['device']['state'], state)
+
+    def test_separate_off_cancels_only_its_queued_on_and_stop_cancels_everything(self):
+        self.online(version='0.8.0', control_mode='manual', need_fill='unknown')
+        self.command('FILL', 1); self.command('FILL_OFF', 2); self.command('DRAIN_OFF', 3)
+        rows={r['id']:r for r in self.store.snapshot()['commands']}
+        self.assertEqual(rows['{:032x}'.format(1)]['status'], 'cancelled')
+        self.assertEqual(rows['{:032x}'.format(2)]['status'], 'queued')
+        self.assertEqual(rows['{:032x}'.format(3)]['status'], 'queued')
+        self.command('STOP', 4)
+        self.assertEqual(self.online(version='0.8.0', control_mode='manual')['command']['command'], 'STOP')
+
+    def test_concurrent_capability_cannot_be_used_by_legacy_or_automatic_mode(self):
+        for version, mode in [('0.7.7','manual'), ('0.8.0','automatic')]:
+            status=dict(STATUS,version=version,control_mode=mode)
+            self.store.poll(GATEWAY,status)
+            for command in ('FILL_OFF','DRAIN_OFF'):
+                with self.assertRaises(Problem): self.command(command)
+            with self.assertRaises(Problem):
+                validate_status(dict(status,state='EXCHANGING',fill='1',drain='1'))
+        base=dict(STATUS,version='0.8.0',control_mode='manual')
+        for patch in [dict(state='EXCHANGING'),dict(state='FILLING',fill='1',drain='1')]:
+            with self.assertRaises(Problem): validate_status(dict(base,**patch))
+
+    def test_concurrent_session_has_the_active_ten_second_deadline(self):
+        status=dict(STATUS,version='0.8.0',control_mode='manual',state='EXCHANGING',fill='1',drain='1')
+        session=self.store.ws_open(status)
+        self.now+=9;self.assertTrue(self.store.snapshot()['online'])
+        self.now+=2;self.assertFalse(self.store.snapshot()['online'])
+        for command in ('FILL','DRAIN','FILL_OFF','DRAIN_OFF','STOP'):
+            with self.assertRaises(Problem): self.command(command)
 
     def test_drain_guards_and_stop_priority(self):
         for patch in (dict(need_fill='1'), dict(ready='0'), dict(overflow='1'),
@@ -312,6 +355,15 @@ class FakeController:
 
 
 class GatewayTests(unittest.TestCase):
+    def test_separate_off_requires_capable_firmware_before_serial_write(self):
+        for command in ('FILL_OFF','DRAIN_OFF'):
+            c=FakeController()
+            self.assertEqual(gateway.execute(c,dict(id='x',command=command),8000,0)['result'],'firmware_upgrade_required')
+            self.assertEqual(c.calls,['STATUS'])
+            c.status=lambda:dict(STATUS,version='0.8.0',control_mode='manual')
+            self.assertEqual(gateway.execute(c,dict(id='y',command=command),8000,0)['status'],'succeeded')
+            self.assertEqual(c.calls[-1],command)
+
     def test_drain_reidentifies_and_rejects_unsupported_firmware(self):
         controller = FakeController()
         result = gateway.execute(controller, dict(id='x', command='DRAIN'), 8000, 0)

@@ -1,20 +1,27 @@
-> 当前源码0.7.4，默认手动开关，不要求传感器或水流验证。后面的液位流程仅用于未来automatic模式。
+# 手动开关控制（0.8.0）
 
-# 手动开关控制（0.7.4）
+默认`water_config.mode="manual"`，补水接DO2/GPIO23，放水接出纸口/GPIO5。两路可以同时开启，且分别控制；没有水位传感器也可使用，need_fill引脚不初始化、不读取，报告unknown。
 
-当前默认 `water_config.mode="manual"`，输出配置已启用。补水接顶部DO2，由GPIO23控制；排水接出纸电机口，由GPIO5控制。FILL打开补水、DRAIN打开冲水，STOP关闭。没有水位传感器也可以使用，need_fill引脚不会被初始化或读取，状态报告为unknown。不能在一路开启时直接开启另一路，先STOP关闭即可切换。
+| 命令 | 行为 |
+| --- | --- |
+| FILL | 开启补水，放水保持原状态 |
+| DRAIN | 开启放水，补水保持原状态 |
+| FILL_OFF | 关闭补水，放水保持原状态 |
+| DRAIN_OFF | 关闭放水，补水保持原状态 |
+| STOP | 关闭全部输出 |
+| RESET | 原因解除后复位故障，不重新开水 |
 
-两路开启均为先`pins.setup(gpio, 0)`，再`pio.pin.setval(1, gpio)`；关闭采用`off_mode="release"`：先`pio.pin.setval(0, gpio)`，再`pins.close(gpio)`，与用户实测旧扫描切换GPIO后无电压的完整流程一致。`off_level=0`只是释放前的写入，不声称单独LOW已经验证关断。上电先对两路执行完整关闭，不自动开水；每次重新开启都重新建立输出模式。接口历史测量约DO2 12V、出纸口6.1V，不代表模组GPIO本身电压或已确认负载额定值。
+两路都开时状态为EXCHANGING；网页显示“补水与排水同时进行”，两个开关分别发送对应OFF命令。保留停止全部输出按钮。旧固件保持原互锁和同一开关发送STOP的行为，须更新0.8.0才能使用并行控制。
 
-写LOW失败时仍尝试close；任何一步失败则保留输出未知/故障，禁止开启另一路。STOP失败后即使重试清理成功，也须重启以恢复控制轮询。旧配置未指定off_mode或显式hold时，仍保持原来的持续OFF电平方式。0.7.4尚待下载，当前测试为模拟GPIO与本地HTTP/浏览器联调，不能替代新版本实板验证。
+每路最多120秒，从该路实际开启开始计时；重复开启不会续期，开/关另一路不重置计时。任一路超时会关闭全部并锁存FAULT，需复位后重新开启。远程10秒失联、溢水输入或IO异常同样尝试关断全部；重连不恢复输出。GPIO12在任意一路开启时常亮；已连服务器且待机时，每次有效心跳回执亮200ms、正常30秒一次；未联网或连接失败时恢复原网络闪烁。短闪不会打断工作常亮，也不增加心跳或流量。
 
-手动模式保留单次120秒超时，可按实际用途调整timing中的fill_timeout_ms/drain_timeout_ms；超时会关闭并锁存FAULT。可选overflow启用时仍受监测；未启用时不需要任何输入引脚。远程活动连接失联会尝试停止输出。RESET只复位，不重新打开。
+开启为pins.setup LOW后写HIGH；关闭仍是写LOW后pins.close。改变一路时不重新写入另一条仍开启的输出。LOW失败仍尝试close；关断或轮询定时器失败时禁止继续开水，需重启恢复。上电先关闭两路，不自动开水。12V/6.1V是历史接口测量，不是模组逻辑电压或同时负载验收。
 
-网页开关和设备回报同步，按同一开关第二次会发送STOP。此阶段只验收软件开关和命令逻辑，不要求实际水流验证。当前生成包是0.7.4，下载清单仍为8Lua+CA，见[Web与4G接入](web-console.md)。
+源码及生成包0.8.0，8Lua+CA，原CORE与默认库不变，见[Web与4G接入](web-console.md)。本地模拟/浏览器测试通过，尚未以0.8.0操作真实输出。用户当前只要求软件开关，不以水流测量作为本阶段前提。
 
 ## 自动液位控制参考（需显式配置mode=automatic）
 
-当前应用为 `water_auto_exchange 0.6.0`，使用既有 Air724UG V4035 FLOAT / LuaTask V2.4.4。本地USB控制无需SIM或网络，网页控制需4G联网；通过命令启动一轮，重启后待机，不恢复未完成的换水。还未加入定时计划或持续自动补水。
+以下为保留的自动液位模式参考，使用既有 Air724UG V4035 FLOAT / LuaTask V2.4.4。本地USB控制无需SIM或网络，网页控制需4G联网；通过命令启动一轮，重启后待机，不恢复未完成的换水。还未加入定时计划或持续自动补水。
 
 ## 液位板的信号
 
@@ -48,7 +55,7 @@ stateDiagram-v2
 
 ## 接线与配置
 
-修改 `src/water_config.lua`。默认 `enabled=false`、`mapping_confirmed=false`、`wiring_confirmed=false`，全部 GPIO 和有效电平均为空，此时 `UNCONFIGURED`，程序不配置输出，也不会扫描引脚。
+当前默认manual且两路输出映射已启用。要使用下述automatic流程，须显式设置mode并配置和确认液位输入；不能只改mode而沿用未配置的need_fill。未确认映射时进入UNCONFIGURED，不扫描未知引脚。
 
 | 配置 | 实际含义 |
 | --- | --- |
@@ -72,6 +79,8 @@ stateDiagram-v2
 可选 `overflow` 是软件额外输入，不等于独立硬件断水。若启用，超高触发不等待正常防抖，最迟在下一次有效轮询/命令采样时关断；解除后需稳定 500ms 才允许 RESET。失电关闭的阀、独立硬件断流方案须另按实际设备确定。
 
 ## USB 使用与状态
+
+下表说明automatic模式的液位流程；当前manual模式的独立开关命令见本文开头。
 
 使用新工具，COM 编号以当前枚举为准：
 
@@ -98,6 +107,6 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\water-command.ps1 -P
 
 ## 下载与验证边界
 
-LuaTools选择water-online-0.7.1项目，使用build/firmware/flash-files.txt中的完整8个Lua文件和1个CA证书，保留既有CORE、默认库及USB trace。准备与验证步骤见[Web与4G接入](web-console.md)。旧water-exchange的5文件清单不包含网络功能，不能用于当前联网版本。用户已授权助手刷写；执行工具不可用时不能宣称已下载。
+LuaTools选择water-online-0.8.0项目，使用build/firmware/flash-files.txt中的完整8个Lua文件和1个CA证书，保留既有CORE、默认库及USB trace。准备与验证步骤见[Web与4G接入](web-console.md)。旧water-exchange的5文件清单不包含网络功能，不能用于当前联网版本。由用户点击下载脚本；此前Escape停止的桌面输入未恢复。
 
-本地测试覆盖控制逻辑、故障、单独冲水不自动补水及端到端命令交付。所有GPIO测试都是模拟，最近实板日志为0.7.0/manual/UNCONFIGURED，0.7.1尚未刷入；实际泵、探针测试不在本阶段范围内。
+本地208项Lua、78项Python和浏览器联调通过，覆盖并行开关、各路计时、故障与端到端命令交付。GPIO测试均为模拟，最近实板日志为0.7.7/manual/IDLE、两路关闭；0.8.0仍待下载验证。实际泵、探针测试不在本阶段范围内。

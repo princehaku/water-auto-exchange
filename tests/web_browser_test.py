@@ -33,7 +33,7 @@ def main():
     server.origin = 'http://127.0.0.1:' + str(server.server_port)
     worker = threading.Thread(target=server.serve_forever, daemon=True)
     worker.start()
-    status = dict(project='water_auto_exchange', version='0.7.7', control_mode='manual',
+    status = dict(project='water_auto_exchange', version='0.8.0', control_mode='manual',
                   state='IDLE', reason='ready', ready='1', fill='0', drain='0',
                   outputs_known='1', need_fill='unknown', overflow='0', cycle='0', overflow_protection='0')
     device = 'a' * 32
@@ -73,15 +73,19 @@ def main():
                 status.update(changes)
                 store.poll(device, status)
             # All manual releases remain supported after backend deployment.
-            for version in ('0.7.0', '0.7.1', '0.7.2', '0.7.3', '0.7.4', '0.7.5', '0.7.6', '0.7.7'):
+            for version in ('0.7.0', '0.7.1', '0.7.2', '0.7.3', '0.7.4', '0.7.5', '0.7.6', '0.7.7', '0.8.0'):
                 report(version=version)
                 expect(page.locator('#version')).to_contain_text('v'+version)
                 page.wait_for_function("!document.getElementById('fill-button').disabled")
+            report(version='0.7.7',state='FILLING',fill='1')
+            expect(drain).to_be_disabled()
+            assert page.evaluate("switchCommand(document.getElementById('fill-button'))") == 'STOP'
+            report(state='IDLE',fill='0')
             # Do not send manual intentions to legacy automatic firmware.
             report(version='0.6.0')
             expect(page.locator('#version')).to_contain_text('v0.6.0')
             expect(fill).to_be_disabled(); expect(drain).to_be_disabled()
-            report(version='0.7.7', control_mode='automatic')
+            report(version='0.8.0', control_mode='automatic')
             expect(page.locator('#need-fill')).to_have_text('自动液位')
             expect(fill).to_be_disabled(); expect(drain).to_be_disabled()
             report(control_mode='manual')
@@ -109,19 +113,27 @@ def main():
             fill.click(); item = delivered('FILL')
             ack(item, state='FILLING', reason='manual_filling', fill='1', cycle='1')
             expect(fill).to_have_attribute('aria-checked', 'true')
-            expect(fill).to_be_enabled(); expect(drain).to_be_disabled()
+            expect(fill).to_be_enabled(); expect(drain).to_be_enabled()
             page.screenshot(path=str(output / 'manual-switches-desktop.png'), full_page=True)
-            # Same switch sends STOP; checked state remains until device confirms OFF.
-            fill.click(); item = delivered('STOP')
+            drain.click(); item = delivered('DRAIN')
+            ack(item, state='EXCHANGING', reason='manual_exchanging', drain='1')
+            expect(fill).to_have_attribute('aria-checked','true')
+            expect(drain).to_have_attribute('aria-checked','true')
+            expect(page.locator('#state')).to_have_text('补水与排水同时进行')
+            # Each switch closes only its own output after the device receipt.
+            fill.click(); item = delivered('FILL_OFF')
             expect(fill).to_have_attribute('aria-checked', 'true')
-            ack(item, state='IDLE', reason='stopped', fill='0')
+            ack(item, state='DRAINING', reason='manual_draining', fill='0')
             expect(fill).to_have_attribute('aria-checked', 'false')
+            expect(drain).to_have_attribute('aria-checked', 'true')
+            drain.click(); item = delivered('DRAIN_OFF')
+            ack(item,state='IDLE',reason='stopped',drain='0')
             expect(drain).to_be_enabled()
             drain.click(); item = delivered('DRAIN')
             ack(item, state='DRAINING', reason='manual_draining', drain='1', cycle='2')
             expect(drain).to_have_attribute('aria-checked', 'true')
-            expect(fill).to_be_disabled()
-            drain.click(); item = delivered('STOP')
+            expect(fill).to_be_enabled()
+            drain.click(); item = delivered('DRAIN_OFF')
             ack(item, state='IDLE', reason='stopped', drain='0')
             expect(drain).to_have_attribute('aria-checked', 'false')
             # Fault/uncertain output must not look like a confirmed successful close.

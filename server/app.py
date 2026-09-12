@@ -11,8 +11,8 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 
-ACTIVE = ('DRAINING', 'SETTLING', 'FILLING')
-COMMANDS = ('START', 'FILL', 'DRAIN', 'STOP', 'RESET')
+ACTIVE = ('DRAINING', 'SETTLING', 'FILLING', 'EXCHANGING')
+COMMANDS = ('START', 'FILL', 'DRAIN', 'FILL_OFF', 'DRAIN_OFF', 'STOP', 'RESET')
 ADMIN_SESSION_TTL_SECONDS = 999 * 24 * 60 * 60
 
 
@@ -24,7 +24,7 @@ class Problem(Exception):
 def validate_status(value):
     if not isinstance(value, dict):
         raise Problem(400, 'invalid_status')
-    if value.get('project') != 'water_auto_exchange' or value.get('version') not in ('0.3.0', '0.4.0', '0.5.0', '0.5.1', '0.5.2', '0.5.3', '0.6.0', '0.7.0', '0.7.1', '0.7.2', '0.7.3', '0.7.4', '0.7.5', '0.7.6', '0.7.7'):
+    if value.get('project') != 'water_auto_exchange' or value.get('version') not in ('0.3.0', '0.4.0', '0.5.0', '0.5.1', '0.5.2', '0.5.3', '0.6.0', '0.7.0', '0.7.1', '0.7.2', '0.7.3', '0.7.4', '0.7.5', '0.7.6', '0.7.7', '0.8.0'):
         raise Problem(409, 'firmware_mismatch')
     if value.get('state') not in ('UNCONFIGURED', 'IDLE', 'DONE', 'FAULT') + ACTIVE:
         raise Problem(400, 'invalid_state')
@@ -40,10 +40,19 @@ def validate_status(value):
             raise Problem(400, 'invalid_flag')
     if result['need_fill'] not in ('0', '1', 'unknown') or not result['cycle'].isdigit():
         raise Problem(400, 'invalid_level_or_cycle')
-    if result['version'] in ('0.7.0', '0.7.1', '0.7.2', '0.7.3', '0.7.4', '0.7.5', '0.7.6', '0.7.7'):
+    if result['version'] in ('0.7.0', '0.7.1', '0.7.2', '0.7.3', '0.7.4', '0.7.5', '0.7.6', '0.7.7', '0.8.0'):
         if value.get('control_mode') not in ('manual', 'automatic'):
             raise Problem(400, 'invalid_control_mode')
         result['control_mode'] = value['control_mode']
+    concurrent = result['version'] == '0.8.0' and result.get('control_mode') == 'manual'
+    if result['state'] == 'EXCHANGING' and not concurrent:
+        raise Problem(400, 'invalid_state')
+    if result['outputs_known'] == '1':
+        both = result['fill'] == result['drain'] == '1'
+        if both and (not concurrent or result['state'] != 'EXCHANGING'):
+            raise Problem(400, 'invalid_state')
+        if result['state'] == 'EXCHANGING' and not both:
+            raise Problem(400, 'invalid_state')
     return result
 
 
@@ -194,12 +203,16 @@ class Store:
             if not self.online():
                 raise Problem(409, 'device_offline')
             s = self.status
-            if command == 'DRAIN' and s['version'] not in ('0.6.0', '0.7.0', '0.7.1', '0.7.2', '0.7.3', '0.7.4', '0.7.5', '0.7.6', '0.7.7'):
+            concurrent = s['version'] == '0.8.0' and s.get('control_mode') == 'manual'
+            if command in ('FILL_OFF', 'DRAIN_OFF') and not concurrent:
+                raise Problem(409, 'firmware_upgrade_required')
+            if command == 'DRAIN' and s['version'] not in ('0.6.0', '0.7.0', '0.7.1', '0.7.2', '0.7.3', '0.7.4', '0.7.5', '0.7.6', '0.7.7', '0.8.0'):
                 raise Problem(409, 'firmware_upgrade_required')
             if command == 'START' and s.get('control_mode') == 'manual':
                 raise Problem(409, 'automatic_mode_required')
             if command in ('START', 'FILL', 'DRAIN'):
-                if s['ready'] != '1' or s['outputs_known'] != '1' or s['overflow'] != '0' or s['state'] not in ('IDLE', 'DONE'):
+                allowed_states = ('IDLE', 'DONE', 'FILLING', 'DRAINING', 'EXCHANGING') if concurrent else ('IDLE', 'DONE')
+                if s['ready'] != '1' or s['outputs_known'] != '1' or s['overflow'] != '0' or s['state'] not in allowed_states:
                     raise Problem(409, 'device_not_ready')
                 if s.get('control_mode') != 'manual' and s['need_fill'] != ('1' if command == 'FILL' else '0'):
                     raise Problem(409, 'level_not_ready')
@@ -207,6 +220,8 @@ class Store:
                 raise Problem(409, 'not_faulted')
             if command == 'STOP':
                 self.db.execute("UPDATE commands SET status='cancelled', result='superseded_by_stop', finished=? WHERE status='queued'", (self.clock(),))
+            elif command in ('FILL_OFF', 'DRAIN_OFF'):
+                self.db.execute("UPDATE commands SET status='cancelled', result='superseded_by_output_off', finished=? WHERE status='queued' AND command=?", (self.clock(), command[:-4]))
             elif self.db.execute("SELECT 1 FROM commands WHERE status IN ('queued','delivered')").fetchone():
                 raise Problem(409, 'command_pending')
             now = self.clock()
@@ -233,7 +248,7 @@ class Store:
                 self.db.execute("UPDATE commands SET status=?, result=?, finished=? WHERE id=? AND status IN ('delivered','uncertain')", (ack['status'], ack['result'], now, ack.get('id')))
             self.status, self.seen = status, now
             self.connection_event(True, 'connected')
-            row = self.db.execute("SELECT * FROM commands WHERE status='queued' ORDER BY CASE command WHEN 'STOP' THEN 0 ELSE 1 END, created LIMIT 1").fetchone()
+            row = self.db.execute("SELECT * FROM commands WHERE status='queued' ORDER BY CASE command WHEN 'STOP' THEN 0 WHEN 'FILL_OFF' THEN 1 WHEN 'DRAIN_OFF' THEN 1 ELSE 2 END, created LIMIT 1").fetchone()
             if row:
                 self.db.execute("UPDATE commands SET status='delivered' WHERE id=?", (row['id'],))
             self.db.commit()
@@ -288,7 +303,7 @@ class Store:
             if session != self.ws_gateway:
                 return None
             self.expire()
-            row = self.db.execute("SELECT * FROM commands WHERE status='queued' ORDER BY CASE command WHEN 'STOP' THEN 0 ELSE 1 END, created LIMIT 1").fetchone()
+            row = self.db.execute("SELECT * FROM commands WHERE status='queued' ORDER BY CASE command WHEN 'STOP' THEN 0 WHEN 'FILL_OFF' THEN 1 WHEN 'DRAIN_OFF' THEN 1 ELSE 2 END, created LIMIT 1").fetchone()
             if not row:
                 return None
             self.db.execute("UPDATE commands SET status='delivered' WHERE id=?", (row['id'],))

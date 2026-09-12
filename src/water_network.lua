@@ -1,7 +1,7 @@
 -- WSS application protocol; socket I/O is queued to water_ws_transport's task.
 local M = {}
-local ACTIVE = { DRAINING = true, SETTLING = true, FILLING = true }
-local ALLOWED = { START = "start", FILL = "fill", DRAIN = "drain", STOP = "stop", RESET = "reset" }
+local ACTIVE = { DRAINING = true, SETTLING = true, FILLING = true, EXCHANGING = true }
+local ALLOWED = { START = "start", FILL = "fill", DRAIN = "drain", FILL_OFF = "fill_off", DRAIN_OFF = "drain_off", STOP = "stop", RESET = "reset" }
 
 function M.start(controller, config, deps)
     if type(config) ~= "table" or config.enabled ~= true then return false, "network_disabled" end
@@ -104,11 +104,13 @@ function M.start(controller, config, deps)
     local function lost(reason)
         if owned then stop_outputs() end
         ready, opened, owned, pending, pings = false, false, false, {}, {}
+        if deps.on_connection then pcall(deps.on_connection, false) end
         if client then client:close(not enabled) end
         print("WATER WS", reason)
     end
     controller.stop = function()
         ready, opened, owned, pending, pings = false, false, false, {}, {}
+        if deps.on_connection then pcall(deps.on_connection, false) end
         if client then client:close() end
         return raw_stop()
     end
@@ -135,6 +137,7 @@ function M.start(controller, config, deps)
             -- Keep one server-issued meter id across reconnects, until reboot.
             meter_id = meter_id or value.session
             previous_session = value.session
+            if deps.on_connection then pcall(deps.on_connection, true) end
             print("WATER WS online")
             return
         end
@@ -147,6 +150,8 @@ function M.start(controller, config, deps)
             if sent_at and value.seq > pong_seq and time - sent_at < limit then
                 last_ok, pong_seq = time, value.seq
                 for seq in pairs(pings) do if seq <= pong_seq then pings[seq] = nil end end
+                -- Indication follows a valid reply, not a queued/unsent ping.
+                if deps.on_heartbeat then pcall(deps.on_heartbeat) end
             end
         elseif value.type == "received" then last_ok = time
         elseif value.type == "offer" then
@@ -155,6 +160,12 @@ function M.start(controller, config, deps)
             end
             if seen[value.id] or pending[value.id] then return end
             if value.command == "STOP" then pending = {} end
+            local off_target = ({FILL_OFF="FILL", DRAIN_OFF="DRAIN"})[value.command]
+            if off_target then
+                for id, item in pairs(pending) do
+                    if item.command == off_target then pending[id] = nil end
+                end
+            end
             pending[value.id] = {started = time, command = value.command}
             send({type = "claim", id = value.id})
         elseif value.type == "expired" then pending[value.id] = nil

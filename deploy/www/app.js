@@ -1,7 +1,7 @@
 'use strict';
 const $ = id => document.getElementById(id);
-const names = {START:'完整换水',FILL:'补水',DRAIN:'冲水',STOP:'停止输出',RESET:'故障复位'};
-const states = {UNCONFIGURED:'等待配置',IDLE:'待机',DRAINING:'正在排水',SETTLING:'切换间隔',FILLING:'正在补水',DONE:'本轮已完成',FAULT:'故障锁定'};
+const names = {START:'完整换水',FILL:'补水',DRAIN:'冲水',FILL_OFF:'关闭补水',DRAIN_OFF:'关闭冲水',STOP:'停止全部输出',RESET:'故障复位'};
+const states = {UNCONFIGURED:'等待配置',IDLE:'待机',DRAINING:'正在排水',SETTLING:'切换间隔',FILLING:'正在补水',EXCHANGING:'补水与排水同时进行',DONE:'本轮已完成',FAULT:'故障锁定'};
 const results = {queued:'等待设备领取',delivered:'等待回执',succeeded:'设备已确认',rejected:'设备已拒绝',expired:'已过期',uncertain:'结果待核实',cancelled:'已取消'};
 const reasons = {mapping_not_confirmed:'输出映射尚未确认',wiring_not_confirmed:'接线尚未确认',ready:'输入已稳定，可以启动',waiting_for_inputs:'等待液位输入稳定',stopped:'输出已停止',completed:'本轮换水完成',overflow:'超高水位触发',drain_timeout:'排水超时',fill_timeout:'补水超时',sensor_sequence:'液位反馈顺序异常',sensor_unstable_timeout:'液位输入持续不稳定',disabled:'控制配置未启用',draining:'等待低位补水请求',settling:'输出关闭，等待切换',filling:'等待补水请求解除',reset:'故障已复位'};
 const errors = {login_required:'请先登录。',invalid_key:'管理密钥不正确。',try_later:'尝试过于频繁，请稍后再试。',device_offline:'设备已离线，命令未提交。',device_not_ready:'设备尚未就绪。',level_not_ready:'当前液位反馈不满足启动条件。',command_pending:'上一条命令尚在等待回执。',not_faulted:'设备当前无待复位故障。'};
@@ -10,6 +10,7 @@ reasons.drain_completed='冲水完成，排水已停止';
 errors.firmware_upgrade_required='请先更新设备固件，再使用单独冲水。';
 reasons.manual_filling='补水已打开，可点击开关关闭';
 reasons.manual_draining='冲水已打开，可点击开关关闭';
+reasons.manual_exchanging='补水和冲水均已打开，可分别关闭';
 reasons.ready='已就绪，可以操作';
 const refreshInterval=2000;
 let snapshot=null, lastSnapshot=null, signedIn=false, busy=false, lastSuccess=0, submittedId=null;
@@ -53,11 +54,13 @@ function renderNetworkHistory(data){
 function can(command){
   const d=snapshot?.device;if(!snapshot?.online||!d||Date.now()-lastSuccess>10000)return false;
   if(command==='STOP')return true;
+  if(['FILL_OFF','DRAIN_OFF'].includes(command))return concurrent(d);
   if(busy||snapshot.commands.some(c=>['queued','delivered'].includes(c.status)))return false;
   if(command==='RESET')return d.state==='FAULT';
-  return ['FILL','DRAIN'].includes(command)&&['0.7.0','0.7.1','0.7.2','0.7.3','0.7.4','0.7.5','0.7.6','0.7.7'].includes(d.version)&&d.control_mode==='manual'&&d.ready==='1'&&d.outputs_known==='1'&&d.overflow==='0'&&['IDLE','DONE'].includes(d.state);
+  return ['FILL','DRAIN'].includes(command)&&['0.7.0','0.7.1','0.7.2','0.7.3','0.7.4','0.7.5','0.7.6','0.7.7','0.8.0'].includes(d.version)&&d.control_mode==='manual'&&d.ready==='1'&&d.outputs_known==='1'&&d.overflow==='0'&&(concurrent(d)?['IDLE','DONE','FILLING','DRAINING','EXCHANGING']:['IDLE','DONE']).includes(d.state);
 }
-function switchCommand(button){const d=snapshot?.device;return button.dataset.output&&d?.outputs_known==='1'&&d[button.dataset.output]==='1'?'STOP':button.dataset.command;}
+function concurrent(d){return d?.version==='0.8.0'&&d.control_mode==='manual';}
+function switchCommand(button){const d=snapshot?.device;return button.dataset.output&&d?.outputs_known==='1'&&d[button.dataset.output]==='1'?(concurrent(d)?button.dataset.command+'_OFF':'STOP'):button.dataset.command;}
 function controls(){document.querySelectorAll('[data-command]').forEach(b=>{
   b.disabled=!can(switchCommand(b));
   if(b.dataset.output){const d=snapshot?.device,known=d?.outputs_known==='1',on=known&&d[b.dataset.output]==='1';b.setAttribute('aria-checked',on?'true':'false');b.classList.toggle('is-on',on);$(b.dataset.output+'-hint').textContent=known?(on?'已打开 · 点击关闭':'已关闭 · 点击打开'):'状态未知';}
@@ -74,7 +77,7 @@ function render(data){
   for(const key of ['fill','drain'])$(key).textContent=d&&d.outputs_known==='1'?(d[key]==='1'?'开启':'关闭'):'未知';
   $('cycle').textContent=d?d.cycle:'—';
   $('protection').textContent=d?(d.overflow==='1'?'超高水位已触发，请检查现场。':d.overflow_protection==='1'?'已配置额外超高输入；软件保护生效。':'额外超高输入未启用。'):'等待保护状态';
-  $('control-hint').textContent=!online?'设备离线，连接恢复后可操作。':!['0.7.0','0.7.1','0.7.2','0.7.3','0.7.4','0.7.5','0.7.6','0.7.7'].includes(d.version)?'更新设备后可使用手动开关。':d.control_mode!=='manual'?'设备需配置为手动开关模式。':d.state==='UNCONFIGURED'?'输出引脚尚未配置。手动开关不需要水位传感器。':d.state==='FAULT'?'排除故障后复位；停止输出仍可使用。':['FILLING','DRAINING'].includes(d.state)?'请先关闭当前输出，再打开另一路。':'点击开关打开或关闭，不等待水位信号。';
+  $('control-hint').textContent=!online?'设备离线，连接恢复后可操作。':!['0.7.0','0.7.1','0.7.2','0.7.3','0.7.4','0.7.5','0.7.6','0.7.7','0.8.0'].includes(d.version)?'更新设备后可使用手动开关。':d.control_mode!=='manual'?'设备需配置为手动开关模式。':d.state==='UNCONFIGURED'?'输出引脚尚未配置。手动开关不需要水位传感器。':d.state==='FAULT'?'排除故障后复位；停止输出仍可使用。':concurrent(d)?'补水和冲水可同时开启，点击各自开关独立关闭。':['FILLING','DRAINING'].includes(d.state)?'当前固件需先关闭当前输出；升级 0.8.0 后可同时开启。':'点击开关打开或关闭；升级 0.8.0 后可同时开启两路。';
   document.querySelectorAll('[data-state]').forEach(e=>e.classList.toggle('current',online&&e.dataset.state===d?.state));
   $('history').replaceChildren();
   for(const item of data.commands){const row=document.createElement('tr');for(const value of [timeLabel(item.created),names[item.command]||item.command,results[item.status]||item.status,item.result||'—']){const cell=document.createElement('td');cell.textContent=value;row.append(cell);}$('history').append(row);}

@@ -86,7 +86,7 @@ function M.new(config, dependencies)
 
     local function emit_status()
         local s = self.status()
-        local signature = s.state .. ":" .. s.reason
+        local signature = s.state .. ":" .. s.reason .. ":" .. tostring(s.fill) .. ":" .. tostring(s.drain)
         if signature == last_state then return end
         last_state = signature
         -- Observers run after output changes; indicator failures cannot block STOP.
@@ -114,11 +114,12 @@ function M.new(config, dependencies)
         return math.floor(elapsed_ms)
     end
 
-    local function off_all()
+    local function off_all(keep)
         local errors = {}
         for _, name in ipairs({"fill", "drain"}) do
             local item = valid and cfg.outputs[name]
-            if owned[name] and (item.off_mode ~= "release" or opened[name] or uncertain[name]) then
+            if owned[name] and (not keep or not keep[name] or uncertain[name])
+                and (item.off_mode ~= "release" or opened[name] or uncertain[name]) then
                 local setup_ok = true
                 if item.off_mode == "release" and not opened[name] then
                     -- Retry an uncertain OFF even if a previous close succeeded.
@@ -167,14 +168,15 @@ function M.new(config, dependencies)
 
     local function apply(token)
         local s = engine:status()
-        assert(not (s.fill and s.drain), "output_interlock")
+        assert(manual or not (s.fill and s.drain), "output_interlock")
         if s.fill == actual.fill and s.drain == actual.drain
             and not uncertain.fill and not uncertain.drain then return end
-        local ok, err = off_all()
+        -- Manual changes leave the other active output electrically untouched.
+        local ok, err = off_all(manual and s or nil)
         if not ok then error("output_off_failed:" .. err, 0) end
         if token ~= generation then return end
-        local name = s.fill and "fill" or (s.drain and "drain" or nil)
-        if name then
+        for _, name in ipairs({"fill", "drain"}) do
+          if s[name] and not actual[name] then
             local item = cfg.outputs[name]
             -- Mark uncertainty before a possibly partial ON write; faults retry both OFFs.
             actual[name], uncertain[name] = true, true
@@ -184,7 +186,9 @@ function M.new(config, dependencies)
                 if token ~= generation then return end
             end
             checked("on_" .. name, pin_api.setval, item.on_level, item.gpio)
+            assert(token == generation, "output_cancelled_during_write")
             uncertain[name] = false
+          end
         end
     end
 
@@ -307,6 +311,12 @@ function M.new(config, dependencies)
         if not valid then return false, config_reason end
         if not initialized then return false, "not_initialized" end
         if not running then return false, "poller_stopped_restart_required" end
+        local stopping = method == "stop_fill" or method == "stop_drain"
+        if stopping then
+            if not manual then return false, "manual_mode_required" end
+            local cancelled, detail = cancel()
+            if not cancelled then running = false; return fault("stop:" .. clean(detail)) end
+        end
         local accepted, reason
         local token = generation
         local ok, err = pcall(function()
@@ -315,7 +325,14 @@ function M.new(config, dependencies)
             apply(token)
             if method == "reset" and accepted then io_error = nil end
         end)
-        if not ok then return fault(err) end
+        if not ok then
+            if stopping then running = false; cancel() end
+            return fault(err)
+        end
+        if stopping and running and token == generation then
+            local scheduled, detail = pcall(schedule)
+            if not scheduled then running = false; cancel(); return fault(detail) end
+        end
         emit_status()
         return accepted, reason
     end
@@ -323,6 +340,8 @@ function M.new(config, dependencies)
     function self.start() return command("start") end
     function self.fill() return command("start_fill") end
     function self.drain() return command("start_drain") end
+    function self.fill_off() return command("stop_fill") end
+    function self.drain_off() return command("stop_drain") end
     function self.reset() return command("reset") end
 
     function self.stop()

@@ -19,7 +19,7 @@ local function state(controller, name, fill, drain)
     equal(s.state, name)
     equal(s.fill, fill == true)
     equal(s.drain, drain == true)
-    assert(not (s.fill and s.drain), "fill/drain interlock failed")
+    assert(controller.mode == "manual" or not (s.fill and s.drain), "fill/drain interlock failed")
     return s
 end
 local function sample_ready(controller, need_fill)
@@ -326,7 +326,7 @@ test("manual fill and drain run without water levels until explicitly stopped", 
         c:update(200, true, false); c:update(400, false, false)
         state(c, target, target == "FILLING", target == "DRAINING")
         equal(c:status().need_fill, nil, "never invent a water level")
-        equal(c[method == "start_fill" and "start_drain" or "start_fill"](c,400), false)
+        assert(c[method == "start_fill" and "start_drain" or "start_fill"](c,400)); state(c,"EXCHANGING",true,true)
         assert(c:stop()); c:update(10000, nil, false); state(c, "IDLE")
     end
 end)
@@ -344,6 +344,45 @@ test("manual switches retain timeout and optional overflow shutdown", function()
             state(c,"IDLE")
         end
     end
+end)
+
+test("manual concurrent outputs retain independent start times and repeated ON cannot extend them",function()
+    for _, first in ipairs({"fill","drain"}) do
+        local other=first=="fill" and "drain" or "fill"
+        local c=fixture({mode="manual"});c:update(0,nil,false);c:update(100,nil,false)
+        assert(c["start_"..first](c,100));c:update(600,nil,false)
+        assert(c["start_"..other](c,600));state(c,"EXCHANGING",true,true)
+        local cycles=c.cycle;assert(c["start_"..first](c,900));equal(c.cycle,cycles)
+        c:update(1099,nil,false);state(c,"EXCHANGING",true,true)
+        c:update(1100,nil,false);equal(state(c,"FAULT").reason,first.."_timeout")
+    end
+end)
+
+test("manual OFF preserves the other output and its original deadline",function()
+    for _, first in ipairs({"fill","drain"}) do
+        local other=first=="fill" and "drain" or "fill"
+        local c=fixture({mode="manual"});c:update(0,nil,false);c:update(100,nil,false)
+        assert(c["start_"..first](c,100));assert(c["start_"..other](c,600))
+        assert(c["stop_"..first](c,800));assert(c["stop_"..first](c,900))
+        equal(c:status()[first],false);equal(c:status()[other],true)
+        c:update(1599,nil,false);equal(c:status()[other],true)
+        c:update(1600,nil,false);equal(state(c,"FAULT").reason,other.."_timeout")
+    end
+end)
+
+test("concurrent STOP overflow and reset never restore either output",function()
+    for _, overflow in ipairs({false,true}) do
+        local c=fixture({mode="manual"});c:update(0,nil,false);c:update(100,nil,false)
+        assert(c:start_fill(100));assert(c:start_drain(100))
+        if overflow then c:update(200,nil,true);state(c,"FAULT")
+        else assert(c:stop());state(c,"IDLE") end
+        c:update(300,nil,false);c:update(400,nil,false)
+        if overflow then assert(c:reset(400)) end
+        state(c,"IDLE");c:update(99999,nil,false);state(c,"IDLE")
+    end
+    local automatic=fixture();sample_ready(automatic,false);assert(automatic:start_drain(100))
+    equal(automatic:start_fill(100),false);equal(automatic:stop_drain(100),false)
+    state(automatic,"DRAINING",false,true)
 end)
 
 local failures = 0

@@ -2,7 +2,7 @@
 param(
     [ValidatePattern('^COM[1-9][0-9]*$')]
     [string]$Port = 'COM4',
-    [ValidateSet('STATUS', 'START', 'FILL', 'DRAIN', 'STOP', 'RESET')]
+    [ValidateSet('STATUS', 'START', 'FILL', 'DRAIN', 'FILL_OFF', 'DRAIN_OFF', 'STOP', 'RESET')]
     [string]$Command = 'STATUS'
 )
 
@@ -29,17 +29,18 @@ function Invoke-WaterCommand([string]$Value) {
         if ($match.Success) { return $match.Groups[1].Value }
         Start-Sleep -Milliseconds 25
     }
-    throw "No water controller response on $Port. Confirm version 0.7.0/0.7.1/0.7.2/0.7.3/0.7.4/0.7.5/0.7.6/0.7.7 is flashed and the USB user port is available."
+    throw "No water controller response on $Port. Confirm version 0.7.0/0.7.1/0.7.2/0.7.3/0.7.4/0.7.5/0.7.6/0.7.7/0.8.0 is flashed and the USB user port is available."
 }
 
 try {
     $serial.Open()
     # Identify the application before sending any command that changes state.
     $status = Invoke-WaterCommand 'STATUS'
-    if ($status -notmatch '^OK STATUS project=water_auto_exchange version=0\.7\.[01234567](?: |$)') {
-        throw 'The selected port did not identify as water_auto_exchange version 0.7.0/0.7.1/0.7.2/0.7.3/0.7.4/0.7.5/0.7.6/0.7.7.'
+    if ($status -notmatch '^OK STATUS project=water_auto_exchange version=(?:0\.7\.[01234567]|0\.8\.0)(?: |$)') {
+        throw 'The selected port did not identify as water_auto_exchange version 0.7.0/0.7.1/0.7.2/0.7.3/0.7.4/0.7.5/0.7.6/0.7.7/0.8.0.'
     }
     Write-Output $status
+    if ($Command -in @('FILL_OFF', 'DRAIN_OFF') -and $status -notmatch 'version=0\.8\.0(?: |$)') { throw 'Separate OFF commands require firmware 0.8.0.' }
     if ($Command -ne 'STATUS') {
         $response = Invoke-WaterCommand $Command.ToUpperInvariant()
         Write-Output $response

@@ -24,7 +24,7 @@ local function fixture()
         sys={timerLoopStart=function(fn) f.step=fn; return 1 end},
         transport={new=function(_,callbacks) f.callbacks=callbacks; return f.client end},
         json={encode=function(value) return value end,decode=function() if f.decode_fail then error("decode") end; return f.decoded end},
-        usb={format_status=function() return "project=water_auto_exchange version=0.7.7 state="..f.state end},
+        usb={format_status=function() return "project=water_auto_exchange version=0.8.0 state="..f.state end},
         read_cert=function() return f.no_cert and "" or "-----BEGIN CERTIFICATE-----" end}
     -- Ordinary messages use fake JSON tokens; auth concatenation needs strings.
     local serial=0
@@ -341,6 +341,58 @@ test("reconnect auth carries the previous server session without replaying a com
     f.callbacks.close();f.callbacks.open()
     token=f.sent[#f.sent]:match('"previous_session":([^}]+)')
     assert(f.messages[token]==string.rep("c",32) and #f.calls==2)
+end)
+
+test("simultaneous outputs keep active heartbeats and partial OFF does not release remote ownership",function()
+    for _, stop_one in ipairs({"FILL_OFF","DRAIN_OFF"}) do
+        local f=fixture();f.config.heartbeat_ms=30000
+        local fill,drain=false,false
+        local function state() f.state=fill and drain and "EXCHANGING" or (fill and "FILLING" or (drain and "DRAINING" or "IDLE")) end
+        f.controller.fill=function() fill=true;state();return true,"fill_started" end
+        f.controller.drain=function() drain=true;state();return true,"drain_started" end
+        f.controller.fill_off=function() fill=false;state();return true,"fill_stopped" end
+        f.controller.drain_off=function() drain=false;state();return true,"drain_stopped" end
+        f.connect();f.offer("FILL");f.execute("FILL")
+        f.offer("DRAIN",string.rep("c",32));f.execute("DRAIN",8000,string.rep("c",32))
+        assert(f.state=="EXCHANGING")
+        for _=1,12 do f.advance(1000);assert(f.last().type=="ping");f.reply({type="pong",seq=f.last().seq}) end
+        assert(not f.closed)
+        f.offer(stop_one,string.rep("d",32));f.execute(stop_one,8000,string.rep("d",32))
+        assert(f.state==(stop_one=="FILL_OFF" and "DRAINING" or "FILLING"))
+        f.advance(9995);assert(not f.closed)
+        f.advance(5);assert(f.closed and f.calls[1]=="STOP")
+    end
+end)
+
+test("partial OFF invalidates only its pending ON and leaves the other command deliverable",function()
+    local f=fixture();f.controller.fill_off=function() return true,"fill_stopped" end;f.connect()
+    f.offer("FILL");f.offer("DRAIN",string.rep("c",32));f.offer("FILL_OFF",string.rep("d",32))
+    f.execute("FILL_OFF",8000,string.rep("d",32));f.execute("FILL")
+    assert(#f.calls==0)
+    f.execute("DRAIN",8000,string.rep("c",32));assert(f.calls[1]=="DRAIN")
+    f.callbacks.close();assert(f.calls[2]=="STOP")
+    f.callbacks.open();f.reply({type="ready",session=string.rep("e",32)})
+    f.execute("FILL");f.execute("DRAIN",8000,string.rep("c",32));assert(#f.calls==2)
+end)
+
+test("LED observers get authenticated connection and fresh heartbeat replies only",function()
+    local f=fixture();local beats,connections=0,{}
+    f.deps.on_heartbeat=function() beats=beats+1 end
+    f.deps.on_connection=function(value) connections[#connections+1]=value end
+    assert(f.start());f.callbacks.open();assert(#connections==0)
+    f.reply({type="ready",session=string.rep("a",32)});assert(connections[1]==true)
+    f.reply({type="received"});assert(beats==0)
+    f.advance(1000);local seq=f.last().seq;assert(beats==0)
+    f.reply({type="pong",seq=-1});assert(beats==0)
+    f.reply({type="pong",seq=seq});f.reply({type="pong",seq=seq});assert(beats==1)
+    f.controller.stop();assert(connections[2]==false)
+    f.callbacks.open();f.reply({type="ready",session=string.rep("c",32)})
+    f.reply({type="pong",seq=seq});assert(beats==1)
+    f.deps.on_heartbeat=function() error("LED unavailable") end
+    f.advance(1000);f.reply({type="pong",seq=f.last().seq});f.closed=false
+    f.advance(1000);assert(not f.closed)
+    f.deps.on_connection=function() error("LED unavailable") end
+    f.callbacks.close();assert(f.closed)
 end)
 
 print("water_network: "..count.." tests passed")

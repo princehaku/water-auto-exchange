@@ -16,6 +16,7 @@ end
 
 local function outputs_off(self)
     self.fill, self.drain = false, false
+    self.fill_since, self.drain_since = nil, nil
 end
 
 local function invalidate_samples(self)
@@ -85,9 +86,9 @@ function methods:update(now, need_fill, overflow)
         self.inputs_ready = not overflow and self.clear_since ~= nil
             and now - self.clear_since >= self.settings.debounce_ms
         if self.state == "FAULT" then return false, self.reason end
-        if self.state == "DRAINING" and now - self.phase_since >= self.settings.drain_timeout_ms then
+        if self.drain and now - self.drain_since >= self.settings.drain_timeout_ms then
             return self:fault("drain_timeout")
-        elseif self.state == "FILLING" and now - self.phase_since >= self.settings.fill_timeout_ms then
+        elseif self.fill and now - self.fill_since >= self.settings.fill_timeout_ms then
             return self:fault("fill_timeout")
         elseif self.state == "IDLE" and self.reason == "waiting_for_inputs" and self.inputs_ready then
             self.reason = "ready"
@@ -141,6 +142,36 @@ function methods:update(now, need_fill, overflow)
     return true, self.reason
 end
 
+local function manual_state(self)
+    if self.fill and self.drain then self.state, self.reason = "EXCHANGING", "manual_exchanging"
+    elseif self.fill then self.state, self.reason = "FILLING", "manual_filling"
+    elseif self.drain then self.state, self.reason = "DRAINING", "manual_draining"
+    else self.state, self.reason = "IDLE", "stopped" end
+end
+
+local function manual_on(self, name, now)
+    if not check_time(self, now) then return false, self.reason end
+    if self.state == "FAULT" then return false, "fault_latched" end
+    if not self.inputs_ready then return false, "inputs_not_stable" end
+    -- Explicit ON is idempotent and never extends an already running deadline.
+    if self[name] then return true, name .. "_already_on" end
+    self[name], self[name .. "_since"] = true, now
+    self.cycle = self.cycle + 1
+    manual_state(self)
+    return true, name .. "_started"
+end
+
+local function manual_off(self, name, now)
+    if not check_time(self, now) then return false, self.reason end
+    if self.mode ~= "manual" then return false, "manual_mode_required" end
+    self[name], self[name .. "_since"] = false, nil
+    if self.state ~= "FAULT" then manual_state(self) end
+    return true, name .. "_stopped"
+end
+
+function methods:stop_fill(now) return manual_off(self, "fill", now) end
+function methods:stop_drain(now) return manual_off(self, "drain", now) end
+
 local function can_start(self, now)
     if not check_time(self, now) then return false, self.reason end
     if self.state == "FAULT" then return false, "fault_latched" end
@@ -162,6 +193,7 @@ end
 
 -- Independent drain: stop at B without entering the automatic refill phase.
 function methods:start_drain(now)
+    if self.mode == "manual" then return manual_on(self, "drain", now) end
     local ok, reason = can_start(self, now)
     if not ok then return false, reason end
     if self.mode ~= "manual" and self.need_fill ~= false then return false, "level_not_ready" end
@@ -172,6 +204,7 @@ function methods:start_drain(now)
 end
 
 function methods:start_fill(now)
+    if self.mode == "manual" then return manual_on(self, "fill", now) end
     local ok, reason = can_start(self, now)
     if not ok then return false, reason end
     if self.mode ~= "manual" and self.need_fill ~= true then return false, "fill_not_requested" end

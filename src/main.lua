@@ -1,5 +1,5 @@
 PROJECT = "water_auto_exchange"
-VERSION = "0.7.7"
+VERSION = "0.8.0"
 
 local sys = require "sys"
 local log = require "log"
@@ -12,7 +12,7 @@ local network_config = require "water_network_config"
 
 print(PROJECT, VERSION, "boot", _VERSION)
 sys.init(0, 0)
-local update_led
+local update_led, heartbeat_led, connection_led
 local controller = water.new(config, {on_status = function(status)
     if update_led then update_led(status) end
 end})
@@ -38,29 +38,66 @@ if call_ok and ready then
         assert(pio and pio.P0_12 ~= nil, "network_led_pin_unavailable")
         local netLed = require "netLed"
         assert(type(netLed.updateBlinkTime) == "function", "network_led_pattern_unavailable")
-        -- LuaTask V2.4.4 defaults; keep one LED owner, including during radio changes.
+        -- netLed remains the only GPIO owner; offline uses LuaTask's defaults.
         local idle_patterns = {NULL={0,65535}, FLYMODE={0,65535}, SIMERR={300,5700},
             IDLE={300,3700}, GSM={300,1700}, GPRS={300,700}, SCK={100,100}}
-        local previous_active
-        update_led = function(status)
-            local active = status.outputs_known == true and (status.fill == true or status.drain == true)
-            if active == previous_active then return end
+        local active, online, pulse, previous_mode = false, false, false, nil
+        local pulse_timer, pulse_generation = nil, 0
+        local function render_led()
+            local mode = active and "on" or (not online and "network" or (pulse and "on" or "off"))
+            if mode == previous_mode then return end
             for state, pattern in pairs(idle_patterns) do
-                netLed.updateBlinkTime(state, active and 65535 or pattern[1], active and 0 or pattern[2])
+                local on, off = pattern[1], pattern[2]
+                if mode ~= "network" then on, off = mode == "on" and 65535 or 0, mode == "on" and 0 or 65535 end
+                netLed.updateBlinkTime(state, on, off)
             end
-            previous_active = active
+            previous_mode = mode
+        end
+        local function cancel_pulse()
+            pulse_generation = pulse_generation + 1
+            pulse = false
+            if pulse_timer then pcall(sys.timerStop, pulse_timer); pulse_timer = nil end
+        end
+        update_led = function(status)
+            local next_active = status.outputs_known == true and (status.fill == true or status.drain == true)
+            if next_active ~= active then cancel_pulse(); active = next_active end
+            render_led()
+        end
+        connection_led = function(connected)
+            if online == connected then return end
+            online = connected
+            cancel_pulse()
+            render_led()
+        end
+        heartbeat_led = function()
+            if active or not online then return end
+            cancel_pulse()
+            local token = pulse_generation
+            pulse = true
+            render_led()
+            local ok, id = pcall(sys.timerStart, function()
+                if token ~= pulse_generation or active then return end
+                pulse_timer, pulse = nil, false
+                pcall(render_led)
+            end, 200)
+            if ok and type(id) == "number" and id > 0 then
+                pulse_timer = id
+            else
+                cancel_pulse()
+                render_led()
+            end
         end
         netLed.setup(true, pio.P0_12)
         update_led(controller.status())
     end)
-    if not led_ok then update_led = nil end
+    if not led_ok then update_led, heartbeat_led, connection_led = nil, nil, nil end
     print("WATER NET LED gpio=12 physical=53", led_ok and "enabled" or "setup_failed")
 end
 
 if call_ok and ready and network_config.enabled == true then
     local ok, started, detail = pcall(function()
         local network = require "water_network"
-        return network.start(controller, network_config)
+        return network.start(controller, network_config, {on_heartbeat = heartbeat_led, on_connection = connection_led})
     end)
     if not ok or not started then
         pcall(controller.stop)

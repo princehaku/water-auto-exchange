@@ -62,14 +62,32 @@ local function timed_fixture(options)
     options=options or {}
     local f={tick=options.tick or 0,opened=false,ready=options.ready~=false,registered=options.registered or "REGISTERED",recoveries={},closed=0,queries={},subscriptions={}}
     _G.rtos={tick=function() return f.tick end}
-    local io={connect=function() return coroutine.yield("CONNECT") end,
+    local io={connect=function(_,host,port,seconds)
+            f.connect_host,f.connect_port,f.connect_seconds=host,port,seconds
+            return coroutine.yield("CONNECT")
+        end,
         send=function() return coroutine.yield("SEND") end,
         recv=function() return coroutine.yield("RECV") end,
         close=function() f.socket_closed=true;coroutine.yield("CLOSE") end}
     local sys={taskInit=function(fn) f.co=coroutine.create(fn);return f.co end,
         subscribe=function(event,fn) f.subscriptions[event]=fn end,
         publish=function() end,wait=function(ms) coroutine.yield("WAIT",ms) end}
-    f.client=ws.new({url="wss://example.test/water/api/device/ws",device_key=string.rep("k",32),ca_cert="water-ca.crt"},
+    f.probes,f.probes_closed=0,0
+    local probe={connect=function(_,host,port,seconds)
+            assert(f.socket_closed and f.closed>0 and not f.client.connected and #f.client.queue==0)
+            assert(host=="example.test" and port==443 and seconds==15)
+            f.probes=f.probes+1
+            if options.probe_yield then return coroutine.yield("PROBE_CONNECT") end
+            return options.probe_success~=false
+        end,
+        send=function() error("diagnostic must never send application data") end,
+        recv=function() error("diagnostic must never read application data") end,
+        close=function()
+            f.probes_closed=f.probes_closed+1
+            if options.probe_yield then coroutine.yield("PROBE_CLOSE") end
+        end}
+    f.client=ws.new({url="wss://example.test/water/api/device/ws",device_key=string.rep("k",32),ca_cert="water-ca.crt",
+        tls_connect_timeout_ms=options.connect_ms},
         {open=function() f.opened=true end,close=function() f.closed=f.closed+1 end},{sys=sys,
         link={shut=function()
             assert(not f.client.connected and #f.client.queue==0)
@@ -79,7 +97,12 @@ local function timed_fixture(options)
         end},
         net={getState=function() return f.registered end},
         ril={request=function(cmd,_,cb) f.queries[#f.queries+1]=cmd;if cb then f.diagnostic_done=cb end end},
-        socket={isReady=function() return f.ready end,tcp=function() if not options.no_socket then return io end end},
+        socket={isReady=function() return f.ready end,tcp=function(ssl,cert)
+            if options.no_socket then return end
+            if not ssl then return probe end
+            assert(ssl==true and cert.caCert=="water-ca.crt" and cert.hostNameFlag==1 and cert.insist==0)
+            return io
+        end},
         crypto={sha1=function() return string.rep("0",40) end,base64_encode=function(_,size) return "base64_"..size end}})
     function f.resume(expected,...)
         local ok,phase,value=coroutine.resume(f.co,...)
@@ -93,6 +116,66 @@ local function timed_fixture(options)
     f.client:start();f.resume((options.ready==false or options.no_socket) and "WAIT" or "CONNECT")
     return f
 end
+
+test("slow cellular TLS may complete after ten seconds with a seconds-based budget",function()
+    for _,ms in ipairs({30000,60000,120000}) do
+        local f=timed_fixture({connect_ms=ms})
+        assert(f.connect_seconds==ms/1000 and f.connect_host=="example.test" and f.connect_port==443)
+        f.tick=5000 -- 25 seconds, which the old ten-second connect timer rejected.
+        assert(f.tick*5<f.connect_seconds*1000)
+        f.upgrade();assert(f.opened and f.probes==0)
+    end
+    assert(timed_fixture().connect_seconds==60)
+end)
+
+test("TLS deadline failure closes socket and retries without authenticating",function()
+    local f=timed_fixture();f.tick=f.connect_seconds*200
+    f.resume("CLOSE",false);assert(f.closed==1 and not f.opened)
+    assert(f.resume("WAIT")==1000);f.resume("CONNECT");f.upgrade()
+end)
+
+test("cancelled slow connect discards a late success before sending HTTP or credentials",function()
+    local f=timed_fixture();f.client:close();f.tick=5000
+    f.resume("CLOSE",true);assert(not f.opened and #f.client.queue==0)
+    assert(f.resume("WAIT")==1000 and f.probes==0)
+end)
+
+test("TCP diagnostic after failures is throttled and cannot mark TLS online",function()
+    for _,reachable in ipairs({true,false}) do
+        local f=timed_fixture({probe_success=reachable})
+        for attempt=1,6 do
+            if attempt==5 then f.tick=f.tick+59999 end
+            if attempt==6 then f.tick=f.tick+1 end
+            f.resume("CLOSE",false);f.resume("WAIT")
+            local expected=attempt<3 and 0 or (attempt<6 and 1 or 2)
+            assert(f.probes==expected and f.probes_closed==expected)
+            assert(not f.opened and not f.client.connected and #f.client.queue==0)
+            f.ready=true;f.resume("CONNECT")
+        end
+    end
+end)
+
+test("TCP diagnostic is skipped if registration or IP readiness is lost",function()
+    for _,lost in ipairs({"registration","ip"}) do
+        local f=timed_fixture()
+        for attempt=1,3 do
+            if attempt==3 then
+                if lost=="registration" then f.registered="UNREGISTER" else f.ready=false end
+            end
+            f.resume("CLOSE",false);f.resume("WAIT")
+            if attempt<3 then f.resume("CONNECT") end
+        end
+        assert(f.probes==0)
+    end
+end)
+
+test("TCP diagnostic yields in the owner and permanent stop prevents another retry",function()
+    local f=timed_fixture({probe_yield=true})
+    for _=1,2 do f.resume("CLOSE",false);f.resume("WAIT");f.resume("CONNECT") end
+    f.resume("CLOSE",false);f.resume("PROBE_CONNECT")
+    f.client:close(true);f.resume("PROBE_CLOSE",true);f.resume(nil)
+    assert(f.probes==1 and f.probes_closed==1 and not f.opened and not f.client:failed())
+end)
 
 test("HTTP upgrade deadline is 2000 Air724 ticks",function()
     local f=timed_fixture();f.resume("SEND",true);f.resume("RECV",true)

@@ -24,7 +24,7 @@ local function fixture()
         sys={timerLoopStart=function(fn) f.step=fn; return 1 end},
         transport={new=function(_,callbacks) f.callbacks=callbacks; return f.client end},
         json={encode=function(value) return value end,decode=function() if f.decode_fail then error("decode") end; return f.decoded end},
-        usb={format_status=function() return "project=water_auto_exchange version=0.7.1 state="..f.state end},
+        usb={format_status=function() return "project=water_auto_exchange version=0.7.2 state="..f.state end},
         read_cert=function() return f.no_cert and "" or "-----BEGIN CERTIFICATE-----" end}
     -- Ordinary messages use fake JSON tokens; auth concatenation needs strings.
     local serial=0
@@ -56,6 +56,25 @@ test("remote DRAIN executes once and disconnect stops the owned drain",function(
 end)
 test("plaintext and old HTTP URL rejected",function() local f=fixture();f.config.url="https://example.test/water";assert(not f.start()) end)
 test("missing CA prevents connection",function() local f=fixture();f.no_cert=true;assert(not f.start());assert(not f.started) end)
+
+test("connection budget accepts bounded seconds expressed in milliseconds",function()
+    assert(require("water_network_config").tls_connect_timeout_ms==60000)
+    for _,ms in ipairs({15000,30000,60000,120000}) do
+        local f=fixture();f.config.tls_connect_timeout_ms=ms;assert(f.start())
+    end
+    for _,ms in ipairs({0,60,14999,15500,121000,"60000",false,0/0,math.huge}) do
+        local f=fixture();f.config.tls_connect_timeout_ms=ms
+        local ok,reason=f.start()
+        assert(not ok and reason=="network_connect_timeout_invalid" and not f.started)
+    end
+end)
+
+test("long connection budget never extends active output communication deadline",function()
+    local f=fixture();f.config.tls_connect_timeout_ms=120000
+    f.connect();f.offer("FILL");f.execute("FILL")
+    f.advance(9995);assert(f.state=="FILLING" and not f.closed)
+    f.advance(5);assert(f.closed and f.state=="IDLE" and f.calls[2]=="STOP")
+end)
 test("auth key has a fixed nonsecret prefix",function() local f=fixture();f.connect();assert(f.sent[1]:find('{"type":"auth","protocol":"water-ws-v1","key"',1,true)==1) end)
 test("idle heartbeat follows one second boundaries",function() local f=fixture();f.connect();for i=1,5 do local n=#f.sent;f.advance(500);assert(#f.sent==n);f.advance(500);assert(#f.sent==n+1 and f.last().type=="ping");f.reply({type="pong",seq=f.last().seq}) end end)
 

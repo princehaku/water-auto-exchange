@@ -4,6 +4,8 @@ return {
     url = "wss://bytegallop.com/water/api/device/ws",
     device_key = "",
     ca_cert = "water-ca.crt",
+    -- Initial DNS/TCP/TLS connection budget; independent of active-output watchdog.
+    tls_connect_timeout_ms = 60000,
     heartbeat_ms = 1000,
     active_heartbeat_ms = 1000,
     offline_stop_ms = 10000,

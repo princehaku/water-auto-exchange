@@ -11,6 +11,11 @@ function M.start(controller, config, deps)
         or type(config.ca_cert) ~= "string" or not config.ca_cert:match("^[%w._-]+$") then
         return false, "network_config_invalid"
     end
+    local connect_ms = config.tls_connect_timeout_ms
+    if connect_ms ~= nil and (type(connect_ms) ~= "number" or connect_ms % 1000 ~= 0
+        or connect_ms < 15000 or connect_ms > 120000) then
+        return false, "network_connect_timeout_invalid"
+    end
     for _, key in ipairs({"heartbeat_ms", "active_heartbeat_ms", "offline_stop_ms", "idle_timeout_ms"}) do
         if type(config[key]) ~= "number" or config[key] % 1 ~= 0 or config[key] < 500 or config[key] > 75000 then
             return false, "network_timing_invalid"

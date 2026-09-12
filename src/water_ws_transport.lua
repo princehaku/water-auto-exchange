@@ -76,7 +76,8 @@ function M.new(config, callbacks, deps)
     local crypto = deps.crypto or _G.crypto
     local client = {queue = {}, connected = false, cancelled = false}
     local event, serial = "WATER_WS_WAKE", 0
-    local last_recovery, last_diagnostic, diagnostic_pending
+    local last_recovery, last_diagnostic, diagnostic_pending, last_tcp_probe
+    local connect_ms = config.tls_connect_timeout_ms or 60000
     local function age(tick)
         return ((rtos.tick() - tick) % 4294967296) * 5
     end
@@ -127,11 +128,34 @@ function M.new(config, callbacks, deps)
         self.queue = {}
         sys.publish(event)
     end
+    local function probe_tcp(host)
+        if client.stopped or not socket.isReady() or net.getState() ~= "REGISTERED"
+            or (last_tcp_probe and age(last_tcp_probe) < 300000) then return end
+        last_tcp_probe = rtos.tick()
+        -- Same owner task, after the old TLS socket and application session close.
+        -- No send/recv, credentials, application fallback or changes to TLS trust.
+        local probe = socket.tcp()
+        if not probe then print("WATER NET tcp_probe socket_create_failed"); return end
+        local started = rtos.tick()
+        print("WATER NET tcp_probe host=" .. host .. " port=443 timeout_ms=15000")
+        local ok = probe:connect(host, 443, 15)
+        print("WATER NET tcp_probe result=" .. (ok and "reachable" or "failed")
+            .. " elapsed_ms=" .. age(started) .. " scope=dns_tcp_only")
+        probe:close()
+    end
     local function run_connection(io)
         local host, path = config.url:match("^wss://([%w%.%-]+)(/.*)$")
-        print("WATER WS connecting_tls", host)
-        if not io:connect(host, 443, 10) then print("WATER WS tls_connect_failed"); return end
+        local connect_started = rtos.tick()
+        print("WATER WS connecting_tls host=" .. host .. " timeout_ms=" .. connect_ms .. " ca=enabled sni=enabled")
+        -- socket4G connect/send use SECONDS; recv uses milliseconds. In particular,
+        -- do not pass the old websocket library's millisecond value through here.
+        if not io:connect(host, 443, connect_ms / 1000) then
+            print("WATER WS tls_connect_failed elapsed_ms=" .. age(connect_started)
+                .. " registration=" .. tostring(net.getState()) .. " pdp_ready=" .. tostring(socket.isReady()))
+            return "tls_connect_failed"
+        end
         if client.cancelled then return end
+        print("WATER WS tls_connected elapsed_ms=" .. age(connect_started))
         print("WATER WS upgrading_http")
         local key = crypto.base64_encode(random_bytes(16), 16)
         local request = "GET " .. path .. " HTTP/1.1\r\nHost: " .. host .. "\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: " .. key .. "\r\n\r\n"
@@ -216,9 +240,10 @@ function M.new(config, callbacks, deps)
                 client.cancelled = false
                 client.stable_before_loss = false
                 local io = socket.tcp(true, {caCert = config.ca_cert, hostNameFlag = 1, insist = 0})
+                local failure
                 if io then
                     -- Never put these yielding operations inside pcall/xpcall.
-                    run_connection(io)
+                    failure = run_connection(io)
                 else print("WATER WS socket_create_failed") end
                 local stable = client.stable_before_loss or (client.connected and age(client.connected_at) >= 60000)
                 local cancelled = client.cancelled
@@ -230,6 +255,10 @@ function M.new(config, callbacks, deps)
                 if stable then backoff, failures = 1000, 0
                 elseif not cancelled then failures = math.min(failures + 1, 6) end
                 diagnose()
+                if not cancelled and failures >= 3 and failure == "tls_connect_failed" then
+                    probe_tcp(config.url:match("^wss://([%w%.%-]+)"))
+                end
+                if client.stopped then return end
                 if failures >= 6 and recover("consecutive_failures") then failures = 0 end
                 print("WATER WS retry_ms=" .. backoff .. " failures=" .. failures)
                 sys.wait(backoff)

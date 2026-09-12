@@ -33,7 +33,7 @@ def main():
     server.origin = 'http://127.0.0.1:' + str(server.server_port)
     worker = threading.Thread(target=server.serve_forever, daemon=True)
     worker.start()
-    status = dict(project='water_auto_exchange', version='0.7.1', control_mode='manual',
+    status = dict(project='water_auto_exchange', version='0.7.2', control_mode='manual',
                   state='IDLE', reason='ready', ready='1', fill='0', drain='0',
                   outputs_known='1', need_fill='unknown', overflow='0', cycle='0', overflow_protection='0')
     device = 'a' * 32
@@ -62,14 +62,14 @@ def main():
                 status.update(changes)
                 store.poll(device, status)
                 page.locator('#refresh').click()
-            # Both manual releases remain supported after backend deployment.
-            report(version='0.7.0')
-            page.wait_for_function("!document.getElementById('fill-button').disabled")
-            report(version='0.7.1')
+            # All manual releases remain supported after backend deployment.
+            for version in ('0.7.0', '0.7.1', '0.7.2'):
+                report(version=version)
+                page.wait_for_function("!document.getElementById('fill-button').disabled")
             # Do not send manual intentions to legacy automatic firmware.
             report(version='0.6.0')
             expect(fill).to_be_disabled(); expect(drain).to_be_disabled()
-            report(version='0.7.1', control_mode='automatic')
+            report(version='0.7.2', control_mode='automatic')
             expect(fill).to_be_disabled(); expect(drain).to_be_disabled()
             report(control_mode='manual')
             expect(fill).to_be_enabled(); expect(drain).to_be_enabled()

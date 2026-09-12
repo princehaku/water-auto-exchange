@@ -1,4 +1,54 @@
-# 0.7.1 网络恢复与注册诊断
+# 0.7.2 连接等待、网络恢复与诊断
+
+## 2026-09-12：与 sms-forward 对照后的修正
+
+本节为最新结论。已修复连接等待过短的问题并增加分层诊断；这次现场连接失败的唯一根因仍未确定，不能将本地验证写成实板联网恢复。
+
+### 凌晨确实连通过
+
+本机 `trace_2026-09-12_002549.txt` 中，0.5.2 在01:55:08.820开始TCPSSL连接、01:55:11.091连接成功、01:55:11.995打印 `WATER WS online`；01:55:43.758继续发送数据并处理控制器状态。前一个连接也在01:52:53.199完成认证。说明同一主机及当时的CA/SNI参数曾经能在板上工作，不支持“板子始终不支持TLS”的判断。
+
+旧0.5.2时基错误导致心跳过慢，0.5.3已修正；下午日志停在TCPSSL连接、尚未到WebSocket/认证，不能直接用旧心跳问题解释。01:55这一连接在01:56:37有发送超时，历史成功不等于长期稳定。
+
+### 对照结果
+
+比较对象为 `E:/sms-forward/device/main.lua`、`sms_center.lua`、`config.example.lua` 和本机官方LuaTask V2.4.4库。短信目录中没有实际 `device/config.lua` 或运行trace，因此示例配置不当成板端已确认值。短信AGENTS记录过电信卡，换水最新日志为移动46000/CMIOT；是否同板同卡待用户确认。
+
+| 项目 | 短信项目源码/示例 | 换水项目原0.7.1及本次处理 |
+| --- | --- | --- |
+| 主机/端口 | bytegallop.com:443，/sms路径 | 同主机443，/water路径；TLS成功后才发送HTTP路径 |
+| CORE | 项目记录V4035 FLOAT | 同系列V4035 FLOAT，保留现有CORE |
+| 建连等待 | HTTPS 30000ms经http库换算为30秒 | 原10秒，0.7.2改60秒，可配置15–120秒整数秒 |
+| WSS库单位 | 传入30000；本机旧websocket库原样交给以秒计的connect/send，存在单位混用 | 继续使用自有单任务传输，毫秒配置明确除1000，recv仍毫秒；不照搬30000 |
+| TLS验证 | HTTP只传hostNameFlag=1；WSS传可选long_connection_cert，示例未配置CA | 保留water-ca.crt、hostNameFlag=1、insist=0；凌晨已有实板成功依据 |
+| 在线机制 | WSS加HTTPS回退，HTTP成功也打印smsCenter.device online | 继续WSS单连接，不引入HTTP命令回退；WATER WS online表示设备认证完成 |
+| 心跳 | 示例60秒HTTP、600秒WS状态，服务端也可下发间隔 | 每秒应用心跳；活动10秒失联停止，空闲75秒，保持原规则 |
+
+只读服务器访问日志尾部也有 `/sms/api/device/ws` 的101记录（最后一条日志时间12/Sep/2026:13:49:18 +0800）。这证明发生过WS升级，日志时间可能是请求结束时间，不能当作目前仍在线或设备认证成功。短信项目未修改。
+
+### 本次实现
+
+- `tls_connect_timeout_ms=60000`，对底层调用传60秒；增加成功/失败耗时、注册状态与PDP就绪日志。连接等待与输出通信看门狗分开，延长重连等待不会延长开水后的10秒失联停止。
+- 连续连接失败计数达到3、当次为TLS建连失败时，在关闭旧会话和旧socket后，对同一域名443只建立一次普通TCP再关闭。不发送HTTP、设备密钥或控制指令，不算上线，不作为TLS回退。两次诊断至少间隔300秒；未注册/无IP时跳过。
+- `tcp_probe result=reachable` 只说明当次域名解析及TCP路径可用，仍需看TLS/认证；`failed`时优先查DNS/数据出口/目标可达性。这个检查不提供DNS解析出的IP，也不能用两次不同时刻的结果证明唯一根因。
+- 保留无限指数退避、受限频率的link.shut恢复、CA/SNI、USB STOP、输出互锁与重连不恢复旧命令。
+
+新日志示意（耗时为示例）：
+
+```text
+WATER WS connecting_tls host=bytegallop.com timeout_ms=60000 ca=enabled sni=enabled
+WATER WS tls_connected elapsed_ms=25000
+WATER WS upgraded; authenticating
+WATER WS online
+```
+
+失败时会打印 `tls_connect_failed elapsed_ms=... registration=... pdp_ready=...`；具体TIMEOUT/RESPONSE仍由底层socket日志提供，应用不能从单一false返回值伪造错误码。
+
+0.7.2本地验证：160项Lua（12+15+19+28+23+35+28）、47项Python和Edge真实本地HTTP联调通过；覆盖25秒连接、毫秒/秒换算、迟到成功取消、TCP诊断无业务发送/关闭/冷却/协程yield、长连接预算不延长10秒停止、0.7.0/0.7.1/0.7.2兼容。完整8Lua+CA下载包及water-online-0.7.2项目已准备。SerialPort.GetPortNames与PresentOnly PnP均只列COM1，本轮未刷写、未发送实板开水命令；最新实板版本沿用15:49的0.7.1。
+
+- 0.7.2兼容后端/网页已部署，备份`/apps/water-auto-exchange/backups/20260912T082015Z-3789216`。容器healthy，四个公网静态文件与本地一致，water/sms健康接口200，保留CA/SNI的TLS1.2及既有凭据WSS probe通过；probe未注册模拟设备、未提交控制命令。
+
+官方依据：[Air724 TCP说明](https://docs.openluat.com/air724ug/luatos/app/socket/tcp/)、[HTTP说明](https://docs.openluat.com/air724ug/luatos/app/socket/http/)，具体调用单位另以本机实际V2.4.4 `socket4G.lua`、`http.lua`、`websocket.lua`源码核对。
 
 ## 2026-09-12 最新：0.7.1已运行，注册及IP已成功，仍连接超时
 

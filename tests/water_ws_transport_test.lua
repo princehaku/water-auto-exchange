@@ -62,11 +62,16 @@ local function timed_fixture(options)
     options=options or {}
     local f={tick=options.tick or 0,opened=false,ready=options.ready~=false,registered=options.registered or "REGISTERED",recoveries={},closed=0,queries={},subscriptions={}}
     _G.rtos={tick=function() return f.tick end}
+    f.sent, f.received = {}, {}
     local io={connect=function(_,host,port,seconds)
             f.connect_host,f.connect_port,f.connect_seconds=host,port,seconds
             return coroutine.yield("CONNECT")
         end,
-        send=function() return coroutine.yield("SEND") end,
+        send=function(_,value,seconds)
+            f.send_seconds = seconds
+            f.sent[#f.sent + 1] = value
+            return coroutine.yield("SEND")
+        end,
         recv=function() return coroutine.yield("RECV") end,
         close=function() f.socket_closed=true;coroutine.yield("CLOSE") end}
     local sys={taskInit=function(fn) f.co=coroutine.create(fn);return f.co end,
@@ -87,11 +92,12 @@ local function timed_fixture(options)
             if options.probe_yield then coroutine.yield("PROBE_CLOSE") end
         end}
     f.config={url="wss://example.test/water/api/device/ws",device_key=string.rep("k",32),long_connection_cert={caCert="water-ca.crt",hostNameFlag=1,insist=0},
-        tls_connect_timeout_ms=options.connect_ms}
+        tls_connect_timeout_ms=options.connect_ms,send_timeout_ms=options.send_ms}
     if options.no_cert then f.config.long_connection_cert=nil end
     f.certificates={}
     f.client=ws.new(f.config,
-        {open=function() f.opened=true end,close=function() f.closed=f.closed+1 end},{sys=sys,
+        {open=function() f.opened=true end,close=function() f.closed=f.closed+1 end,
+        message=function(value) f.received[#f.received+1]=value end},{sys=sys,
         link={shut=function()
             assert(not f.client.connected and #f.client.queue==0)
             if f.opened then assert(f.closed>0 and f.socket_closed) end
@@ -293,6 +299,69 @@ test("PDP timeout and recovery cooldown handle raw tick wrap",function()
     f.tick=(f.tick+24000)%4294967296;f.resume("WAIT");assert(#f.recoveries==1)
     f.tick=(f.tick+59999)%4294967296;f.resume("WAIT");assert(#f.recoveries==1)
     f.tick=f.tick+1;f.resume("WAIT");assert(#f.recoveries==2)
+end)
+
+test("send budgets use seconds and allow completion beyond the former five seconds",function()
+    for _,ms in ipairs({10000,30000,60000}) do
+        local f=timed_fixture({send_ms=ms});f.upgrade();assert(f.send_seconds==ms/1000)
+        assert(f.client:send("ping-one","ping"));f.resume("SEND",false,"WATER_WS_WAKE")
+        assert(f.send_seconds==ms/1000)
+        f.tick=f.tick+1201 -- 6005 ms
+        f.resume("RECV",true)
+        f.resume("RECV",true,frame("pong-one"))
+        assert(f.received[1]=="pong-one" and f.client.connected and f.client:stats():find("tx=1",1,true))
+    end
+    local f=timed_fixture();f.upgrade();assert(f.send_seconds==30)
+end)
+
+test("receives replies between queued frames instead of draining the whole queue",function()
+    local f=timed_fixture();f.upgrade()
+    assert(f.client:send("claim-one","claim"));assert(f.client:send("ack-one","ack"))
+    f.resume("SEND",false,"WATER_WS_WAKE")
+    f.resume("RECV",true)
+    f.resume("SEND",true,frame("execute-one"))
+    assert(f.received[1]=="execute-one" and #f.sent==3)
+    f.resume("RECV",true)
+end)
+
+test("slow in-flight send coalesces pending heartbeats and preserves command order",function()
+    local f=timed_fixture();f.upgrade()
+    assert(f.client:send("ping-zero","ping"));f.resume("SEND",false,"WATER_WS_WAKE")
+    assert(f.client:send("claim","claim"))
+    for n=1,40 do assert(f.client:send("ping-"..n,"ping")) end
+    assert(f.client:send("ack","ack"))
+    assert(#f.client.queue==3 and f.client.queue[1].kind=="claim"
+        and f.client.queue[2].data=="ping-40" and f.client.queue[3].kind=="ack")
+    f.tick=f.tick+1200;f.resume("RECV",true)
+    f.resume("SEND",true,frame("pong-zero"));assert(f.received[1]=="pong-zero")
+    f.resume("RECV",true);assert(#f.client.queue==2)
+end)
+
+test("full control queue remains bounded and a queued heartbeat can still be replaced",function()
+    local f=timed_fixture();f.upgrade()
+    assert(f.client:send("ping","ping"))
+    for n=1,7 do assert(f.client:send("ack-"..n,"ack")) end
+    assert(f.client:send("latest-ping","ping") and #f.client.queue==8)
+    assert(not f.client:send("one-too-many","claim") and #f.client.queue==8)
+    assert(f.client.queue[1].data=="latest-ping" and f.client.queue[8].data=="ack-7")
+end)
+
+test("cancelled long send never flushes pending commands after a late success",function()
+    local f=timed_fixture();f.upgrade()
+    assert(f.client:send("ping","ping"));f.resume("SEND",false,"WATER_WS_WAKE")
+    assert(f.client:send("old-ack","ack"));f.client:close()
+    f.tick=f.tick+4000;f.resume("CLOSE",true)
+    assert(#f.sent==2 and #f.client.queue==0 and f.closed==1)
+    assert(f.client:stats():find("sending=0",1,true))
+end)
+
+test("failed frame send closes and clears pending data before retry",function()
+    local f=timed_fixture();f.upgrade()
+    assert(f.client:send("ping","ping"));f.resume("SEND",false,"WATER_WS_WAKE")
+    assert(f.client:send("stale-ping","ping"))
+    f.tick=f.tick+6000;f.resume("CLOSE",false)
+    assert(not f.client.connected and #f.client.queue==0 and f.closed==1)
+    assert(f.client:stats():find("tx=0",1,true))
 end)
 
 print("water_ws_transport: "..count.." tests passed")

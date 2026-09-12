@@ -24,7 +24,7 @@ class Problem(Exception):
 def validate_status(value):
     if not isinstance(value, dict):
         raise Problem(400, 'invalid_status')
-    if value.get('project') != 'water_auto_exchange' or value.get('version') not in ('0.3.0', '0.4.0', '0.5.0', '0.5.1', '0.5.2', '0.5.3', '0.6.0', '0.7.0', '0.7.1', '0.7.2', '0.7.3', '0.7.4'):
+    if value.get('project') != 'water_auto_exchange' or value.get('version') not in ('0.3.0', '0.4.0', '0.5.0', '0.5.1', '0.5.2', '0.5.3', '0.6.0', '0.7.0', '0.7.1', '0.7.2', '0.7.3', '0.7.4', '0.7.5'):
         raise Problem(409, 'firmware_mismatch')
     if value.get('state') not in ('UNCONFIGURED', 'IDLE', 'DONE', 'FAULT') + ACTIVE:
         raise Problem(400, 'invalid_state')
@@ -40,7 +40,7 @@ def validate_status(value):
             raise Problem(400, 'invalid_flag')
     if result['need_fill'] not in ('0', '1', 'unknown') or not result['cycle'].isdigit():
         raise Problem(400, 'invalid_level_or_cycle')
-    if result['version'] in ('0.7.0', '0.7.1', '0.7.2', '0.7.3', '0.7.4'):
+    if result['version'] in ('0.7.0', '0.7.1', '0.7.2', '0.7.3', '0.7.4', '0.7.5'):
         if value.get('control_mode') not in ('manual', 'automatic'):
             raise Problem(400, 'invalid_control_mode')
         result['control_mode'] = value['control_mode']
@@ -126,7 +126,7 @@ class Store:
             if not self.online():
                 raise Problem(409, 'device_offline')
             s = self.status
-            if command == 'DRAIN' and s['version'] not in ('0.6.0', '0.7.0', '0.7.1', '0.7.2', '0.7.3', '0.7.4'):
+            if command == 'DRAIN' and s['version'] not in ('0.6.0', '0.7.0', '0.7.1', '0.7.2', '0.7.3', '0.7.4', '0.7.5'):
                 raise Problem(409, 'firmware_upgrade_required')
             if command == 'START' and s.get('control_mode') == 'manual':
                 raise Problem(409, 'automatic_mode_required')

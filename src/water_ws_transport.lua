@@ -78,6 +78,8 @@ function M.new(config, callbacks, deps)
     local event, serial = "WATER_WS_WAKE", 0
     local last_recovery, last_diagnostic, diagnostic_pending, last_tcp_probe
     local connect_ms = config.tls_connect_timeout_ms or 60000
+    local send_ms = config.send_timeout_ms or 30000
+    local sent_frames, send_attempt, sending = 0, 0, false
     local function certificate_options()
         if config.long_connection_cert == nil then return nil end
         -- socket4G rewrites certificate filenames; keep config reusable on retry.
@@ -123,11 +125,25 @@ function M.new(config, callbacks, deps)
             if not ok then client.cancelled = true end
         end
     end
-    function client:send(value)
-        if not self.connected or self.cancelled or #self.queue >= 8 or type(value) ~= "string" or #value > LIMIT then return false end
-        self.queue[#self.queue + 1] = value
+    function client:send(value, kind)
+        if not self.connected or self.cancelled or type(value) ~= "string" or #value > LIMIT then return false end
+        -- A slow send must not accumulate one obsolete heartbeat every second.
+        -- Claims/acks/auth remain ordered and are never coalesced or replayed.
+        if kind == "ping" then
+            for index, item in ipairs(self.queue) do
+                if item.kind == "ping" then
+                    self.queue[index] = {data = value, kind = kind}
+                    return true
+                end
+            end
+        end
+        if #self.queue >= 8 then return false end
+        self.queue[#self.queue + 1] = {data = value, kind = kind}
         sys.publish(event)
         return true
+    end
+    function client:stats()
+        return " tx=" .. sent_frames .. " queued=" .. #self.queue .. " sending=" .. (sending and "1" or "0")
     end
     function client:close(permanent)
         if permanent then self.stopped = true end
@@ -151,12 +167,14 @@ function M.new(config, callbacks, deps)
         probe:close()
     end
     local function run_connection(io)
+        sent_frames, send_attempt, sending = 0, 0, false
         local host, path = config.url:match("^wss://([%w%.%-]+)(/.*)$")
         local connect_started = rtos.tick()
         local cert = config.long_connection_cert
         print("WATER WS connecting_tls host=" .. host .. " timeout_ms=" .. connect_ms
             .. " ca=" .. (cert and cert.caCert and "enabled" or "disabled")
-            .. " sni=" .. (cert and cert.hostNameFlag == 1 and "enabled" or "disabled"))
+            .. " sni=" .. (cert and cert.hostNameFlag == 1 and "enabled" or "disabled")
+            .. " send_timeout_ms=" .. send_ms)
         -- socket4G connect/send use SECONDS; recv uses milliseconds. In particular,
         -- do not pass the old websocket library's millisecond value through here.
         if not io:connect(host, 443, connect_ms / 1000) then
@@ -169,7 +187,8 @@ function M.new(config, callbacks, deps)
         print("WATER WS upgrading_http")
         local key = crypto.base64_encode(random_bytes(16), 16)
         local request = "GET " .. path .. " HTTP/1.1\r\nHost: " .. host .. "\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: " .. key .. "\r\n\r\n"
-        if not io:send(request, 5) then print("WATER WS upgrade_send_failed"); return end
+        if not io:send(request, send_ms / 1000) then print("WATER WS upgrade_send_failed"); return end
+        if client.cancelled then return end
         local response, boundary = "", nil
         -- recv is milliseconds; connect/send use seconds in socket4G V2.4.4.
         local started = rtos.tick() % 4294967296
@@ -198,22 +217,41 @@ function M.new(config, callbacks, deps)
         notify("open")
         local parse = M.parser()
         local pending = response:sub(boundary + 4)
+        local function send_frame(value, opcode, kind)
+            send_attempt, sending = send_attempt + 1, true
+            local started = rtos.tick()
+            local ok = io:send(M.frame(value, opcode, random_bytes(4)), send_ms / 1000)
+            sending = false
+            if ok then sent_frames = sent_frames + 1 end
+            if not ok or age(started) >= 1000 then
+                -- Metadata only: never log frame contents or credential fields.
+                local label = ({auth=true, ping=true, claim=true, ack=true, status=true, pong=true})[kind] and kind or "data"
+                print("WATER WS send_result=" .. (ok and "ok" or "failed") .. " kind=" .. label
+                    .. " attempt=" .. send_attempt .. " bytes=" .. #value .. " elapsed_ms=" .. age(started)
+                    .. " timeout_ms=" .. send_ms .. " queued=" .. #client.queue)
+            end
+            return ok and not client.cancelled
+        end
         while not client.cancelled do
             if #pending > 0 then
                 local ok, events = pcall(parse, pending)
                 if not ok then return end
                 for _, item in ipairs(events) do
-                    if item.opcode == 8 then return
+                    if item.opcode == 8 then
+                        local code = #item.data >= 2 and item.data:byte(1) * 256 + item.data:byte(2) or 1005
+                        print("WATER WS peer_close code=" .. code)
+                        return
                     elseif item.opcode == 9 then
-                        if not io:send(M.frame(item.data, 10, random_bytes(4)), 5) then return end
+                        if not send_frame(item.data, 10, "pong") then return end
                     elseif item.opcode == 1 or item.opcode == 2 then notify("message", item.data) end
                     if client.cancelled then return end
                 end
             end
-            while #client.queue > 0 and not client.cancelled do
-                local value = table.remove(client.queue, 1)
-                if not io:send(M.frame(value, 1, random_bytes(4)), 5) then return end
+            if #client.queue > 0 and not client.cancelled then
+                local item = table.remove(client.queue, 1)
+                if not send_frame(item.data, 1, item.kind) then return end
             end
+            -- Give buffered replies/commands a turn between every queued frame.
             local ok, chunk = io:recv(1000, event)
             pending = ok and chunk or ""
             if not ok and chunk ~= "timeout" and chunk ~= event then return end

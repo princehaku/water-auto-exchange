@@ -1,4 +1,26 @@
-# 0.7.3 可选WSS证书与网络恢复
+# 0.7.5 WSS发送与网络恢复
+
+## 2026-09-12：0.7.5处理上线后发送超时
+
+用户17:22日志已确认0.7.4就绪，TLS在7520ms完成，随后WS认证online；约6秒后socket:send TIMEOUT。这次不是TLS超时。心跳seq=4/ack=0只说明4次心跳已入队且尚无有效pong，不能说4条已经发到服务器。对照本机LuaTask V2.4.4源码，water旧实现send(...,5)只等5秒；SMS所用websocket.lua发送未指定超时，socket4G默认等待120秒。现改为有界30秒，仍不照搬旧库的过长默认值。
+
+```lua
+tls_connect_timeout_ms = 60000,
+send_timeout_ms = 30000, -- 5000到60000，必须为整秒的毫秒值
+long_connection_cert = nil,
+```
+
+HTTP升级请求和WS帧使用该发送预算，底层传秒；升级收包和应用认证另有原期限，因此30秒不是总握手期限。活动输出仍由独立500ms定时回调检查，10秒没有有效应用回执便停止所属输出并作废会话。发送等待可继续清理旧socket，但不能重新打开输出或发送遗留队列。空闲检测75秒，每秒心跳和原退避/PDP恢复保留。
+
+旧实现先清空发送队列再收包，慢链路下每秒产生的心跳可能延迟回包处理。新版每发送一帧便调用recv处理缓冲回包；只合并尚未发送的ping，保留最新seq。auth/claim/ack/status不合并、不重放。最多8条待发帧，异常仍关闭会话。
+
+新增日志字段：`tx`是底层确认发送帧数（含auth），`queued`是待发帧数，`sending=1`表示底层发送尚未返回；`seq`仍是入队的心跳序号。发送耗时超过1秒或失败时记录`send_result/kind/attempt/bytes/elapsed_ms/timeout_ms`。收到WS关闭帧打印`peer_close code`；服务器记录白名单拒绝原因如`another_device_active`，其他异常只记录`protocol_or_internal_error`，不写帧内容、密钥或任意异常详情。新日志不能证明历史认证断开的原因。
+
+`+CESQ:99,99,255,255,4,6`最后两项按标准CESQ量化对应RSRQ[-18,-17.5)dB、RSRP[-135,-134)dBm，提示弱信号，但一个样本不能认定本次失败唯一由信号导致。量化参考[合宙CESQ标准字段说明](https://docs.openluat.com/air780e/at/app/Command_List/Network_service/CESQ/)（该网页为Air780E系列，引用的是3GPP同名字段定义，不据此替代Air724固件说明）。已询问4G天线是否接好并移至窗边对比，等待用户反馈。
+
+183项Lua、58项Python及Edge本地HTTP开关联调通过，覆盖慢发送、收发交替、心跳合并、队列上限、取消后迟到成功不重放、10秒活动停止及0.7.5端到端兼容。实板最近仍0.7.4，0.7.5需要下载验证；没有恢复被Escape停止的computer-use或发送实物开关命令。
+
+0.7.5后端兼容已部署，备份`/apps/water-auto-exchange/backups/20260912T093214Z-3813795`；容器healthy，公网静态文件/WSS probe/登录与999天会话/健康检查通过。下载包9项、项目及官方LuaFLOAT语法检查通过，板端仍待下载。
 
 ## 2026-09-12：按用户要求与短信WSS参数一致
 

@@ -3,6 +3,7 @@ import sys
 import threading
 import time
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 import websocket
 
@@ -63,6 +64,24 @@ class WebSocketTests(unittest.TestCase):
         self.assertEqual(c.recv(), '')
         self.assertFalse(self.store.snapshot()['online'])
 
+    def test_old_session_rejection_is_logged_without_exposing_keys(self):
+        first = self.connect()
+        with patch('server.ws_endpoint.print', create=True) as logged:
+            second = self.connect(False)
+            second.send(json.dumps(dict(type='auth', key='b'*32, status=STATUS)))
+            self.assertEqual(second.recv(), '')
+            logged.assert_called_with('WATER WS close reason=another_device_active', flush=True)
+        first.send(json.dumps(dict(type='ping', seq=1)))
+        self.assertEqual(json.loads(first.recv())['type'], 'pong')
+
+    def test_arbitrary_exception_details_never_enter_close_logs(self):
+        with patch.object(self.store, 'ws_open', side_effect=ValueError('private-exception-detail')):
+            with patch('server.ws_endpoint.print', create=True) as logged:
+                client = self.connect(False)
+                client.send(json.dumps(dict(type='auth', key='b'*32, status=STATUS)))
+                self.assertEqual(client.recv(), '')
+                logged.assert_called_with('WATER WS close reason=protocol_or_internal_error', flush=True)
+
     def test_manual_switch_command_and_state_roundtrip(self):
         self.manual_roundtrip('0.7.0')
 
@@ -77,6 +96,9 @@ class WebSocketTests(unittest.TestCase):
 
     def test_board_output_firmware_manual_roundtrip(self):
         self.manual_roundtrip('0.7.4')
+
+    def test_slow_send_firmware_manual_roundtrip(self):
+        self.manual_roundtrip('0.7.5')
 
     def manual_roundtrip(self, version):
         status=dict(STATUS,version=version,control_mode='manual',need_fill='unknown')

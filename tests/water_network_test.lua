@@ -4,7 +4,7 @@ local network = require "water_network"
 local count = 0
 local function test(name, fn) fn(); count=count+1; print("PASS "..name) end
 local function fixture()
-    local f = {tick=0, sent={}, calls={}, state="IDLE", decoded={}}
+    local f = {tick=0, sent={}, kinds={}, calls={}, state="IDLE", decoded={}}
     f.config = {enabled=true, url="wss://example.test/water/api/device/ws",device_key=string.rep("k",32),long_connection_cert={caCert="water-ca.crt",hostNameFlag=1,insist=0},
         heartbeat_ms=1000,active_heartbeat_ms=1000,offline_stop_ms=10000,idle_timeout_ms=75000}
     f.controller = {
@@ -16,7 +16,7 @@ local function fixture()
         reset=function() return false,"not_faulted" end
     }
     f.client = {
-        send=function(_,value) f.sent[#f.sent+1]=value; return not f.send_fail end,
+        send=function(_,value,kind) f.sent[#f.sent+1]=value;f.kinds[#f.kinds+1]=kind; return not f.send_fail end,
         close=function() f.closed=true end,
         start=function() f.started=true end
     }
@@ -24,7 +24,7 @@ local function fixture()
         sys={timerLoopStart=function(fn) f.step=fn; return 1 end},
         transport={new=function(_,callbacks) f.callbacks=callbacks; return f.client end},
         json={encode=function(value) return value end,decode=function() if f.decode_fail then error("decode") end; return f.decoded end},
-        usb={format_status=function() return "project=water_auto_exchange version=0.7.4 state="..f.state end},
+        usb={format_status=function() return "project=water_auto_exchange version=0.7.5 state="..f.state end},
         read_cert=function() return f.no_cert and "" or "-----BEGIN CERTIFICATE-----" end}
     -- Ordinary messages use fake JSON tokens; auth concatenation needs strings.
     local serial=0
@@ -102,6 +102,27 @@ test("long connection budget never extends active output communication deadline"
     f.connect();f.offer("FILL");f.execute("FILL")
     f.advance(9995);assert(f.state=="FILLING" and not f.closed)
     f.advance(5);assert(f.closed and f.state=="IDLE" and f.calls[2]=="STOP")
+end)
+
+test("send budget is bounded independently from the ten second active stop",function()
+    assert(require("water_network_config").send_timeout_ms==30000)
+    for _,ms in ipairs({5000,30000,60000}) do
+        local f=fixture();f.config.send_timeout_ms=ms
+        f.connect();f.offer("FILL");f.execute("FILL")
+        f.advance(9995);assert(f.state=="FILLING" and not f.closed)
+        f.advance(5);assert(f.state=="IDLE" and f.calls[2]=="STOP" and f.closed)
+    end
+    for _,ms in ipairs({0,30,4999,5500,61000,"30000",false,0/0,math.huge}) do
+        local f=fixture();f.config.send_timeout_ms=ms
+        local ok,reason=f.start();assert(not ok and reason=="network_send_timeout_invalid" and not f.started)
+    end
+end)
+
+test("transport metadata identifies auth heartbeat claim and ack without inspecting JSON",function()
+    local f=fixture();f.connect();assert(f.kinds[1]=="auth")
+    f.advance(1000);assert(f.kinds[#f.kinds]=="ping")
+    f.offer("FILL");assert(f.kinds[#f.kinds]=="claim")
+    f.execute("FILL");assert(f.kinds[#f.kinds]=="ack")
 end)
 test("auth key has a fixed nonsecret prefix",function() local f=fixture();f.connect();assert(f.sent[1]:find('{"type":"auth","protocol":"water-ws-v1","key"',1,true)==1) end)
 test("idle heartbeat follows one second boundaries",function() local f=fixture();f.connect();for i=1,5 do local n=#f.sent;f.advance(500);assert(#f.sent==n);f.advance(500);assert(#f.sent==n+1 and f.last().type=="ping");f.reply({type="pong",seq=f.last().seq}) end end)

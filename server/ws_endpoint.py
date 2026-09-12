@@ -7,6 +7,19 @@ import time
 from wsproto import WSConnection, ConnectionType
 from wsproto.events import AcceptConnection, Request, TextMessage, BytesMessage, Ping, CloseConnection
 
+SAFE_CLOSE_REASONS = frozenset((
+    'auth_failed', 'another_device_active', 'firmware_mismatch', 'stale_session',
+    'invalid_status', 'invalid_state', 'invalid_control_mode', 'invalid_flag',
+    'invalid_level_or_cycle', 'invalid_message', 'message_too_large',
+    'invalid_claim', 'session_limit', 'unclaimed_ack', 'invalid_ack', 'invalid_type'))
+
+
+def safe_close_reason(error):
+    reason = getattr(error, 'message', None)
+    if reason is None and type(error) is ValueError and error.args:
+        reason = error.args[0]
+    return reason if isinstance(reason, str) and reason in SAFE_CLOSE_REASONS else 'protocol_or_internal_error'
+
 
 def serve(handler):
     ws = WSConnection(ConnectionType.SERVER)
@@ -102,8 +115,9 @@ def serve(handler):
                 else:
                     raise ValueError('invalid_type')
                 last_rx = time.monotonic()
-    except Exception:
-        # No credential-bearing messages, URLs or exception bodies in logs.
+    except Exception as error:
+        # Whitelist only: arbitrary exception messages may contain credentials.
+        print('WATER WS close reason=' + safe_close_reason(error), flush=True)
         try:
             connection.sendall(ws.send(CloseConnection(code=1008, reason='connection ended')))
         except Exception:

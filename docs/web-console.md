@@ -1,5 +1,11 @@
 # Web 控制台与 4G 接入
 
+## 2026-09-12 当前：0.7.5发送修正待下载，实板0.7.4就绪
+
+用户17:22日志确认0.7.4/manual/IDLE/ready=1/outputs_known=1、两路为0，且出现WATER WS online；随后底层发送超时。输出映射已经生效，网页开启仍要求设备当时在线。0.7.5保留GPIO23补水、GPIO5排水及LOW后释放的关断流程，改为默认30秒发送等待、合并积压心跳、发送帧之间收包，并增加发送进度及关闭原因诊断。活动输出10秒失联停止保持不变。详见[网络恢复](network-recovery.md)。
+
+下载目标water-online-0.7.5，完整8Lua+CA来自build/firmware。原CORE与默认库保留；本轮未恢复此前被Escape停止的computer-use，由用户点击下载脚本。183项Lua、58项后端和Edge本地开关联调通过，0.7.5实板稳定性仍待验证。以下记录保留各次调查的历史状态。
+
 ## 2026-09-12 当前：0.7.4 两路输出已配置，待下载
 
 用户确认补水接顶部DO2、排水接出纸口，并补充旧扫描切换GPIO后接口没电压。0.7.4按该完整操作序列配置补水GPIO23、排水GPIO5：开启时配置输出并拉高；关闭时写低后pins.close释放，重新开启时恢复输出模式。开机先关闭两路，500ms状态稳定后可接受手动FILL/DRAIN；STOP、120秒超时、互锁与远程失联停止保留，无液位输入要求。详见[输出控制](water-control.md)。
@@ -46,7 +52,7 @@ DRAIN要求板端0.6.0，旧版显示“更新设备后可用”，API及USB网�
 
 ## 软件与实板边界
 
-当前源码0.7.4、实板最近已确认0.7.3，详情以上方最新记录为准。本版启用GPIO23补水和GPIO5排水，关断沿用用户测过的写LOW后释放流程，GPIO12仍专用于网络灯。未刷入本版或未进行实板输出操作前，不把模拟测试或网站在线写成实物验收完成。
+当前源码0.7.5、实板最近已确认0.7.4且ready=1，详情以上方最新记录为准。本版启用GPIO23补水和GPIO5排水，关断沿用用户测过的写LOW后释放流程，GPIO12仍专用于网络灯。未刷入本版或未进行实板输出操作前，不把模拟测试或网站在线写成实物验收完成。
 
 ## 管理员登录
 
@@ -61,8 +67,8 @@ Cookie 下发 `Max-Age=86313600`，继续使用 Secure / HttpOnly / SameSite=Str
 1. 准备可联网的 SIM、天线和供电；本版开机写LOW并释放两路输出，先核对待机状态。GPIO23 复用 SIM 在位检测的硬件约束继续有效，不能据此猜测泵映射。
 2. 本轮已提供 `build/device.private.json`。后续使用自己的 JSON 文件，格式为 `{"url":"https://bytegallop.com/water","device_key":"填入设备密钥"}`。
 3. 在仓库运行 `python tools/build-firmware.py --config build/device.private.json`。脚本复制源码到 `build/firmware/`，仅在该目录启用联网并填入设备密钥，源文件与 GPIO 配置保持原状。
-4. 本机LuaTools“刷新列表”后选 `water-online-0.7.4`。其他机器按 `build/firmware/flash-files.txt` 创建项目并加入 **8个Lua文件和1个CA证书**，全部来自同一个生成目录。保留现有CORE、默认LuaTask V2.4.4库及USB trace。每条require独占一行；JSON为CORE内置全局模块。
-5. 按当前用户授权点击“下载脚本”。下载后核对 `project=water_auto_exchange version=0.7.4`、`manual`、`ready=1`、`outputs_known=1`、初始两路为0和生成配置，并查看服务器是否收到真实上报。持续观察至少跨过原75秒断线窗口，确认5秒日志中的心跳seq/ack继续增长、服务器last_seen持续刷新，再验证重连。仅版本号或一次online不足以通过联调。
+4. 本机LuaTools“刷新列表”后选 `water-online-0.7.5`。其他机器按 `build/firmware/flash-files.txt` 创建项目并加入 **8个Lua文件和1个CA证书**，全部来自同一个生成目录。保留现有CORE、默认LuaTask V2.4.4库及USB trace。每条require独占一行；JSON为CORE内置全局模块。
+5. 由用户点击“下载脚本”（此前Escape停止的UI操作尚未恢复）。下载后核对 `project=water_auto_exchange version=0.7.5`、`manual`、`ready=1`、`outputs_known=1`、初始两路为0和生成配置，并查看服务器是否收到真实上报。持续观察至少跨过原75秒断线窗口，确认5秒日志中的心跳seq/ack继续增长、服务器last_seen持续刷新，再验证重连。仅版本号或一次online不足以通过联调。
 6. 手动模式只需确认输出启停、输出接线和超时参数后修改 `src/water_config.lua`；不要求水位传感器。自动模式另需液位板隔离反馈接线，重新生成整包、验证、提交并推送，再由用户刷写。不能直接在生成目录内做长期配置修改，重新生成会覆盖该目录文件。
 
 下载清单：`main.lua`、`water_config.lua`、`water_cycle.lua`、`water_control.lua`、`water_usb.lua`、`water_network.lua`、`water_network_config.lua`、`water_ws_transport.lua`、`water-ca.crt`。
@@ -80,7 +86,7 @@ TLS强制提供CA文件并开启SNI。CA来源与指纹见[证书说明](../cert
 - USB STOP 会作废在途远程响应并关闭当前连接；新连接创建新会话，旧命令不能恢复泵。远程 STOP 保留连接以便立即回传结果。
 - `water_ws_transport.lua` 的单一任务持有 socket；connect/send/recv/close 直接在该任务中执行，不放进外层 pcall。业务调用 send 只入队，不直接等待底层 SOCKET_SEND。
 - 收发支持 TCP 分包、粘包、126 字节边界、WebSocket 分片及 Ping/Pong。每条消息上限 8192 字节，发送队列上限 8 条；异常输入、队列失败及超时会断线并尝试关闭远程输出。应用/传输层不打印认证消息，认证固定前缀避免底层 socket 调试预览包含密钥。
-- 0.7.4新增：已注册时连续6次连接失败，或等待IP超过120秒，调用当前LuaTask库的link.shut恢复链路就绪状态；每次至少间隔300秒。未注册时等待底层搜网，不循环切飞行模式。故障期间每60秒最多一批只读AT诊断，IP_ERROR立即作废远程会话并尝试停止其输出。详见[网络恢复与现场注册诊断](network-recovery.md)。
+- 0.7.1起已支持：已注册时连续6次连接失败，或等待IP超过120秒，调用当前LuaTask库的link.shut恢复链路就绪状态；每次至少间隔300秒。未注册时等待底层搜网，不循环切飞行模式。故障期间每60秒最多一批只读AT诊断，IP_ERROR立即作废远程会话并尝试停止其输出。详见[网络恢复与现场注册诊断](network-recovery.md)。
 - 失败重连按 1、2、4 秒逐步延长，最多 60 秒；连接稳定达到 60 秒后重置退避。连接失败和身份拒绝不会每秒重新握手。不可恢复的任务异常或时钟异常停止网络控制，需排查后重启。
 - 初期 TLS 握手依然有流量开销。长连接避免每 2 秒重复 TCP/TLS/HTTP 请求；实际运营商流量仍需实板测量，不据模拟测试填写节省百分比。
 - TLS 必须携带 CA、SNI，并设置 `insist=0` 拒绝证书域名校验失败。板端实际 TLS 握手与长时间在线仍待用户刷写验证。

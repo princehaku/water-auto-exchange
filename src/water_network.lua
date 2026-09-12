@@ -33,6 +33,11 @@ function M.start(controller, config, deps)
         or connect_ms < 15000 or connect_ms > 120000) then
         return false, "network_connect_timeout_invalid"
     end
+    local send_ms = config.send_timeout_ms
+    if send_ms ~= nil and (type(send_ms) ~= "number" or send_ms % 1000 ~= 0
+        or send_ms < 5000 or send_ms > 60000) then
+        return false, "network_send_timeout_invalid"
+    end
     for _, key in ipairs({"heartbeat_ms", "active_heartbeat_ms", "offline_stop_ms", "idle_timeout_ms"}) do
         if type(config[key]) ~= "number" or config[key] % 1 ~= 0 or config[key] < 500 or config[key] > 75000 then
             return false, "network_timing_invalid"
@@ -103,7 +108,7 @@ function M.start(controller, config, deps)
     local function send(value)
         local encoded = json.encode(value)
         assert(type(encoded) == "string", "encode_failed")
-        if client:send(encoded) ~= true then lost("send_failed"); return false end
+        if client:send(encoded, value.type) ~= true then lost("send_failed"); return false end
         return true
     end
     local function message(body)
@@ -173,7 +178,7 @@ function M.start(controller, config, deps)
             -- Fixed prefix keeps credentials outside socket4G's 30-byte debug preview.
             local auth = '{"type":"auth","protocol":"water-ws-v1","key":' .. json.encode(config.device_key)
                 .. ',"status":' .. json.encode(status) .. '}'
-            if client:send(auth) ~= true then lost("auth_send_failed") end
+            if client:send(auth, "auth") ~= true then lost("auth_send_failed") end
         end,
         message = function(body)
             local ok = pcall(message, body)
@@ -206,7 +211,8 @@ function M.start(controller, config, deps)
         if report_steps >= 10 then
             report_steps = 0
             print("WATER WS heartbeat seq=" .. ping_seq .. " ack=" .. pong_seq
-                .. " age_ms=" .. math.floor(time - last_ok))
+                .. " age_ms=" .. math.floor(time - last_ok)
+                .. (client.stats and client:stats() or ""))
         end
         for id, item in pairs(pending) do if time - item.started >= 5000 then pending[id] = nil end end
         if seen_count >= 2048 and not active then lost("session_refresh") end

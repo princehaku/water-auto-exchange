@@ -1,5 +1,12 @@
 # 项目约定与本轮对话摘要
 
+## 2026-09-12 接续更正：USB已连接，COM4实读0.7.0
+
+- 不可用Win32_SerialPort只列出COM1推断Air724未连接。该WMI类漏列本机LUAT端口；SerialPort.GetPortNames与Get-PnpDevice -PresentOnly实际确认COM3/4/5/6均存在且OK。后续枚举至少核对这两种来源。
+- 本次通过tools/water-command.ps1 -Port COM4 -Command STATUS实读0.7.0/manual/UNCONFIGURED，输出未配置。COM3只读AT诊断在Open时报Access denied，未发送AT、未终止占用程序。
+- 用户15:13:25 connecting_tls的后续在15:13:35.279 TIMEOUT，继而按8/16/32/60秒持续重试；15:16:11仍TIMEOUT。固件没有停在STATUS打印，也没有升级为0.7.1。当前注册原因未新增实证，不能把历史CREG:3直接归为当前TLS超时的确定根因。
+- 0.7.1生成包及项目已准备，应用源码和后端未再更改；本轮未刷写或发送开水命令。下节“仅COM1、未新读STATUS”为已被纠正的历史观察。
+
 ## 2026-09-12 最新：0.7.1重连恢复，实板日志0.7.0
 
 - 0.7.1兼容后端和网页已部署，备份 `/apps/water-auto-exchange/backups/20260912T071450Z-3768177`；容器healthy，四个公网文件与本地一致，API及/sms200，真实凭据WSS probe通过。未向生产注入模拟设备状态或开关命令。

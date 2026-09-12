@@ -32,7 +32,9 @@ WATER WS pdp_recover reason=pdp_wait_timeout cooldown_ms=300000
 
 已向用户询问普通手机卡/物联网卡类型，尚待答复。运营商卡状态、物联网卡设备绑定/业务开通、覆盖等还未核实，不据此断言欠费、天线坏或APN错误。重连不能绕过运营商的注册拒绝。
 
-本轮枚举仅见COM1，未对串口发送AT命令、未刷写0.7.1。最新板端版本证据来自用户日志和本机现有trace，而不是本轮新STATUS实读。
+后续更正：Win32_SerialPort漏列了LUAT的USB端口，不能据仅列COM1推断未连接。SerialPort.GetPortNames及Get-PnpDevice -PresentOnly确认COM3/4/5/6都在且OK；本次COM4 STATUS实读0.7.0/manual/UNCONFIGURED。COM3在Open时报Access denied，没有发出AT查询，也未终止占用程序。0.7.1仍未刷写。
+
+用户15:13:25的TLS连接在15:13:35.279返回TIMEOUT，随后8/16/32/60秒持续退避，至15:16:11仍TIMEOUT。程序持续运行，尚未取得本次TLS失败的确定根因，不能仅用此前注册日志代替当前注册证据。
 
 ## 验证与下载
 

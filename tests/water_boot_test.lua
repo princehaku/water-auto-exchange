@@ -32,6 +32,10 @@ local function fixture(real_controller)
             equal(lte, nil, "no second LED GPIO may be claimed")
             if f.led_failure then error("injected LED failure") end
             f.led_gpio = gpio
+        end, updateBlinkTime = function(state, on, off)
+            if f.pattern_failure then error("injected pattern failure") end
+            f.patterns = f.patterns or {}
+            f.patterns[state] = {on, off}
         end}
     end
     _G.pmd = {ldoset = forbidden}
@@ -56,7 +60,7 @@ local function fixture(real_controller)
             f.trace = true
         end}
     end
-    _G.PROJECT, _G.VERSION = "water_auto_exchange", "0.7.6"
+    _G.PROJECT, _G.VERSION = "water_auto_exchange", "0.7.7"
     _G.uart = {
         USB = 0x81, PAR_NONE = 0, STOP_1 = 1,
         setup = function(id, baud, bits, parity, stop)
@@ -151,7 +155,7 @@ test("fragmented STATUS is read-only and unknown water level is explicit", funct
     f.feed("STA")
     equal(#f.replies, 1)
     f.feed("TUS\r")
-    contains(f.replies[2], "OK STATUS project=water_auto_exchange version=0.7.6")
+    contains(f.replies[2], "OK STATUS project=water_auto_exchange version=0.7.7")
     contains(f.replies[2], "ready=0 fill=0 drain=0 outputs_known=0 need_fill=unknown")
     f.feed("\n")
     equal(#f.replies, 2, "CRLF must yield one reply")
@@ -268,18 +272,18 @@ test("boot prints immediately and every 5 seconds without starting outputs", fun
     local f = fixture()
     f.boot()
     equal(PROJECT, "water_auto_exchange")
-    equal(VERSION, "0.7.6")
+    equal(VERSION, "0.7.7")
     equal(f.sys_init[1], 0)
     equal(f.sys_init[2], 0)
     equal(f.sys_run, true)
     equal(f.trace, true)
-    equal(f.led_gpio, nil, "source without networking must not initialize the LED")
+    equal(f.led_gpio, 12, "USB control also has a working indicator without networking")
     contains(table.concat(f.logs), "WATER NET disabled")
     equal(f.calls.init, 1)
     equal(f.calls.start, nil)
     equal(f.calls.fill, nil)
     equal(f.gpio_calls, 0)
-    contains(table.concat(f.logs), "WATER STATUS project=water_auto_exchange version=0.7.6")
+    contains(table.concat(f.logs), "WATER STATUS project=water_auto_exchange version=0.7.7")
     equal(#f.timers, 1)
     equal(f.timers[1].ms, 5000)
     local replies, status_calls = #f.replies, f.calls.status
@@ -372,11 +376,21 @@ test("shipping config boots OFF and real USB FILL DRAIN STOP use mapped outputs"
     contains(f.replies[#f.replies], "ready=1 fill=0 drain=0 outputs_known=1 need_fill=unknown")
     f.feed("FILL\n"); contains(f.replies[#f.replies], "OK FILL")
     equal(levels[23], 1); equal(opened[5], false)
+    for _,pattern in pairs(f.patterns) do equal(pattern[1],65535);equal(pattern[2],0) end
     f.feed("DRAIN\n"); contains(f.replies[#f.replies], "ERROR DRAIN")
     f.feed("STOP\n"); equal(opened[23], false)
+    equal(f.patterns.SCK[1],100);equal(f.patterns.SCK[2],100)
     f.feed("DRAIN\n"); contains(f.replies[#f.replies], "OK DRAIN")
     equal(levels[5], 1); equal(opened[23], false)
+    equal(f.patterns.SIMERR[1],65535);equal(f.patterns.SIMERR[2],0)
     f.feed("STOP\n"); equal(opened[5], false)
+    equal(f.patterns.SIMERR[1],300);equal(f.patterns.SIMERR[2],5700)
+    -- Local 120s timeout restores the idle pattern without waiting for trace.
+    f.feed("DRAIN\n");raw_tick=raw_tick+120000/5;f.poll()
+    equal(opened[5],false);equal(f.patterns.SCK[1],100);equal(f.patterns.SCK[2],100)
+    f.feed("RESET\n");f.feed("FILL\n");equal(levels[23],1)
+    f.pattern_failure=true;f.feed("STOP\n")
+    equal(opened[23],false);contains(f.replies[#f.replies],"OK STOP")
 end)
 
 test("network starts after USB and controller initialization", function()

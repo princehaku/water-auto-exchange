@@ -103,6 +103,20 @@ class WebSocketTests(unittest.TestCase):
     def test_traffic_firmware_manual_roundtrip(self):
         self.manual_roundtrip('0.7.6')
 
+    def test_idle_saving_firmware_manual_roundtrip(self):
+        self.manual_roundtrip('0.7.7')
+
+    def test_five_minute_traffic_report_and_idle_push(self):
+        c = self.connect(status=dict(STATUS, version='0.7.7', control_mode='manual'))
+        # The server offers a command without waiting for the next idle ping.
+        self.now += 25
+        self.store.enqueue('FILL', '6'*32)
+        self.assertEqual(json.loads(c.recv())['command'], 'FILL')
+        c.send(json.dumps(dict(type='traffic', meter='a'*32, total_bytes=2400,
+                              interval_bytes=2400, interval_seconds=300)))
+        self.assertEqual(json.loads(c.recv())['type'], 'received')
+        self.assertEqual(self.store.snapshot()['traffic']['interval_seconds'], 300)
+
     def test_live_traffic_report_and_repeated_report_are_acknowledged(self):
         c=self.connect(status=dict(STATUS,version='0.7.6',control_mode='manual'))
         value=dict(type='traffic',meter='a'*32,total_bytes=4096,interval_bytes=4096,interval_seconds=60)

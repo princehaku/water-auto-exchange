@@ -1,5 +1,23 @@
 # Web 控制台与 4G 接入
 
+## 2026-09-13：0.7.7省流量与工作常亮灯
+
+用户确认采用待机30秒、工作1秒心跳、每5分钟上报流量，覆盖此前空闲也每秒心跳的要求。`src/water_network_config.lua`设置`heartbeat_ms=30000`、`active_heartbeat_ms=1000`、`traffic_interval_s=300`；统计周期按秒传给当前LuaTask V2.4.4的`socket.setIpStatis`，允许60–3600整数秒，省略时默认300。无统计API仍可联网。
+
+WSS持续保持，服务端推送命令不等下一次心跳；执行命令时刷新活动通信计时，工作期间仍每秒心跳。状态变化下个500ms网络检查立即上报，USB/trace仍每5秒打印；流量上报变慢不延长活动10秒失联停止、75秒空闲检测或单次120秒输出上限。120秒到期关断并锁存`fill_timeout`/`drain_timeout`，需要复位；重连不恢复输出。网页仍每2秒查询服务器，流量数字取最新已上报样本。
+
+GPIO12/物理53由`netLed`单独控制；真实输出记录明确开启时，所有网络状态（包括未联网/搜网）都设为常亮，停止后恢复V2.4.4原有各状态闪烁时长。复用`updateBlinkTime(state,65535,0)`，不另启GPIO写入任务与库争用。控制器在应用输出后通知灯效，异常被隔离，不能阻止STOP；USB独立控制也能亮灯。常亮反映软件输出记录，不是水流或电压反馈。灯闪烁与WSS心跳独立，不消耗SIM数据。
+
+截至00:17，真实日志/API已确认0.7.6、流量持续上报；旧卡联通（3gnet），新卡移动（CMIOT），23:51:26重启由用户换卡触发。移动卡00:03:41上线后至00:17仍有通信；此前两卡均出现过超时，短时稳定不能证明网络问题永久解决。00:17真实状态为FAULT/drain_timeout、fill=0/drain=0。
+
+旧配置两段60秒样本12844/12959字节，折算约557MB/30天，属于库估算而非运营商账单。新配置按每天工作10分钟、其余待机，模型约25–40MB/30天；重连、TLS和重传会影响实际值。此数不是0.7.7实测节省。5分钟未上报区间在掉电时可能丢失。
+
+源码/生成包0.7.7，下载项目`water-online-0.7.7`，仍8Lua+CA、原CORE与默认库。LED及省流量需要用户下载脚本；本轮没有恢复Escape停止的桌面输入或操作真实输出。
+
+本地195项Lua（12+15+20+36+23+53+36）、72项Python及Edge桌面/手机联调通过；覆盖30秒待机边界、服务端主动命令、活动1秒心跳与10秒停止、5分钟统计、75秒空闲期限、GPIO灯效切换/超时恢复及灯效异常不阻断STOP。LuaFLOAT、JS、PowerShell语法通过；9项生成包/版本/源码/私有凭据/超时/输出映射/原CORE核对通过。测试未操作真实GPIO，不等同0.7.7实板验证。
+
+后端/网页0.7.7兼容已部署，备份`/apps/water-auto-exchange/backups/20260912T161911Z-3944482`；容器healthy/restart=0，公网四静态文件与本地一致，TLS/WSS凭据probe、HTTPS登录/status/退出、999天会话和water/sms健康通过。部署前确认真实两路均关闭；本轮未注册模拟设备或发送开水命令。实板仍需用户下载0.7.7，服务端更新不会改变板端心跳或灯效。
+
 ## 2026-09-12 当前：网页自动同步与恢复
 
 登录后，页面可见时每2秒自动查询服务器，更新设备在线/离线、开关状态、命令回执、连接记录及最新已上报流量；不用反复点“刷新”。“连接与流量”右上角显示自动更新间隔及本次网页同步时间。此时间与设备“最近通信”分开，网页同步成功不意味着设备刚上报。板端流量仍约60秒统计一次，网页查询不向板子追加请求。
@@ -68,7 +86,7 @@ DRAIN要求板端0.6.0，旧版显示“更新设备后可用”，API及USB网�
 
 ## 软件与实板边界
 
-当前源码0.7.6、实板最近已确认0.7.5且ready=1，详情以上方最新记录为准。本版启用GPIO23补水和GPIO5排水，关断沿用用户测过的写LOW后释放流程，GPIO12仍专用于网络灯。未刷入本版或未进行实板输出操作前，不把模拟测试或网站在线写成实物验收完成。
+当前源码0.7.7、实板已确认0.7.6，详情以上方最新记录为准。本版启用GPIO23补水和GPIO5排水，关断沿用用户测过的写LOW后释放流程，GPIO12仍专用于网络灯。未刷入本版或未进行实板输出操作前，不把模拟测试或网站在线写成实物验收完成。
 
 ## 管理员登录
 
@@ -83,8 +101,8 @@ Cookie 下发 `Max-Age=86313600`，继续使用 Secure / HttpOnly / SameSite=Str
 1. 准备可联网的 SIM、天线和供电；本版开机写LOW并释放两路输出，先核对待机状态。GPIO23 复用 SIM 在位检测的硬件约束继续有效，不能据此猜测泵映射。
 2. 本轮已提供 `build/device.private.json`。后续使用自己的 JSON 文件，格式为 `{"url":"https://bytegallop.com/water","device_key":"填入设备密钥"}`。
 3. 在仓库运行 `python tools/build-firmware.py --config build/device.private.json`。脚本复制源码到 `build/firmware/`，仅在该目录启用联网并填入设备密钥，源文件与 GPIO 配置保持原状。
-4. 本机LuaTools“刷新列表”后选 `water-online-0.7.6`。其他机器按 `build/firmware/flash-files.txt` 创建项目并加入 **8个Lua文件和1个CA证书**，全部来自同一个生成目录。保留现有CORE、默认LuaTask V2.4.4库及USB trace。每条require独占一行；JSON为CORE内置全局模块。
-5. 由用户点击“下载脚本”（此前Escape停止的UI操作尚未恢复）。下载后核对 `project=water_auto_exchange version=0.7.6`、`manual`、`ready=1`、`outputs_known=1`、初始两路为0和生成配置，并查看服务器是否收到真实上报。持续观察至少跨过原75秒断线窗口，确认5秒日志中的心跳seq/ack继续增长、服务器last_seen持续刷新，再验证重连。仅版本号或一次online不足以通过联调。
+4. 本机LuaTools“刷新列表”后选 `water-online-0.7.7`。其他机器按 `build/firmware/flash-files.txt` 创建项目并加入 **8个Lua文件和1个CA证书**，全部来自同一个生成目录。保留现有CORE、默认LuaTask V2.4.4库及USB trace。每条require独占一行；JSON为CORE内置全局模块。
+5. 由用户点击“下载脚本”（此前Escape停止的UI操作尚未恢复）。下载后核对 `project=water_auto_exchange version=0.7.7`、`manual`、`ready=1`、`outputs_known=1`、初始两路为0和生成配置，并查看服务器是否收到真实上报。持续观察至少跨过原75秒断线窗口，确认5秒摘要中的心跳seq/ack按待机30秒、活动1秒继续增长、服务器last_seen持续刷新，再验证重连。仅版本号或一次online不足以通过联调。
 6. 手动模式只需确认输出启停、输出接线和超时参数后修改 `src/water_config.lua`；不要求水位传感器。自动模式另需液位板隔离反馈接线，重新生成整包、验证、提交并推送，再由用户刷写。不能直接在生成目录内做长期配置修改，重新生成会覆盖该目录文件。
 
 下载清单：`main.lua`、`water_config.lua`、`water_cycle.lua`、`water_control.lua`、`water_usb.lua`、`water_network.lua`、`water_network_config.lua`、`water_ws_transport.lua`、`water-ca.crt`。

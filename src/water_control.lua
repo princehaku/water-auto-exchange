@@ -89,6 +89,8 @@ function M.new(config, dependencies)
         local signature = s.state .. ":" .. s.reason
         if signature == last_state then return end
         last_state = signature
+        -- Observers run after output changes; indicator failures cannot block STOP.
+        if deps.on_status then pcall(deps.on_status, s) end
         -- Logging failure must never bypass output cleanup or stop the poller.
         pcall(deps.emit or print, "WATER state=" .. s.state .. " reason=" .. clean(s.reason)
             .. " fill=" .. (s.fill and "1" or "0") .. " drain=" .. (s.drain and "1" or "0")

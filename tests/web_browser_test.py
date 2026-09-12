@@ -33,7 +33,7 @@ def main():
     server.origin = 'http://127.0.0.1:' + str(server.server_port)
     worker = threading.Thread(target=server.serve_forever, daemon=True)
     worker.start()
-    status = dict(project='water_auto_exchange', version='0.7.6', control_mode='manual',
+    status = dict(project='water_auto_exchange', version='0.7.7', control_mode='manual',
                   state='IDLE', reason='ready', ready='1', fill='0', drain='0',
                   outputs_known='1', need_fill='unknown', overflow='0', cycle='0', overflow_protection='0')
     device = 'a' * 32
@@ -73,7 +73,7 @@ def main():
                 status.update(changes)
                 store.poll(device, status)
             # All manual releases remain supported after backend deployment.
-            for version in ('0.7.0', '0.7.1', '0.7.2', '0.7.3', '0.7.4', '0.7.5', '0.7.6'):
+            for version in ('0.7.0', '0.7.1', '0.7.2', '0.7.3', '0.7.4', '0.7.5', '0.7.6', '0.7.7'):
                 report(version=version)
                 expect(page.locator('#version')).to_contain_text('v'+version)
                 page.wait_for_function("!document.getElementById('fill-button').disabled")
@@ -81,7 +81,7 @@ def main():
             report(version='0.6.0')
             expect(page.locator('#version')).to_contain_text('v0.6.0')
             expect(fill).to_be_disabled(); expect(drain).to_be_disabled()
-            report(version='0.7.6', control_mode='automatic')
+            report(version='0.7.7', control_mode='automatic')
             expect(page.locator('#need-fill')).to_have_text('自动液位')
             expect(fill).to_be_disabled(); expect(drain).to_be_disabled()
             report(control_mode='manual')
@@ -147,7 +147,7 @@ def main():
             # Switch the isolated fixture to a real WS session for traffic reports.
             store.gateway=None;store.gateway_seen=0
             session=store.ws_open(status)
-            store.traffic_report(session,dict(meter='a'*32,total_bytes=4096,interval_bytes=1024,interval_seconds=60))
+            store.traffic_report(session,dict(meter='a'*32,total_bytes=4096,interval_bytes=1024,interval_seconds=300))
             expect(page.locator('#connection')).to_contain_text('在线')
             expect(page.locator('#traffic-total')).to_have_text('4.00 KB')
             expect(page.locator('#traffic-interval')).to_contain_text('1.00 KB')
@@ -168,7 +168,7 @@ def main():
             expect(page.locator('#connection')).to_contain_text('在线')
             expect(page.locator('#sync-status')).to_contain_text('已同步')
             expect(page.locator('#message')).not_to_contain_text('服务连接中断')
-            store.traffic_report(session,dict(meter='a'*32,total_bytes=8192,interval_bytes=4096,interval_seconds=60))
+            store.traffic_report(session,dict(meter='a'*32,total_bytes=8192,interval_bytes=4096,interval_seconds=300))
             expect(page.locator('#traffic-total')).to_have_text('8.00 KB')
             store.ws_close(session,'peer_disconnected')
             expect(page.locator('#connection')).to_contain_text('离线')

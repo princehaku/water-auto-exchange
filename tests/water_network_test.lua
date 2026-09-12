@@ -24,7 +24,7 @@ local function fixture()
         sys={timerLoopStart=function(fn) f.step=fn; return 1 end},
         transport={new=function(_,callbacks) f.callbacks=callbacks; return f.client end},
         json={encode=function(value) return value end,decode=function() if f.decode_fail then error("decode") end; return f.decoded end},
-        usb={format_status=function() return "project=water_auto_exchange version=0.7.6 state="..f.state end},
+        usb={format_status=function() return "project=water_auto_exchange version=0.7.7 state="..f.state end},
         read_cert=function() return f.no_cert and "" or "-----BEGIN CERTIFICATE-----" end}
     -- Ordinary messages use fake JSON tokens; auth concatenation needs strings.
     local serial=0
@@ -45,7 +45,51 @@ local function fixture()
     return f
 end
 
-test("shipped heartbeat defaults are one second",function() local c=require "water_network_config";assert(c.heartbeat_ms==1000 and c.active_heartbeat_ms==1000);assert(c.offline_stop_ms==10000 and c.idle_timeout_ms==75000) end)
+test("shipped defaults save idle traffic while keeping active watchdog",function() local c=require "water_network_config";assert(c.heartbeat_ms==30000 and c.active_heartbeat_ms==1000);assert(c.traffic_interval_s==300);assert(c.offline_stop_ms==10000 and c.idle_timeout_ms==75000) end)
+
+test("thirty second idle heartbeat keeps one connection with twenty pings in ten minutes",function()
+    local f=fixture();f.config.heartbeat_ms=30000;f.connect()
+    for _=1,20 do
+        local n=#f.sent;f.advance(29500);assert(#f.sent==n)
+        f.advance(500);assert(#f.sent==n+1 and f.last().type=="ping")
+        f.reply({type="pong",seq=f.last().seq})
+    end
+    assert(not f.closed and #f.sent==21 and #f.calls==0)
+end)
+
+test("commands after long idle execute immediately then use one second active heartbeat",function()
+    for _,command in ipairs({"FILL","DRAIN"}) do
+        local f=fixture();f.config.heartbeat_ms=30000;f.connect();f.advance(25000)
+        assert(#f.sent==1)
+        f.offer(command);assert(f.last().type=="claim")
+        f.execute(command);assert(f.calls[1]==command and f.last().ack.status=="succeeded")
+        -- No new idle ping was needed to receive/execute the command.
+        f.advance(500);assert(f.last().type=="ping" and not f.closed)
+        f.reply({type="pong",seq=f.last().seq})
+        for _=1,3 do
+            local n=#f.sent;f.advance(500);assert(#f.sent==n)
+            f.advance(500);assert(#f.sent==n+1 and f.last().type=="ping")
+            f.reply({type="pong",seq=f.last().seq})
+        end
+        f.advance(9995);assert(not f.closed and #f.calls==1)
+        f.advance(5);assert(f.closed and f.calls[2]=="STOP" and f.state=="IDLE")
+    end
+end)
+
+test("STOP restores idle heartbeat and fault telemetry does not wait thirty seconds",function()
+    local f=fixture();f.config.heartbeat_ms=30000;f.connect();f.offer("FILL");f.execute("FILL")
+    f.advance(1000);f.reply({type="pong",seq=f.last().seq})
+    f.offer("STOP",string.rep("c",32));f.execute("STOP",8000,string.rep("c",32))
+    local n=#f.sent;f.advance(29500);assert(#f.sent==n and f.state=="IDLE")
+    f.advance(500);assert(f.last().type=="ping");f.reply({type="pong",seq=f.last().seq})
+    f.state="FAULT";f.advance(500);assert(f.last().type=="status")
+end)
+
+test("five minute accounting never extends the seventy five second idle deadline",function()
+    local f=fixture();f.config.heartbeat_ms=30000;f.config.traffic_interval_s=300;f.connect()
+    f.advance(30000);f.advance(30000);f.advance(14995);assert(not f.closed)
+    f.advance(5);assert(f.closed and #f.calls==0)
+end)
 
 test("disabled network has no I/O",function() assert(not network.start({}, {enabled=false})) end)
 test("remote DRAIN executes once and disconnect stops the owned drain",function()
@@ -208,9 +252,9 @@ test("authentication budget tolerates delayed ready but is still bounded",functi
 end)
 
 local function metered_fixture()
-    local f=fixture();f.config.traffic_enabled=true
+    local f=fixture();f.config.traffic_enabled=true;f.config.traffic_interval_s=60
     f.deps.sys.subscribe=function(event,callback) assert(event=="LIB_IP_STATIS_RPT");f.report_flow=callback end
-    f.deps.socket={setIpStatis=function(interval) assert(interval==60);f.accounting_started=true end}
+    f.deps.socket={setIpStatis=function(interval) f.accounting_interval=interval;f.accounting_started=true end}
     function f.traffic_messages()
         local result={}
         for _,token in ipairs(f.sent) do
@@ -221,6 +265,34 @@ local function metered_fixture()
     end
     return f
 end
+
+test("five minute accounting samples and reports once while heartbeats keep running",function()
+    local f=metered_fixture();f.config.traffic_interval_s=nil;f.config.heartbeat_ms=30000;f.connect()
+    assert(f.accounting_interval==300)
+    for _=1,10 do
+        f.advance(30000);f.reply({type="pong",seq=f.last().seq})
+        assert(#f.traffic_messages()==0)
+    end
+    f.report_flow(2400);f.step();local samples=f.traffic_messages()
+    assert(#samples==1 and samples[1].interval_seconds==300 and samples[1].total_bytes==2400)
+    for _=1,10 do f.advance(30000);f.reply({type="pong",seq=f.last().seq}) end
+    assert(#f.traffic_messages()==1)
+    f.report_flow(2300);f.step();samples=f.traffic_messages()
+    assert(#samples==2 and samples[2].interval_seconds==300 and samples[2].total_bytes==4700)
+    assert(not f.closed and #f.calls==0)
+end)
+
+test("accounting interval rejects invalid values before any network I/O",function()
+    for _,seconds in ipairs({false,0,59,300.5,3601,"300",math.huge,0/0}) do
+        local f=metered_fixture();f.config.traffic_interval_s=seconds
+        local ok,reason=f.start();assert(not ok and reason=="network_traffic_interval_invalid")
+        assert(not f.started and not f.accounting_started)
+    end
+    for _,seconds in ipairs({60,300,3600}) do
+        local f=metered_fixture();f.config.traffic_interval_s=seconds;f.connect()
+        assert(f.accounting_interval==seconds)
+    end
+end)
 
 test("IP accounting reports cumulative bytes only after a sample and authenticated ready",function()
     local f=metered_fixture();f.connect();assert(f.accounting_started)

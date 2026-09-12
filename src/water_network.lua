@@ -42,6 +42,11 @@ function M.start(controller, config, deps)
     if type(auth_ms) ~= "number" or auth_ms % 1000 ~= 0 or auth_ms < 5000 or auth_ms > 60000 then
         return false, "network_auth_timeout_invalid"
     end
+    local traffic_interval = config.traffic_interval_s == nil and 300 or config.traffic_interval_s
+    if type(traffic_interval) ~= "number" or traffic_interval % 1 ~= 0
+        or traffic_interval < 60 or traffic_interval > 3600 then
+        return false, "network_traffic_interval_invalid"
+    end
     for _, key in ipairs({"heartbeat_ms", "active_heartbeat_ms", "offline_stop_ms", "idle_timeout_ms"}) do
         if type(config[key]) ~= "number" or config[key] % 1 ~= 0 or config[key] < 500 or config[key] > 75000 then
             return false, "network_timing_invalid"
@@ -89,7 +94,7 @@ function M.start(controller, config, deps)
     local pings, report_steps = {}, 0
     local meter_id, traffic_total, traffic_seq, traffic_sent = nil, 0, 0, 0
     local previous_session
-    local traffic_bytes, traffic_seconds, traffic_at = 0, 60, now()
+    local traffic_bytes, traffic_seconds, traffic_at = 0, traffic_interval, now()
     local pending, seen, seen_count = {}, {}, 0
     local raw_stop = controller.stop
     local function stop_outputs()
@@ -256,9 +261,9 @@ function M.start(controller, config, deps)
                 traffic_seconds = math.max(1, math.floor((time - traffic_at) / 1000))
                 traffic_at, traffic_seq = time, traffic_seq + 1
             end)
-            accounting.setIpStatis(60)
+            accounting.setIpStatis(traffic_interval)
         end)
-        print("WATER NET traffic=" .. (accounting_ok and "estimated interval_s=60" or "unavailable"))
+        print("WATER NET traffic=" .. (accounting_ok and "estimated interval_s=" .. traffic_interval or "unavailable"))
     end
     client:start()
     return true, "network_started"

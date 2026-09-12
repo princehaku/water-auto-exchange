@@ -12,9 +12,10 @@ return {
     -- Allow cellular retransmission; the active-output watchdog stays at 10s.
     send_timeout_ms = 30000,
     auth_timeout_ms = 30000,
-    -- LuaTask IP accounting is an estimate, reported at most once per minute.
+    -- LuaTask IP accounting is an estimate; sample/report every five minutes.
     traffic_enabled = true,
-    heartbeat_ms = 1000,
+    traffic_interval_s = 300,
+    heartbeat_ms = 30000,
     active_heartbeat_ms = 1000,
     offline_stop_ms = 10000,
     idle_timeout_ms = 75000

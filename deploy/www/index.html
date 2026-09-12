@@ -16,7 +16,7 @@
 <div class="section-head"><h2 id="connection-title">连接与流量</h2><span id="sync-status" class="muted">每 2 秒自动更新</span></div>
 <p id="connection-detail" class="muted" role="status">正在获取连接信息。</p>
 <div class="connection-metrics"><div><span>本次状态开始</span><strong id="connection-since">—</strong></div><div><span>状态持续时间</span><strong id="connection-duration">—</strong></div><div><span>距最近通信</span><strong id="connection-age">—</strong></div></div>
-<div class="network-grid"><div class="traffic-panel"><h3>设备估算流量</h3><dl class="traffic-metrics"><div><dt>累计已上报</dt><dd id="traffic-total">—</dd></div><div><dt>本次设备运行</dt><dd id="traffic-boot">—</dd></div><div><dt>最近统计段</dt><dd id="traffic-interval">—</dd></div></dl><p id="traffic-updated" class="muted">尚未收到流量统计。</p><p class="caption">约每 60 秒更新，包含设备通信及估算开销；与运营商实际计费可能不同。重连会继续累计，历史统计由服务器保存。</p></div>
+<div class="network-grid"><div class="traffic-panel"><h3>设备估算流量</h3><dl class="traffic-metrics"><div><dt>累计已上报</dt><dd id="traffic-total">—</dd></div><div><dt>本次设备运行</dt><dd id="traffic-boot">—</dd></div><div><dt>最近统计段</dt><dd id="traffic-interval">—</dd></div></dl><p id="traffic-updated" class="muted">尚未收到流量统计。</p><p class="caption">新版设备默认每 5 分钟上报，旧版约每分钟；包含设备通信及估算开销；与运营商实际计费可能不同。重连会继续累计，历史统计由服务器保存。</p></div>
 <div class="connection-history"><h3>在线 / 离线记录</h3><p id="connection-empty" class="muted">等待首次连接。</p><div class="connection-events-wrap"><table id="connection-events-table" hidden><thead><tr><th>时间</th><th>状态</th><th>说明</th></tr></thead><tbody id="connection-events"></tbody></table></div><p class="caption">最近 60 次状态变化。服务连接中断时，设备是否在线暂时无法确认。</p></div></div>
 </section>
 <div class="grid">

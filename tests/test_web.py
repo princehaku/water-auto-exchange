@@ -317,6 +317,19 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(self.request('logout', {}, headers)[0], 200)
         self.assertEqual(self.request('status', headers={'Cookie': cookie})[0], 401)
 
+    def test_simulation_calibration_requires_session_and_origin(self):
+        payload = dict(level=100, fill_seconds=300, drain_seconds=240)
+        self.assertEqual(self.request('simulation', payload, {'Origin': 'https://example.test'})[0], 401)
+        cookie = self.login()
+        self.assertEqual(self.request('simulation', payload, {'Cookie': cookie, 'Origin': 'https://evil.test'})[0], 403)
+        device_headers = {'Authorization': 'Bearer ' + 'device' * 10}
+        manual = dict(STATUS, version='0.8.0', control_mode='manual', need_fill='unknown')
+        self.request('device/poll', dict(gateway=GATEWAY, status=manual), device_headers)
+        code, result, _ = self.request('simulation', payload, {'Cookie': cookie, 'Origin': 'https://example.test'})
+        self.assertEqual(code, 200)
+        self.assertTrue(result['calibrated'])
+        self.assertEqual(self.request('status', headers={'Cookie': cookie})[1]['simulation']['level'], 100)
+
     def test_csrf_rejected(self):
         cookie = self.login()
         self.assertEqual(self.request('commands', dict(command='START', id='f' * 32), {'Cookie': cookie, 'Origin': 'https://evil.test'})[0], 403)

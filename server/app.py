@@ -2,6 +2,7 @@
 import hashlib
 import hmac
 import json
+import math
 import os
 import secrets
 import sqlite3
@@ -76,6 +77,7 @@ class Store:
             CREATE TABLE IF NOT EXISTS traffic_meters (
               id TEXT PRIMARY KEY, total INTEGER NOT NULL, interval_bytes INTEGER NOT NULL,
               interval_seconds INTEGER NOT NULL, updated REAL NOT NULL);
+            CREATE TABLE IF NOT EXISTS aquarium_simulation (id INTEGER PRIMARY KEY, value TEXT NOT NULL);
         ''')
         # Restart never resurrects commands or claims that old telemetry is live.
         self.db.execute("UPDATE commands SET status='uncertain', result='server_restarted' WHERE status IN ('queued','delivered')")
@@ -88,6 +90,17 @@ class Store:
         if saved:
             previous = json.loads(saved['value'])
             self.status, self.seen = previous.get('device'), previous.get('last_seen')
+        saved_sim = self.db.execute('SELECT value FROM aquarium_simulation WHERE id=1').fetchone()
+        self.simulation = json.loads(saved_sim['value']) if saved_sim else dict(
+            level=None, fill_seconds=None, drain_seconds=None, updated_at=None,
+            uncertain=False, observed_at=None, observed_known=False,
+            fill_on=False, drain_on=False, fill_since=None, drain_since=None)
+        # An output that was active before a server restart has an unknown stop time.
+        if self.simulation['fill_on'] or self.simulation['drain_on']:
+            self.simulation['uncertain'] = True
+            self.simulation['observed_known'] = False
+            self.simulation['observed_at'] = None
+            self.simulation['fill_since'] = self.simulation['drain_since'] = None
         event = self.db.execute('SELECT * FROM connection_events ORDER BY id DESC LIMIT 1').fetchone()
         if event:
             self.connection_state, self.connection_since, self.connection_reason = event['state'], event['at'], event['reason']
@@ -99,6 +112,12 @@ class Store:
         if state == self.connection_state:
             return
         self.connection_state, self.connection_since, self.connection_reason = state, self.clock(), reason
+        if not online and (self.simulation['fill_on'] or self.simulation['drain_on']):
+            self.simulation['uncertain'] = True
+            self.simulation['observed_known'] = False
+            self.simulation['observed_at'] = None
+            self.simulation['fill_since'] = self.simulation['drain_since'] = None
+            self.save_simulation()
         self.db.execute('INSERT INTO connection_events(at,state,reason) VALUES(?,?,?)',
                         (self.connection_since, state, reason))
         self.db.execute('DELETE FROM connection_events WHERE id NOT IN (SELECT id FROM connection_events ORDER BY id DESC LIMIT 60)')
@@ -108,6 +127,64 @@ class Store:
         self.db.execute('INSERT OR REPLACE INTO device_snapshot VALUES(1,?)',
                         (json.dumps(dict(device=self.status, last_seen=self.seen)),))
         self.db.commit()
+
+    def save_simulation(self):
+        self.db.execute('INSERT OR REPLACE INTO aquarium_simulation VALUES(1,?)',
+                        (json.dumps(self.simulation),))
+        self.db.commit()
+
+    def observe_outputs(self, status):
+        """Integrate only spans supported by consecutive, fresh device reports."""
+        sim, now = self.simulation, self.clock()
+        previous_at = sim['observed_at']
+        if sim['observed_known'] and previous_at is not None and sim['level'] is not None and not sim['uncertain']:
+            elapsed = max(0, now - previous_at)
+            if elapsed > 12 and (sim['fill_on'] or sim['drain_on']):
+                sim['uncertain'] = True
+            elif elapsed:
+                delta = (int(sim['fill_on']) * 100 / sim['fill_seconds']
+                         - int(sim['drain_on']) * 100 / sim['drain_seconds']) * elapsed
+                sim['level'] = min(100, max(0, sim['level'] + delta))
+                sim['updated_at'] = now
+        known = status['outputs_known'] == '1'
+        if not known and (sim['fill_on'] or sim['drain_on']):
+            sim['uncertain'] = True
+        for key in ('fill', 'drain'):
+            on = known and status[key] == '1'
+            if on and (not sim['observed_known'] or not sim[key + '_on']):
+                sim[key + '_since'] = now
+            elif not on:
+                sim[key + '_since'] = None
+            sim[key + '_on'] = on
+        sim['observed_known'], sim['observed_at'] = known, now
+        self.save_simulation()
+
+    def configure_simulation(self, value):
+        if not isinstance(value, dict):
+            raise Problem(400, 'invalid_simulation')
+        numbers = [value.get(key) for key in ('level', 'fill_seconds', 'drain_seconds')]
+        if any(type(n) not in (int, float) or not math.isfinite(n) for n in numbers):
+            raise Problem(400, 'invalid_simulation')
+        level, fill_seconds, drain_seconds = numbers
+        if not (0 <= level <= 100 and 1 <= fill_seconds <= 86400 and 1 <= drain_seconds <= 86400):
+            raise Problem(400, 'invalid_simulation')
+        with self.lock:
+            if not self.online() or not self.status or self.status['outputs_known'] != '1' or self.status['fill'] != '0' or self.status['drain'] != '0':
+                raise Problem(409, 'simulation_requires_idle')
+            self.simulation.update(level=float(level), fill_seconds=float(fill_seconds),
+                                   drain_seconds=float(drain_seconds), updated_at=self.clock(),
+                                   uncertain=False, observed_at=self.clock(), observed_known=True,
+                                   fill_on=False, drain_on=False, fill_since=None, drain_since=None)
+            self.save_simulation()
+            return self.simulation_snapshot()
+
+    def simulation_snapshot(self):
+        sim = self.simulation
+        return dict(calibrated=sim['level'] is not None, level=sim['level'],
+                    fill_seconds=sim['fill_seconds'], drain_seconds=sim['drain_seconds'],
+                    updated_at=sim['updated_at'], uncertain=sim['uncertain'],
+                    observed_at=sim['observed_at'], fill_on_since=sim['fill_since'],
+                    drain_on_since=sim['drain_since'])
 
     def traffic_report(self, session, value):
         with self.lock:
@@ -188,6 +265,7 @@ class Store:
                         connection=dict(state=self.connection_state, since=self.connection_since, reason=self.connection_reason,
                                         events=[dict(r) for r in self.db.execute('SELECT at,state,reason FROM connection_events ORDER BY id DESC LIMIT 60')]),
                         traffic=self.traffic_snapshot(),
+                        simulation=self.simulation_snapshot(),
                         commands=[dict(r) for r in self.db.execute('SELECT * FROM commands ORDER BY created DESC, rowid DESC LIMIT 60')])
 
     def enqueue(self, command, request_id):
@@ -247,6 +325,7 @@ class Store:
                     raise Problem(400, 'invalid_ack')
                 self.db.execute("UPDATE commands SET status=?, result=?, finished=? WHERE id=? AND status IN ('delivered','uncertain')", (ack['status'], ack['result'], now, ack.get('id')))
             self.status, self.seen = status, now
+            self.observe_outputs(status)
             self.connection_event(True, 'connected')
             row = self.db.execute("SELECT * FROM commands WHERE status='queued' ORDER BY CASE command WHEN 'STOP' THEN 0 WHEN 'FILL_OFF' THEN 1 WHEN 'DRAIN_OFF' THEN 1 ELSE 2 END, created LIMIT 1").fetchone()
             if row:
@@ -280,6 +359,7 @@ class Store:
             self.db.execute("UPDATE commands SET status='uncertain', result='device_reconnected' WHERE status IN ('queued','delivered')")
             self.db.commit()
             self.status, self.seen = status, self.clock()
+            self.observe_outputs(status)
             self.gateway_seen = self.seen
             self.connection_event(True, 'connected')
             return self.ws_gateway
@@ -290,6 +370,7 @@ class Store:
                 raise Problem(409, 'stale_session')
             if status is not None:
                 self.status = validate_status(status)
+                self.observe_outputs(self.status)
             if ack is not None:
                 if not isinstance(ack, dict) or ack.get('status') not in ('succeeded', 'rejected', 'uncertain') or not isinstance(ack.get('result'), str) or len(ack['result']) > 256 or not isinstance(ack.get('id'), str):
                     raise Problem(400, 'invalid_ack')
@@ -435,6 +516,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.respond(200, dict(ok=True), 'water_session=; Path=/water/api/; Secure; HttpOnly; SameSite=Strict; Max-Age=0')
         if path == '/water/api/status' and not post:
             return self.respond(200, self.server.store.snapshot())
+        if path == '/water/api/simulation' and post:
+            return self.respond(200, self.server.store.configure_simulation(self.body()))
         if path == '/water/api/commands' and post:
             data = self.body()
             return self.respond(202, self.server.store.enqueue(data.get('command'), data.get('id')))

@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#081f32">
+  <title>龟缸水路 · 水序</title>
+  <link rel="stylesheet" href="./aquarium.css">
+  <script type="module" src="./aquarium.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="./aquarium.html"><span class="brand-icon">◈</span><span>水序 <small>龟缸水路</small></span></a>
+    <nav aria-label="页面"><span class="nav-current">三维控制台</span><a href="./">经典控制台 ↗</a></nav>
+    <div class="header-actions"><span id="header-connection" class="connection-pill">正在连接</span><button id="logout" class="text-button" hidden>退出</button></div>
+  </header>
+
+  <main>
+    <section class="intro">
+      <div><div class="eyebrow"><span class="tiny-dot"></span> AQUARIUM CONTROL / 01</div><h1>好好照看<br><em>这一缸水。</em></h1><p>两只红耳巴西龟的日常，也是一套清晰可见的水路控制。</p></div>
+      <div class="intro-meta"><span>设备通讯</span><strong id="hero-status">正在获取状态</strong><small id="hero-seen">等待设备上报</small></div>
+    </section>
+
+    <section id="login-panel" class="login-panel" aria-labelledby="login-title">
+      <div><div class="eyebrow">WELCOME BACK</div><h2 id="login-title">连接你的龟缸</h2><p>登录后查看设备状态并控制补水与冲水。</p></div>
+      <form id="login-form"><label for="key">管理密钥</label><div class="login-row"><input id="key" type="password" autocomplete="current-password" required placeholder="输入管理密钥"><button type="submit">进入控制台 <span aria-hidden="true">↗</span></button></div></form>
+    </section>
+
+    <div id="console" hidden>
+      <div class="dashboard-grid">
+        <section class="tank-card" aria-labelledby="tank-title">
+          <div class="card-top"><div><div class="eyebrow">LIVE SCENE / 3D VIEW</div><h2 id="tank-title">龟缸全景</h2></div><span id="scene-status" class="scene-tag">场景示意</span></div>
+          <div class="tank-stage"><canvas id="tank-canvas" aria-label="有两只红耳巴西龟和小块陆地的三维鱼缸"></canvas><div id="scene-fallback" class="scene-fallback" hidden>当前浏览器无法绘制三维场景，控制与状态仍可使用。</div><div class="stage-label label-in">01 <span>补水入口</span></div><div class="stage-label label-out">02 <span>排水出口</span></div><span class="stage-ornament">RED-EARED SLIDERS · 02</span></div>
+          <div class="level-row"><div><span class="overline">WATER LEVEL / 模拟水位</span><strong id="level-value">未校准</strong><small id="level-detail">水面高度仅作场景示意</small></div><div class="level-gauge" aria-hidden="true"><span>满</span><div class="level-track"><i id="level-fill"></i></div><span>空</span></div></div>
+          <div class="model-note"><span class="info-icon">i</span><p id="model-note">这里没有真实液位传感器。请按已知的满水或空水位置校准，之后才会显示模拟水位。</p></div>
+        </section>
+
+        <section class="control-card" aria-labelledby="control-title">
+          <div class="card-top"><div><div class="eyebrow">MANUAL CONTROL / 2D</div><h2 id="control-title">水路控制</h2></div><span id="version" class="version">—</span></div>
+          <div class="device-strip"><div><span class="overline">设备状态</span><strong id="device-state">等待连接</strong></div><span id="device-mode">—</span></div>
+          <p id="control-hint" class="control-hint">设备在线且就绪后可操作。</p>
+          <div class="switch-list">
+            <button id="fill-button" class="water-switch fill-switch" role="switch" aria-label="补水" aria-checked="false" aria-describedby="fill-detail" data-command="FILL" data-output="fill" disabled><span class="switch-icon">↘</span><span class="switch-copy"><strong>补水</strong><small id="fill-detail">状态未知</small></span><span class="switch-control" aria-hidden="true"></span></button>
+            <div class="run-progress"><div><span>补水运行进度</span><b id="fill-progress-text">— / 120 秒</b></div><div class="progress-track"><i id="fill-progress"></i></div></div>
+            <button id="drain-button" class="water-switch drain-switch" role="switch" aria-label="冲水排出" aria-checked="false" aria-describedby="drain-detail" data-command="DRAIN" data-output="drain" disabled><span class="switch-icon">↗</span><span class="switch-copy"><strong>冲水 · 排出</strong><small id="drain-detail">状态未知</small></span><span class="switch-control" aria-hidden="true"></span></button>
+            <div class="run-progress"><div><span>排水运行进度</span><b id="drain-progress-text">— / 120 秒</b></div><div class="progress-track drain-progress"><i id="drain-progress"></i></div></div>
+          </div>
+          <div class="control-actions"><button id="stop" data-command="STOP" class="stop-button" disabled>■ &nbsp;停止全部输出</button><button id="reset" data-command="RESET" class="reset-button" disabled>故障复位</button></div>
+          <div class="control-foot"><span class="tiny-dot"></span><span>0.8.0 手动模式可同时开启两路；各路独立关闭。进度从首次收到开启状态起估算，可能晚于实际启动；任一路 120 秒到期会故障锁定并关闭全部。</span></div>
+        </section>
+      </div>
+
+      <div class="lower-grid">
+        <section class="detail-card" aria-labelledby="detail-title"><div class="section-head"><div><div class="eyebrow">DEVICE DETAIL</div><h2 id="detail-title">设备详情</h2></div><span id="sync-status">每 2 秒自动同步</span></div><div class="detail-grid"><div><span>补水输出</span><strong id="fill-state">未知</strong></div><div><span>排水输出</span><strong id="drain-state">未知</strong></div><div><span>最近通信</span><strong id="last-seen">—</strong></div><div><span>本次连接持续</span><strong id="online-duration">—</strong></div></div><p id="device-reason" class="detail-reason">等待设备状态。</p><p id="command-feedback" class="feedback" role="status" aria-live="polite"></p></section>
+        <section class="detail-card calibration" aria-labelledby="calibration-title"><div class="section-head"><div><div class="eyebrow">SIMULATED LEVEL</div><h2 id="calibration-title">水位模拟校准</h2></div><span class="sim-chip">仅供展示</span></div><p>根据你的历史经验填写空缸到满缸、满缸到空缸所需的总时间。它们是模拟速率，不改变设备的 120 秒保护。</p><form id="calibration-form"><div class="calibration-fields"><label>空 → 满用时（秒）<input id="fill-seconds" type="number" min="1" max="86400" step="1" required placeholder="例如 300"></label><label>满 → 空用时（秒）<input id="drain-seconds" type="number" min="1" max="86400" step="1" required placeholder="例如 240"></label></div><div class="anchor-row"><label>此刻的已知水位<input id="anchor-level" type="number" min="0" max="100" step="1" required value="100"></label><div class="anchor-presets"><button type="button" data-anchor="100">此刻满水</button><button type="button" data-anchor="0">此刻空水</button></div></div><button id="save-calibration" class="save-button" type="submit">保存校准并开始同步</button></form><p class="calibration-hint">仅在设备在线且两路均关闭时可校准；工作中失联后需按现场水位重新校准。</p></section>
+      </div>
+
+      <section class="history-card" aria-labelledby="history-title"><div class="history-head"><div><div class="eyebrow">LOGBOOK</div><h2 id="history-title">历史记录</h2><p>命令与连接变化都保留最近 60 条。</p></div><button id="history-toggle" aria-controls="history-content" aria-expanded="false">展开记录 <span aria-hidden="true">＋</span></button></div><div id="history-content" hidden><div class="history-tabs" role="tablist" aria-label="历史类型"><button id="tab-commands" role="tab" aria-selected="true" aria-controls="command-panel">操作记录</button><button id="tab-connection" role="tab" aria-selected="false" aria-controls="connection-panel">在线 / 离线</button></div><div id="command-panel" role="tabpanel" aria-labelledby="tab-commands"><div class="table-wrap"><table><thead><tr><th>时间</th><th>操作</th><th>状态</th><th>设备回执 / 说明</th></tr></thead><tbody id="commands-list"></tbody></table></div><p id="commands-empty" class="empty">暂无操作记录。</p></div><div id="connection-panel" role="tabpanel" aria-labelledby="tab-connection" hidden><div class="table-wrap"><table><thead><tr><th>时间</th><th>设备</th><th>说明</th></tr></thead><tbody id="connection-list"></tbody></table></div><p id="connection-empty" class="empty">暂无连接记录。</p></div></div></section>
+    </div>
+    <p id="message" role="status" aria-live="polite"></p>
+  </main>
+  <footer><span>水序 AQUARIUM CONTROL</span><span>界面水位为模型估算；实际水位请以现场为准。</span></footer>
+  <dialog id="confirm"><form method="dialog"><h2>确认故障复位？</h2><p>请先确认现场故障原因已经排除。复位后输出仍保持关闭。</p><div><button value="cancel" class="reset-button">取消</button><button value="ok" class="save-button">确认复位</button></div></form></dialog>
+</body>
+</html>

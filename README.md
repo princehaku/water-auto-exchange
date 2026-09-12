@@ -1,18 +1,18 @@
 # Air724UG 自动换水
 
-> 2026-09-12：源码 **0.7.3** 已按用户要求将WSS证书参数改成与短信项目一致：默认long_connection_cert=nil，TLS加密但不校验服务端证书、不启用SNI。可显式填写证书表开启校验。保留60秒建连、每秒心跳和活动10秒失联停止。166项Lua、48项后端及浏览器联调通过；完整9项包已准备。见[网络恢复与配置](docs/network-recovery.md)。
+> 2026-09-12：源码 **0.7.4** 已按用户确认的接口用途启用两路手动输出：补水DO2/GPIO23、排水出纸口/GPIO5。用户补充旧扫描切换到别的GPIO后接口无电压，关断因此沿用旧脚本的“写LOW再pins.close”，不要求单独LOW持续保持也能关断。175项Lua、55项后端及浏览器联调通过；实板尚未下载本版，不能把模拟测试当作本版实物验证。
 
-`water_auto_exchange 0.7.3` 默认采用手动模式：FILL开启补水，DRAIN开启冲水（排水），STOP关闭。两路互锁，单次默认最多120秒；自动液位模式须显式配置。本地USB控制不需要SIM，4G远程控制需要可用数据连接。
+`water_auto_exchange 0.7.4` 默认采用手动模式：FILL开启补水，DRAIN开启冲水（排水），STOP关闭。两路互锁，单次默认最多120秒；自动液位模式须显式配置。本地USB控制不需要SIM，4G远程控制需要可用数据连接。
 
 上电待机，立即打印状态，之后每 5 秒打印一次。USB 支持 `STATUS`、`START`、`FILL`、`DRAIN`、`STOP`、`RESET`。已实现输入防抖、进排水互锁、阶段超时、故障锁存及可选超高水位输入。当前由手动命令开启/关闭对应输出，尚未设置定时计划。
 
-**0.7.3已刷入并由COM4确认。** 板端日志已确认可选证书配置生效，尚未确认本轮WSS在线。默认输出映射仍未填写且禁用；须确认输出接线及有效电平。手动模式不要求液位反馈。
+**实板最近已确认0.7.3，0.7.4待下载。** 用户曾看到网页在线，但连接稳定性仍待排查。本版生成包已填写两路输出，开机执行LOW后释放，待机不自动开水；发出开水命令后才重新配置相应GPIO并拉高。手动模式不要求液位反馈。WSS继续采用0.7.3的可选证书配置，默认long_connection_cert=nil；见[网络恢复与配置](docs/network-recovery.md)。
 
 ## 配置与使用
 
 完整流程、接线条件、故障解释见 [自动换水说明](docs/water-control.md)。
 
-- [water_config.lua](src/water_config.lua)：填写补水、排水输出和液位反馈输入；默认全部未映射。
+- [water_config.lua](src/water_config.lua)：补水GPIO23、排水GPIO5，均采用off_mode="release"；液位输入默认不启用。
 - [water_cycle.lua](src/water_cycle.lua)：不依赖硬件的换水状态机。
 - [water_control.lua](src/water_control.lua)：旧版 LuatOS-Air GPIO、采样、定时和故障清理。
 - [water_usb.lua](src/water_usb.lua)、[main.lua](src/main.lua)：USB 命令、启动与每 5 秒状态日志。
@@ -33,7 +33,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\water-command.ps1 -P
 
 ## 下载
 
-在 LuaTools `water-online-0.7.3` 项目中保留 `LuatOS-Air_V4035_RDA8910_TTS_NOLVGL_FLOAT` CORE 和默认 LuaTask V2.4.4 库。项目配置已改为下载包清单中的 8 个 Lua 文件和 1 个 CA 证书；若界面仍显示旧清单，重新载入项目核对后，由用户点击“下载脚本”：
+在 LuaTools `water-online-0.7.4` 项目中保留 `LuatOS-Air_V4035_RDA8910_TTS_NOLVGL_FLOAT` CORE 和默认 LuaTask V2.4.4 库。项目配置已改为下载包清单中的 8 个 Lua 文件和 1 个 CA 证书；若界面仍显示旧清单，重新载入项目核对后，由用户点击“下载脚本”：
 
 ```text
 build/firmware/main.lua

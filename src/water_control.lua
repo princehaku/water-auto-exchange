@@ -42,6 +42,9 @@ function M.validate(config)
         if not level(item.on_level) or not level(item.off_level) or item.on_level == item.off_level then
             return false, "invalid_output_levels_" .. name
         end
+        if item.off_mode ~= nil and item.off_mode ~= "hold" and item.off_mode ~= "release" then
+            return false, "invalid_off_mode_" .. name
+        end
     end
     if type(config.inputs.overflow) ~= "table" or type(config.inputs.overflow.enabled) ~= "boolean" then
         return false, "invalid_overflow_config"
@@ -72,7 +75,7 @@ function M.new(config, dependencies)
     local self = {}
     local initialized, running = false, false
     local sys, pins, pin_api, tick_fn, pio_api
-    local owned = {}
+    local owned, opened = {}, {}
     local actual = { fill = false, drain = false }
     local uncertain = { fill = false, drain = false }
     local io_error
@@ -112,14 +115,32 @@ function M.new(config, dependencies)
     local function off_all()
         local errors = {}
         for _, name in ipairs({"fill", "drain"}) do
-            if owned[name] then
-                local item = cfg.outputs[name]
+            local item = valid and cfg.outputs[name]
+            if owned[name] and (item.off_mode ~= "release" or opened[name] or uncertain[name]) then
+                local setup_ok = true
+                if item.off_mode == "release" and not opened[name] then
+                    -- Retry an uncertain OFF even if a previous close succeeded.
+                    opened[name] = true
+                    local err
+                    setup_ok, err = pcall(function()
+                        assert(type(pins.setup(item.gpio, item.off_level)) == "function", "off_setup_" .. name .. "_failed")
+                    end)
+                    if not setup_ok then errors[#errors + 1] = clean(err) end
+                end
                 local ok, err = pcall(checked, "off_" .. name, pin_api.setval, item.off_level, item.gpio)
-                if ok then
+                if not ok then errors[#errors + 1] = clean(err) end
+                local close_ok = true
+                if item.off_mode == "release" then
+                    -- Match gpio_probe's measured switch-away/STOP sequence.
+                    -- Always attempt close, including after a failed LOW write.
+                    close_ok, err = pcall(checked, "close_" .. name, pins.close, item.gpio)
+                    if close_ok then opened[name] = false
+                    else errors[#errors + 1] = clean(err) end
+                end
+                if setup_ok and ok and close_ok then
                     actual[name], uncertain[name] = false, false
                 else
                     uncertain[name] = true
-                    errors[#errors + 1] = clean(err)
                 end
             end
         end
@@ -155,6 +176,11 @@ function M.new(config, dependencies)
             local item = cfg.outputs[name]
             -- Mark uncertainty before a possibly partial ON write; faults retry both OFFs.
             actual[name], uncertain[name] = true, true
+            if item.off_mode == "release" then
+                opened[name] = true
+                assert(type(pins.setup(item.gpio, item.off_level)) == "function", "on_setup_" .. name .. "_failed")
+                if token ~= generation then return end
+            end
             checked("on_" .. name, pin_api.setval, item.on_level, item.gpio)
             uncertain[name] = false
         end
@@ -233,11 +259,24 @@ function M.new(config, dependencies)
             assert(type(pins.setup) == "function" and pin_api and type(pin_api.setval) == "function"
                 and type(pin_api.getval) == "function" and type(tick_fn) == "function", "io_api_unavailable")
             for _, name in ipairs({"fill", "drain"}) do
+                local item = cfg.outputs[name]
+                if item.off_mode == "release" then
+                    assert(type(pins.close) == "function", "close_api_unavailable")
+                end
+            end
+            for _, name in ipairs({"fill", "drain"}) do
                 owned[name] = true
+                opened[name] = true
                 uncertain[name] = true
                 local item = cfg.outputs[name]
                 assert(type(pins.setup(item.gpio, item.off_level)) == "function", "setup_" .. name .. "_failed")
                 uncertain[name] = false
+                if item.off_mode == "release" then
+                    -- LOW alone is not the measured OFF: finish closing this
+                    -- output before configuring the next one.
+                    local stopped, detail = off_all()
+                    assert(stopped, "init_off_failed:" .. detail)
+                end
             end
             for _, name in ipairs({"need_fill", "overflow"}) do
                 local item = cfg.inputs[name]

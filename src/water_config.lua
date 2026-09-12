@@ -1,18 +1,19 @@
 -- Manual water switches; optional automatic mode uses a liquid-level relay.
--- Set the wiring and measured active/OFF levels before enabling real outputs.
+-- GK21.5PTM: user's tested scan-switch-away sequence is LOW then pins.close.
 return {
     -- Manual switches need only confirmed outputs; no level sensor is required.
     -- Set automatic only when the level feedback is installed and verified.
     mode = "manual",
-    enabled = false,
-    mapping_confirmed = false,
-    -- Confirm output wiring and OFF behavior. Automatic mode additionally
-    -- requires isolated level feedback and no bypass of the fill permission.
-    wiring_confirmed = false,
+    enabled = true,
+    mapping_confirmed = true,
+    -- Confirmed for manual board-output control, not pump/flow commissioning.
+    wiring_confirmed = true,
 
     outputs = {
-        fill = { gpio = nil, on_level = nil, off_level = nil },
-        drain = { gpio = nil, on_level = nil, off_level = nil }
+        -- Fill: top DO2 (~12V); drain: paper motor connector (~6.1V).
+        -- off_level alone is NOT the validated OFF state: release is required.
+        fill = { gpio = 23, on_level = 1, off_level = 0, off_mode = "release" },
+        drain = { gpio = 5, on_level = 1, off_level = 0, off_mode = "release" }
     },
     inputs = {
         -- Board relay requests fill below B; stays asserted until water reaches C.

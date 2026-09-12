@@ -1,5 +1,14 @@
 # 项目约定与本轮对话摘要
 
+## 2026-09-12 最新：沿用旧扫描关断流程，0.7.4启用两路输出
+
+- 用户补充“切到别的gpio就没电压了”，这是对旧扫描完整关断流程有效的新增测量反馈；不能继续把仅未确认单独LOW解释为没有关断依据。已复核src/gpio_probe.lua：每脚HIGH/LOW各5秒，切脚/STOP时setval(0)后pins.close。依此采用完整序列，无需用户重新证明单独保持LOW也能关断；不把close推断为特定内部上下拉或独立测量结论。
+- 用户确定用途：补水接DO2/GPIO23，排水接出纸电机口/GPIO5。源码及生成包0.7.4设manual、enabled/mapping_confirmed/wiring_confirmed=true，两路on_level=1、off_level=0、off_mode=release。这里的off_level只是释放前的写入，完整关断还必须close。约12V/6.1V为此前接口观察，非GPIO逻辑电压或负载额定证明。
+- 适配器新增可选release关断；旧未指定/hold配置仍持续保持OFF。开机USB STOP先建立，然后两路写LOW并释放，保持待机；发开水命令才重新setup LOW再写HIGH。关闭已释放输出不重复写GPIO；LOW失败也尝试close，任何错误保留未知/FAULT且阻止另一输出开启。重开前恢复输出模式，旧回调不能在STOP后拉高。保留两路互锁、默认120秒、无传感器manual、断网停止及不自动恢复。
+- 175项Lua（12+15+20+36+23+39+30）、55项Python、Edge本地HTTP联调通过。新增9项Lua覆盖真实默认配置/USB启动顺序、两路独立重复开关、释放与LOW失败、重开失败、120秒超时、缺少close及STOP竞态；模拟测试不等于实物新版本验证。LuaFLOAT、PS、JS语法通过，生成包9项/源码一致/私有联网凭据/映射/CORE及water-online-0.7.4项目核对通过。
+- 0.7.4仍待下载。此次COM4存在但STATUS请求3秒无应答，最近实板已确认仍沿用0.7.3；未恢复被Escape停止的computer-use、未刷写或发实板FILL/DRAIN。用户可选择新项目点击下载脚本，保留CORE；板端须实读版本、manual/ready=1/outputs_known=1、初始fill=0/drain=0及真实在线。不要写成两个物理接口本版已测试通过。
+- 服务端和网页0.7.4兼容已部署，备份`/apps/water-auto-exchange/backups/20260912T091638Z-3808181`，容器healthy。四个公网静态文件与本地一致，真实HTTPS登录/status/退出、999天Cookie与持久化到期时间、water/sms健康及凭据WSS probe通过；未注册模拟设备或发控制命令。沿用999天会话持久化；不改变WSS重试/证书参数，不将之前认证阶段断开解释为已修复。
+
 ## 2026-09-12 最新：网页登录 token 保留 999 天，输出仍待配置
 
 - 用户要求“服务端token保留999天”。网页登录会话从8小时内存保存改为登录后固定999天（86,313,600秒），保存到现有data/water.db的admin_sessions表，正常容器重启和部署后保留。仅存token摘要、到期时间和管理密钥摘要；退出立即撤销当前token，更换管理密钥并重启撤销旧会话。设备密钥、WSS会话/命令时限及板端0.7.3不变，无需刷板。

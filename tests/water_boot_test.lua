@@ -14,6 +14,10 @@ local function fixture(real_controller)
     for _, name in ipairs({"sys", "log", "pins", "netLed", "water_config", "water_control", "water_cycle", "water_usb", "water_network_config", "water_network"}) do
         package.loaded[name] = nil
     end
+    -- Exercise explicit unconfigured fallback; shipping config is tested below.
+    local disabled_config = dofile(root .. "/src/water_config.lua")
+    disabled_config.mapping_confirmed = false
+    package.loaded.water_config = disabled_config
     local f = {rx = {}, replies = {}, calls = {}, logs = {}, setups = {}, timers = {}, gpio_calls = 0}
     local function forbidden()
         f.gpio_calls = f.gpio_calls + 1
@@ -52,7 +56,7 @@ local function fixture(real_controller)
             f.trace = true
         end}
     end
-    _G.PROJECT, _G.VERSION = "water_auto_exchange", "0.7.3"
+    _G.PROJECT, _G.VERSION = "water_auto_exchange", "0.7.4"
     _G.uart = {
         USB = 0x81, PAR_NONE = 0, STOP_1 = 1,
         setup = function(id, baud, bits, parity, stop)
@@ -147,7 +151,7 @@ test("fragmented STATUS is read-only and unknown water level is explicit", funct
     f.feed("STA")
     equal(#f.replies, 1)
     f.feed("TUS\r")
-    contains(f.replies[2], "OK STATUS project=water_auto_exchange version=0.7.3")
+    contains(f.replies[2], "OK STATUS project=water_auto_exchange version=0.7.4")
     contains(f.replies[2], "ready=0 fill=0 drain=0 outputs_known=0 need_fill=unknown")
     f.feed("\n")
     equal(#f.replies, 2, "CRLF must yield one reply")
@@ -264,7 +268,7 @@ test("boot prints immediately and every 5 seconds without starting outputs", fun
     local f = fixture()
     f.boot()
     equal(PROJECT, "water_auto_exchange")
-    equal(VERSION, "0.7.3")
+    equal(VERSION, "0.7.4")
     equal(f.sys_init[1], 0)
     equal(f.sys_init[2], 0)
     equal(f.sys_run, true)
@@ -275,7 +279,7 @@ test("boot prints immediately and every 5 seconds without starting outputs", fun
     equal(f.calls.start, nil)
     equal(f.calls.fill, nil)
     equal(f.gpio_calls, 0)
-    contains(table.concat(f.logs), "WATER STATUS project=water_auto_exchange version=0.7.3")
+    contains(table.concat(f.logs), "WATER STATUS project=water_auto_exchange version=0.7.4")
     equal(#f.timers, 1)
     equal(f.timers[1].ms, 5000)
     local replies, status_calls = #f.replies, f.calls.status
@@ -317,7 +321,7 @@ test("controller initialization exception attempts STOP and keeps USB available"
     equal(f.sys_run, true)
 end)
 
-test("default real configuration boots unconfigured without any GPIO or scan", function()
+test("unconfirmed configuration boots unconfigured without any GPIO or scan", function()
     local f = fixture(true)
     f.boot()
     equal(f.gpio_calls, 0)
@@ -331,6 +335,48 @@ test("default real configuration boots unconfigured without any GPIO or scan", f
     contains(replies, "fill=0 drain=0 outputs_known=0")
     equal(f.gpio_calls, 0)
     equal(#f.timers, 1, "only trace heartbeat is scheduled when unconfigured")
+end)
+
+test("shipping config boots OFF and real USB FILL DRAIN STOP use mapped outputs", function()
+    local f = fixture(true)
+    package.loaded.water_config = nil
+    local raw_tick, opened, levels, writes = 0, {}, {}, {}
+    package.preload.pins = function()
+        return {
+            setup = function(gpio, value)
+                assert(f.receive, "USB STOP must precede every output setup")
+                assert(gpio == 23 or gpio == 5)
+                equal(value, 0)
+                assert(not opened[gpio == 23 and 5 or 23], "release the other output first")
+                opened[gpio], levels[gpio] = true, value
+                return function() end
+            end,
+            close = function(gpio) opened[gpio], levels[gpio] = false, nil end
+        }
+    end
+    _G.pio.pin.setval = function(value, gpio)
+        assert(opened[gpio], "output mode must be restored before write")
+        levels[gpio] = value
+        writes[#writes + 1] = {gpio, value}
+        assert(not (levels[23] == 1 and levels[5] == 1))
+    end
+    _G.rtos.tick = function() return raw_tick end
+    local sys = require "sys"
+    sys.timerStart = function(callback) f.poll = callback; return 10 end
+    sys.timerStop = function() end
+    f.boot()
+    equal(opened[23], false); equal(opened[5], false)
+    for _, write in ipairs(writes) do equal(write[2], 0, "boot must never turn on water") end
+    raw_tick = 100; f.poll()
+    f.feed("STATUS\n")
+    contains(f.replies[#f.replies], "ready=1 fill=0 drain=0 outputs_known=1 need_fill=unknown")
+    f.feed("FILL\n"); contains(f.replies[#f.replies], "OK FILL")
+    equal(levels[23], 1); equal(opened[5], false)
+    f.feed("DRAIN\n"); contains(f.replies[#f.replies], "ERROR DRAIN")
+    f.feed("STOP\n"); equal(opened[23], false)
+    f.feed("DRAIN\n"); contains(f.replies[#f.replies], "OK DRAIN")
+    equal(levels[5], 1); equal(opened[23], false)
+    f.feed("STOP\n"); equal(opened[5], false)
 end)
 
 test("network starts after USB and controller initialization", function()

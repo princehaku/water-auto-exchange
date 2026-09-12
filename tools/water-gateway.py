@@ -13,7 +13,7 @@ def parse_status(line):
     if not line.startswith('OK STATUS '):
         raise ValueError('status_missing')
     result = dict(word.split('=', 1) for word in line.split()[2:] if '=' in word)
-    if result.get('project') != 'water_auto_exchange' or result.get('version') not in ('0.3.0', '0.4.0', '0.5.0', '0.5.1', '0.5.2', '0.5.3', '0.6.0', '0.7.0', '0.7.1', '0.7.2', '0.7.3'):
+    if result.get('project') != 'water_auto_exchange' or result.get('version') not in ('0.3.0', '0.4.0', '0.5.0', '0.5.1', '0.5.2', '0.5.3', '0.6.0', '0.7.0', '0.7.1', '0.7.2', '0.7.3', '0.7.4'):
         raise ValueError('firmware_mismatch')
     return result
 
@@ -57,7 +57,7 @@ def execute(controller, item, ttl_ms, elapsed):
     try:
         started = time.monotonic()
         status = controller.status()  # Re-identify before EVERY mutation.
-        if command == 'DRAIN' and status.get('version') not in ('0.6.0', '0.7.0', '0.7.1', '0.7.2', '0.7.3'):
+        if command == 'DRAIN' and status.get('version') not in ('0.6.0', '0.7.0', '0.7.1', '0.7.2', '0.7.3', '0.7.4'):
             ack['result'] = 'firmware_upgrade_required'
             return ack
         if (elapsed + time.monotonic() - started) * 1000 >= ttl_ms:

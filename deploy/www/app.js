@@ -26,7 +26,7 @@ function can(command){
   if(command==='STOP')return true;
   if(busy||snapshot.commands.some(c=>['queued','delivered'].includes(c.status)))return false;
   if(command==='RESET')return d.state==='FAULT';
-  return ['FILL','DRAIN'].includes(command)&&['0.7.0','0.7.1','0.7.2','0.7.3'].includes(d.version)&&d.control_mode==='manual'&&d.ready==='1'&&d.outputs_known==='1'&&d.overflow==='0'&&['IDLE','DONE'].includes(d.state);
+  return ['FILL','DRAIN'].includes(command)&&['0.7.0','0.7.1','0.7.2','0.7.3','0.7.4'].includes(d.version)&&d.control_mode==='manual'&&d.ready==='1'&&d.outputs_known==='1'&&d.overflow==='0'&&['IDLE','DONE'].includes(d.state);
 }
 function switchCommand(button){const d=snapshot?.device;return button.dataset.output&&d?.outputs_known==='1'&&d[button.dataset.output]==='1'?'STOP':button.dataset.command;}
 function controls(){document.querySelectorAll('[data-command]').forEach(b=>{
@@ -46,7 +46,7 @@ function render(data){
   for(const key of ['fill','drain'])$(key).textContent=d&&d.outputs_known==='1'?(d[key]==='1'?'开启':'关闭'):'未知';
   $('cycle').textContent=d?d.cycle:'—';
   $('protection').textContent=d?(d.overflow==='1'?'超高水位已触发，请检查现场。':d.overflow_protection==='1'?'已配置额外超高输入；软件保护生效。':'额外超高输入未启用。'):'等待保护状态';
-  $('control-hint').textContent=!online?'设备离线，连接恢复后可操作。':!['0.7.0','0.7.1','0.7.2','0.7.3'].includes(d.version)?'更新设备后可使用手动开关。':d.control_mode!=='manual'?'设备需配置为手动开关模式。':d.state==='UNCONFIGURED'?'输出引脚尚未配置。手动开关不需要水位传感器。':d.state==='FAULT'?'排除故障后复位；停止输出仍可使用。':['FILLING','DRAINING'].includes(d.state)?'请先关闭当前输出，再打开另一路。':'点击开关打开或关闭，不等待水位信号。';
+  $('control-hint').textContent=!online?'设备离线，连接恢复后可操作。':!['0.7.0','0.7.1','0.7.2','0.7.3','0.7.4'].includes(d.version)?'更新设备后可使用手动开关。':d.control_mode!=='manual'?'设备需配置为手动开关模式。':d.state==='UNCONFIGURED'?'输出引脚尚未配置。手动开关不需要水位传感器。':d.state==='FAULT'?'排除故障后复位；停止输出仍可使用。':['FILLING','DRAINING'].includes(d.state)?'请先关闭当前输出，再打开另一路。':'点击开关打开或关闭，不等待水位信号。';
   document.querySelectorAll('[data-state]').forEach(e=>e.classList.toggle('current',online&&e.dataset.state===d?.state));
   $('history').replaceChildren();
   for(const item of data.commands){const row=document.createElement('tr');for(const value of [timeLabel(item.created),names[item.command]||item.command,results[item.status]||item.status,item.result||'—']){const cell=document.createElement('td');cell.textContent=value;row.append(cell);}$('history').append(row);}

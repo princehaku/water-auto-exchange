@@ -75,6 +75,9 @@ class WebSocketTests(unittest.TestCase):
     def test_optional_certificate_firmware_manual_roundtrip(self):
         self.manual_roundtrip('0.7.3')
 
+    def test_board_output_firmware_manual_roundtrip(self):
+        self.manual_roundtrip('0.7.4')
+
     def manual_roundtrip(self, version):
         status=dict(STATUS,version=version,control_mode='manual',need_fill='unknown')
         c=self.connect(status=status)

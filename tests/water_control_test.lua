@@ -30,7 +30,7 @@ local function config()
 end
 local function fixture(cfg)
     cfg = cfg or config()
-    local h = { config = cfg, events = {}, levels = {}, timers = {},
+    local h = { config = cfg, events = {}, levels = {}, opened = {}, timers = {},
         tick = 0, next_id = 0, signed = false, reads = 0, messages = {} }
     for _, name in ipairs({ "need_fill", "overflow" }) do
         local item = cfg.inputs[name]
@@ -67,14 +67,21 @@ local function fixture(cfg)
         pins = {
             setup = function(gpio, value, pull)
                 event(value == nil and "input_setup" or "output_setup", gpio, value)
+                h.opened[gpio] = true
                 if value ~= nil then h.levels[gpio] = value end
                 if h.on_setup then h.on_setup(gpio, value, pull) end
                 return function() error("output_closure_must_not_be_read") end
+            end,
+            close = function(gpio)
+                event("close", gpio)
+                if h.on_close and h.on_close(gpio) == false then return false end
+                h.opened[gpio], h.levels[gpio] = false, nil
             end
         },
         pio = { PULLUP = 1001, PULLDOWN = 1002, NOPULL = 1003, pin = {
             setval = function(value, gpio)
                 event("write", gpio, value)
+                assert(h.opened[gpio], "write_to_released_gpio")
                 if h.on_write then
                     local result = h.on_write(value, gpio)
                     if result == false then return false end
@@ -101,6 +108,7 @@ local function fixture(cfg)
             if h.on_emit then h.on_emit(line) end
         end
     }
+    h.deps = deps
     h.controller = water.new(cfg, deps)
     function h.sensor(name, active)
         local item = cfg.inputs[name]
@@ -153,8 +161,8 @@ local function both_off_attempted(h, since)
     end
 end
 
-test("default unconfigured controller has no hardware side effects on any command", function()
-    local cfg = require "water_config"
+test("unconfigured controller has no hardware side effects on any command", function()
+    local cfg = config(); cfg.mapping_confirmed = false
     local calls = 0
     local function forbidden() calls = calls + 1; error("unexpected_hardware_access") end
     local c = water.new(cfg, {
@@ -182,6 +190,7 @@ test("GPIO conflicts and invalid electrical settings are rejected before initial
         function(c) c.outputs.fill.gpio = 12 end,
         function(c) c.inputs.need_fill.gpio = 12 end,
         function(c) c.outputs.fill.off_level = c.outputs.fill.on_level end,
+        function(c) c.outputs.fill.off_mode = "typo" end,
         function(c) c.inputs.need_fill.active_level = true end,
         function(c) c.inputs.need_fill.pull = "INVALID" end,
         function(c) c.poll_ms = 0 end,
@@ -548,6 +557,119 @@ test("manual config still validates outputs and monitors an enabled overflow inp
     assert(h.controller.fill()); h.sensor("overflow",true); h.poll(100)
     state(h,"FAULT"); equal(h.controller.reset(),false)
     for _, e in ipairs(h.events) do if e.kind=="read" then equal(e.gpio,11) end end
+end)
+
+local function board_fixture()
+    return fixture(dofile(root .. "/src/water_config.lua"))
+end
+
+test("shipping board config initializes both outputs LOW then closed with no sensors or ON", function()
+    local h = board_fixture()
+    h.on_setup = function(gpio)
+        assert(not h.opened[gpio == 23 and 5 or 23], "other output must be released before setup")
+    end
+    assert(h.controller.init()); h.poll(500)
+    local s = state(h, "IDLE")
+    equal(s.ready, true); equal(s.outputs_known, true); equal(s.need_fill, nil)
+    equal(h.reads, 0)
+    for _, gpio in ipairs({23, 5}) do
+        equal(h.opened[gpio], false)
+        equal(h.writes_since(0, gpio, 1), 0)
+        local previous
+        for _, e in ipairs(h.events) do
+            if e.gpio == gpio then
+                if e.kind == "close" then equal(previous.kind, "write"); equal(previous.value, 0) end
+                previous = e
+            end
+        end
+        equal(previous.kind, "close")
+    end
+end)
+
+test("board fill and drain reopen individually and STOP closes without stale callback writes", function()
+    local h = board_fixture(); assert(h.controller.init()); h.poll(500)
+    for _, name in ipairs({"fill", "drain", "fill", "drain"}) do
+        local gpio = h.config.outputs[name].gpio
+        local other = name == "fill" and 5 or 23
+        assert(h.controller[name]())
+        equal(h.levels[gpio], 1); equal(h.opened[other], false)
+        equal(h.controller[name == "fill" and "drain" or "fill"](), false)
+        local _, stale = h.pending()
+        assert(h.controller.stop()); state(h, "IDLE")
+        equal(h.opened[gpio], false)
+        local before = #h.events
+        stale(); equal(#h.events, before)
+    end
+    local before = h.writes_since(0)
+    h.poll(500); assert(h.controller.stop())
+    equal(h.writes_since(0), before, "idle must not write released pins")
+end)
+
+test("failed board close is uncertain and prevents energizing the other output", function()
+    local h = board_fixture(); assert(h.controller.init()); h.poll(500)
+    assert(h.controller.fill())
+    h.on_close = function(gpio) if gpio == 23 then return false end end
+    equal(h.controller.stop(), false)
+    local s = h.controller.status(); equal(s.state, "FAULT")
+    equal(s.outputs_known, false); contains(s.reason, "close_fill_failed")
+    equal(h.controller.drain(), false)
+    equal(h.writes_since(0, 5, 1), 0)
+    h.on_close = nil
+    assert(h.controller.stop())
+    equal(h.opened[23], false); equal(h.controller.status().outputs_known, true)
+    local ok, reason = h.controller.drain()
+    equal(ok, false); contains(reason, "poller_stopped_restart_required")
+end)
+
+test("failed LOW write still attempts close and never reports known OFF", function()
+    local h = board_fixture(); assert(h.controller.init()); h.poll(500)
+    assert(h.controller.fill())
+    h.on_write = function(value, gpio) if gpio == 23 and value == 0 then return false end end
+    equal(h.controller.stop(), false)
+    equal(h.opened[23], false, "close must run even after LOW fails")
+    equal(h.controller.status().state, "FAULT")
+    equal(h.controller.status().outputs_known, false)
+    h.on_write = nil
+    assert(h.controller.stop())
+    equal(h.controller.status().outputs_known, true)
+end)
+
+test("partial reopen failure closes GPIO and does not write HIGH", function()
+    local h = board_fixture(); assert(h.controller.init()); h.poll(500)
+    h.on_setup = function(gpio) if gpio == 23 then error("reopen_failed") end end
+    equal(h.controller.fill(), false); state(h, "FAULT")
+    equal(h.opened[23], false)
+    equal(h.writes_since(0, 23, 1), 0)
+end)
+
+test("both board output timeouts execute LOW and close at 120 seconds", function()
+    for _, name in ipairs({"fill", "drain"}) do
+        local h = board_fixture(); assert(h.controller.init()); h.poll(500)
+        assert(h.controller[name]())
+        h.poll(119999); equal(h.opened[h.config.outputs[name].gpio], true)
+        h.poll(1)
+        local s = state(h, "FAULT")
+        equal(s.reason, name .. "_timeout"); equal(s.outputs_known, true)
+        equal(h.opened[23], false); equal(h.opened[5], false)
+        h.poll(1000); equal(h.opened[23], false); equal(h.opened[5], false)
+    end
+end)
+
+test("missing close API fails before claiming either board output", function()
+    local h = board_fixture(); h.deps.pins.close = nil
+    equal(h.controller.init(), false)
+    contains(state(h, "FAULT").reason, "close_api_unavailable")
+    for _, e in ipairs(h.events) do assert(e.kind ~= "output_setup" and e.kind ~= "write") end
+end)
+
+test("STOP during output reopen cannot be followed by a late HIGH", function()
+    local h = board_fixture(); assert(h.controller.init()); h.poll(500)
+    h.on_setup = function(gpio)
+        if gpio == 23 then h.on_setup = nil; assert(h.controller.stop()) end
+    end
+    h.controller.fill()
+    equal(h.writes_since(0, 23, 1), 0)
+    equal(h.opened[23], false); state(h, "IDLE")
 end)
 
 local failures = 0

@@ -1,5 +1,13 @@
 # 项目记忆
 
+## 2026-09-12 最新：0.7.1已运行，注册及IP已成功，仍连接超时
+
+- 本机trace在15:49:26记录CEREG:2,1（已注册）、CPIN:READY、CSQ10；15:48:28已获得CMIOT承载IP，15:49:54恢复后再次IP_READY。不能再把15:07的注册拒绝作为当前状态。0.7.1在15:49多条STATUS中得到确认，属于现场trace证据，并非助手刷写或本轮COM4成功实读。
+- 15:49:52.373实际执行pdp_recover reason=consecutive_failures，随后重新IP_READY，证明新增恢复路径运行；尚无WATER WS online，不代表TLS已恢复。源码GPIO仍禁用。本轮后段COM4打开报不存在，重新用GetPortNames/PnP确认仅COM1，无LUAT端口。
+- 按用户要求检索同类问题：Air724原始论坛帖有TCP成功/SSL失败现象，官方历史AT固件有DNS和加密套件修复，官方FAQ提及物联卡白名单。仅为排查线索，不能把旧AT/新LuatOS修复直接套用当前V4035+LuaTask2.4.4。
+- PC域名解析本次返回198.18.0.6，域名TLS EOF；改用真实服务器47.97.255.190并保留bytegallop.com SNI、同一CA及TLS1.2验证后约0.05秒成功。此结果只证明PC直连服务器可用，不代表板端DNS结果或4G路径。公网DNS在服务器解析为47.97.255.190，服务健康。短时SYN抓包因SSH连接中断无有效数据，不得写成服务器未收到板端连接。
+- 下一步应分离板端域名解析、纯TCP建连与TLS握手，现有TCPSSL TIMEOUT只是综合连接截止，不能等同证书失败。未改证书校验、APN、CORE或控制GPIO。本轮仅更新调查记录。
+
 ## 2026-09-12 接续更正：USB已连接，COM4实读0.7.0
 
 - 不可用Win32_SerialPort只列出COM1推断Air724未连接。该WMI类漏列本机LUAT端口；SerialPort.GetPortNames与Get-PnpDevice -PresentOnly实际确认COM3/4/5/6均存在且OK。后续枚举至少核对这两种来源。

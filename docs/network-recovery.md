@@ -1,5 +1,13 @@
 # 0.7.1 网络恢复与注册诊断
 
+## 2026-09-12 最新：0.7.1已运行，注册及IP已成功，仍连接超时
+
+- 本机trace在15:49:26记录CEREG:2,1（已注册）、CPIN:READY、CSQ10；15:48:28已获得CMIOT承载IP，15:49:54恢复后再次IP_READY。不能再把15:07的注册拒绝作为当前状态。0.7.1在15:49多条STATUS中得到确认，属于现场trace证据，并非助手刷写或本轮COM4成功实读。
+- 15:49:52.373实际执行pdp_recover reason=consecutive_failures，随后重新IP_READY，证明新增恢复路径运行；尚无WATER WS online，不代表TLS已恢复。源码GPIO仍禁用。本轮后段COM4打开报不存在，重新用GetPortNames/PnP确认仅COM1，无LUAT端口。
+- 按用户要求检索同类问题：Air724原始论坛帖有TCP成功/SSL失败现象，官方历史AT固件有DNS和加密套件修复，官方FAQ提及物联卡白名单。仅为排查线索，不能把旧AT/新LuatOS修复直接套用当前V4035+LuaTask2.4.4。
+- PC域名解析本次返回198.18.0.6，域名TLS EOF；改用真实服务器47.97.255.190并保留bytegallop.com SNI、同一CA及TLS1.2验证后约0.05秒成功。此结果只证明PC直连服务器可用，不代表板端DNS结果或4G路径。公网DNS在服务器解析为47.97.255.190，服务健康。短时SYN抓包因SSH连接中断无有效数据，不得写成服务器未收到板端连接。
+- 下一步应分离板端域名解析、纯TCP建连与TLS握手，现有TCPSSL TIMEOUT只是综合连接截止，不能等同证书失败。未改证书校验、APN、CORE或控制GPIO。本轮仅更新调查记录。
+
 本版延续补水/冲水手动开关，无需水位传感器或水流验收。网络恢复不恢复之前的开启状态，也不重放失效会话的命令。GPIO配置仍默认禁用。
 
 ## 重试规则
@@ -43,3 +51,12 @@ WATER WS pdp_recover reason=pdp_wait_timeout cooldown_ms=300000
 完整下载包仍为build/firmware下8个Lua文件与1个CA，LuaTools项目`water-online-0.7.1`，保留原CORE。下载后确认版本0.7.1，并检查注册/IP/WSS及心跳；尚未实证本版能恢复这次运营商注册异常。
 
 0.7.1兼容网页/后端已部署，备份`/apps/water-auto-exchange/backups/20260912T071450Z-3768177`。容器healthy，公网四个静态文件与本地一致，API和/sms健康200，既有凭据WSS probe通过；未向生产提交设备模拟状态或开水命令。
+
+## 同类问题检索来源（2026-09-12）
+
+- [原始Air724问题帖，2022-03-17](https://whycan.com/t_7805.html)：发帖人描述私有EMQX普通TCP可连，改为SSL和证书后连接失败。未取得与本项目相同版本及TIMEOUT的已解决复现，不能照搬帖子里的证书关闭操作。
+- [合宙Air724UG历史AT固件记录](https://docs.openluat.com/air724ug/at/firmware/)：记录过DNS解析慢/失败及SSL加密套件兼容问题。这是旧AT版本的历史，不证明当前Lua V4035有相同缺陷。
+- [合宙FAQ 2026-08-13](https://docs.openluat.com/faq/2026-08-13/)：有物联卡访问目标域名/IP受定向白名单限制的问答。用户卡类型仍未确认，CMIOT及10.x承载地址本身不能证明限制存在。
+- [Air724UG HTTP官方说明](https://docs.openluat.com/air724ug/luatos/app/socket/http/)：说明CA及hostNameFlag域名上报参数；本项目已有CA校验与hostNameFlag=1，不能简单归因漏配SNI。
+
+检查顺序建议：板端读取域名解析目标、对目标IP只建TCP不发业务密钥，再以保留域名校验的TLS连接对照。纯TCP也失败优先查数据出口/目标可达性；TCP成功而TLS失败再定位CA/时间/协议套件和握手期限。不要把PC假IP解析结果当作板端结果，也不要从综合TIMEOUT日志直接断言证书错误。

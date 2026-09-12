@@ -11,15 +11,18 @@ errors.firmware_upgrade_required='请先更新设备固件，再使用单独冲�
 reasons.manual_filling='补水已打开，可点击开关关闭';
 reasons.manual_draining='冲水已打开，可点击开关关闭';
 reasons.ready='已就绪，可以操作';
-let snapshot=null, lastSnapshot=null, signedIn=false, busy=false, refreshing=false, lastSuccess=0, submittedId=null;
+const refreshInterval=2000;
+let snapshot=null, lastSnapshot=null, signedIn=false, busy=false, lastSuccess=0, submittedId=null;
+let refreshEnabled=true, refreshRequest=null, authEpoch=0, initialSyncError='';
 function message(text){$('message').textContent=text;}
-async function api(path, body){
-  const response=await fetch('./api/'+path,{method:body===undefined?'GET':'POST',credentials:'same-origin',cache:'no-store',headers:body===undefined?{}:{'Content-Type':'application/json'},body:body===undefined?undefined:JSON.stringify(body),signal:AbortSignal.timeout(6000)});
+async function api(path, body, signal=AbortSignal.timeout(6000)){
+  const response=await fetch('./api/'+path,{method:body===undefined?'GET':'POST',credentials:'same-origin',cache:'no-store',headers:body===undefined?{}:{'Content-Type':'application/json'},body:body===undefined?undefined:JSON.stringify(body),signal});
   let data; try{data=await response.json();}catch{throw new Error('服务暂时不可用，请稍后重试。');}
-  if(!response.ok){if(response.status===401 && path!=='login')showLogin();throw new Error(errors[data.error]||'操作失败：'+(data.error||response.status));}
+  if(!response.ok){if(response.status===401 && !['login','status'].includes(path))showLogin();const error=new Error(errors[data.error]||'操作失败：'+(data.error||response.status));error.status=response.status;throw error;}
   return data;
 }
-function showLogin(){signedIn=false;snapshot=null;lastSnapshot=null;$('console').hidden=true;$('login-panel').hidden=false;}
+function cancelRefresh(){authEpoch++;refreshRequest?.abort();refreshRequest=null;}
+function showLogin(){cancelRefresh();refreshEnabled=false;signedIn=false;snapshot=null;lastSnapshot=null;submittedId=null;lastSuccess=0;if($('message').textContent===initialSyncError)message('');initialSyncError='';$('console').hidden=true;$('login-panel').hidden=false;}
 function timeLabel(t){return t?new Date(t*1000).toLocaleString('zh-CN',{hour12:false}):'尚未收到数据';}
 function durationLabel(seconds){if(!Number.isFinite(seconds))return '—';seconds=Math.max(0,Math.floor(seconds));if(seconds<60)return seconds+' 秒';if(seconds<3600)return Math.floor(seconds/60)+' 分 '+seconds%60+' 秒';if(seconds<86400)return Math.floor(seconds/3600)+' 小时 '+Math.floor(seconds%3600/60)+' 分';return Math.floor(seconds/86400)+' 天 '+Math.floor(seconds%86400/3600)+' 小时';}
 function bytesLabel(bytes){if(!Number.isFinite(bytes)||bytes<0)return '—';const units=['B','KB','MB','GB','TB'];let i=0;while(bytes>=1024&&i<units.length-1){bytes/=1024;i++;}return (i?bytes.toFixed(2):Math.floor(bytes))+' '+units[i];}
@@ -78,12 +81,26 @@ function render(data){
   $('empty').hidden=data.commands.length>0;$('history-table').hidden=!data.commands.length;controls();
 }
 async function refresh(){
-  if(refreshing)return;refreshing=true;
-  try{const data=await api('status');signedIn=true;lastSuccess=Date.now();$('login-panel').hidden=true;$('console').hidden=false;render(data);}
-  catch(e){if(signedIn){snapshot=null;controls();renderConnection(lastSnapshot,false);$('control-hint').textContent='服务连接中断，暂时无法操作。';message(e.message);}}
-  finally{refreshing=false;}
+  if(refreshRequest||!refreshEnabled)return;
+  const request=new AbortController(), epoch=authEpoch;
+  refreshRequest=request;
+  const timeout=setTimeout(()=>request.abort(),6000);
+  try{
+    const data=await api('status',undefined,request.signal);
+    if(epoch!==authEpoch)return;
+    signedIn=true;lastSuccess=Date.now();
+    if($('message').textContent===initialSyncError)message('');initialSyncError='';
+    $('login-panel').hidden=true;$('console').hidden=false;render(data);
+    $('sync-status').textContent='每 2 秒自动更新 · 已同步 '+new Date(lastSuccess).toLocaleTimeString('zh-CN',{hour12:false});
+  }catch(e){
+    if(epoch!==authEpoch)return;
+    if(e.status===401){showLogin();return;}
+    $('sync-status').textContent='同步中断 · 正在自动重试';
+    if(signedIn){snapshot=null;controls();renderConnection(lastSnapshot,false);$('control-hint').textContent='服务连接中断，暂时无法操作。';}
+    else{initialSyncError='暂时无法获取状态，正在自动重试。';message(initialSyncError);}
+  }finally{clearTimeout(timeout);if(refreshRequest===request)refreshRequest=null;}
 }
-$('login-form').addEventListener('submit',async e=>{e.preventDefault();const button=e.target.querySelector('button');button.disabled=true;try{await api('login',{key:$('key').value});$('key').value='';message('');await refresh();}catch(e){message(e.message);}finally{button.disabled=false;}});
+$('login-form').addEventListener('submit',async e=>{e.preventDefault();const button=e.target.querySelector('button');button.disabled=true;try{await api('login',{key:$('key').value});cancelRefresh();refreshEnabled=true;$('key').value='';message('');await refresh();}catch(e){message(e.message);}finally{button.disabled=false;}});
 $('logout').addEventListener('click',async()=>{try{await api('logout',{});showLogin();message('已退出。');}catch(e){message(e.message);}});
 $('refresh').addEventListener('click',()=>refresh());
 async function confirmCommand(command){if(command!=='RESET')return true;const dialog=$('confirm');$('confirm-title').textContent='确认故障复位？';$('confirm-body').textContent='确认故障原因已经排除。复位后保持关闭。';dialog.returnValue='cancel';dialog.showModal();return new Promise(resolve=>dialog.addEventListener('close',()=>resolve(dialog.returnValue==='ok'),{once:true}));}
@@ -91,9 +108,12 @@ for(const button of document.querySelectorAll('[data-command]'))button.addEventL
   const command=switchCommand(button);if(!can(command)||!await confirmCommand(command)||!can(command)||switchCommand(button)!==command)return;
   busy=true;controls();
   try{const id=Array.from(crypto.getRandomValues(new Uint8Array(16)),v=>v.toString(16).padStart(2,'0')).join('');submittedId=id;await api('commands',{command,id});message('命令已提交，正在等待设备回执。');await refresh();}
-  catch(e){message(e.message+' 若提交时连接中断，请先刷新操作记录核实结果。');}
+  catch(e){message(e.message+' 若提交时连接中断，请等待操作记录自动更新后核实结果。');}
   finally{busy=false;controls();}
 });
-setInterval(()=>{controls();if(signedIn){renderConnection(lastSnapshot,snapshot!==null&&Date.now()-lastSuccess<=10000);if(!document.hidden)refresh();}},2000);
-document.addEventListener('visibilitychange',()=>{if(!document.hidden&&signedIn)refresh();});
+function resumeRefresh(){if(!document.hidden)refresh();}
+setInterval(()=>{controls();if(signedIn)renderConnection(lastSnapshot,snapshot!==null&&Date.now()-lastSuccess<=10000);resumeRefresh();},refreshInterval);
+document.addEventListener('visibilitychange',resumeRefresh);
+window.addEventListener('focus',resumeRefresh);
+window.addEventListener('online',resumeRefresh);
 refresh();

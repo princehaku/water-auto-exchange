@@ -13,6 +13,7 @@ from socketserver import ThreadingMixIn
 
 ACTIVE = ('DRAINING', 'SETTLING', 'FILLING')
 COMMANDS = ('START', 'FILL', 'DRAIN', 'STOP', 'RESET')
+ADMIN_SESSION_TTL_SECONDS = 999 * 24 * 60 * 60
 
 
 class Problem(Exception):
@@ -57,6 +58,9 @@ class Store:
             CREATE TABLE IF NOT EXISTS commands (
               id TEXT PRIMARY KEY, command TEXT NOT NULL, created REAL NOT NULL,
               expires REAL NOT NULL, status TEXT NOT NULL, result TEXT, finished REAL);
+            CREATE TABLE IF NOT EXISTS admin_sessions (
+              token_hash TEXT PRIMARY KEY, expires REAL NOT NULL,
+              admin_key_hash TEXT NOT NULL);
         ''')
         # Restart never resurrects commands or claims that old telemetry is live.
         self.db.execute("UPDATE commands SET status='uncertain', result='server_restarted' WHERE status IN ('queued','delivered')")
@@ -64,6 +68,35 @@ class Store:
         self.status, self.seen, self.gateway = None, None, None
         self.gateway_seen = 0
         self.ws_gateway = None
+
+    def prune_admin_sessions(self, admin_key):
+        with self.lock:
+            self.db.execute('DELETE FROM admin_sessions WHERE expires<=? OR admin_key_hash<>?',
+                            (self.clock(), hashlib.sha256(admin_key.encode()).hexdigest()))
+            self.db.commit()
+
+    def create_admin_session(self, admin_key):
+        with self.lock:
+            self.prune_admin_sessions(admin_key)
+            token = secrets.token_urlsafe(32)
+            self.db.execute('INSERT INTO admin_sessions VALUES (?,?,?)',
+                            (hashlib.sha256(token.encode()).hexdigest(),
+                             self.clock() + ADMIN_SESSION_TTL_SECONDS,
+                             hashlib.sha256(admin_key.encode()).hexdigest()))
+            self.db.commit()
+            return token
+
+    def valid_admin_session(self, token, admin_key):
+        with self.lock:
+            return self.db.execute('SELECT 1 FROM admin_sessions WHERE token_hash=? AND expires>? AND admin_key_hash=?',
+                                   (hashlib.sha256(token.encode()).hexdigest(), self.clock(),
+                                    hashlib.sha256(admin_key.encode()).hexdigest())).fetchone() is not None
+
+    def revoke_admin_session(self, token):
+        with self.lock:
+            self.db.execute('DELETE FROM admin_sessions WHERE token_hash=?',
+                            (hashlib.sha256(token.encode()).hexdigest(),))
+            self.db.commit()
 
     def expire(self):
         now = self.clock()
@@ -210,8 +243,9 @@ class Server(ThreadingMixIn, HTTPServer):
 
     def __init__(self, address, store, admin_key, device_key, origin):
         self.store, self.admin_key, self.device_key, self.origin = store, admin_key, device_key, origin
-        self.sessions, self.attempts = {}, []
+        self.attempts = []
         self.auth_lock = threading.Lock()
+        self.store.prune_admin_sessions(admin_key)
         super().__init__(address, Handler)
 
 
@@ -262,9 +296,8 @@ class Handler(BaseHTTPRequestHandler):
             token = cookie['water_session'].value
         except Exception:
             raise Problem(401, 'login_required')
-        with self.server.auth_lock:
-            if self.server.sessions.get(token, 0) < time.time():
-                raise Problem(401, 'login_required')
+        if not self.server.store.valid_admin_session(token, self.server.admin_key):
+            raise Problem(401, 'login_required')
         return token
 
     def route(self):
@@ -300,14 +333,11 @@ class Handler(BaseHTTPRequestHandler):
                 key = data.get('key')
                 if not isinstance(key, str) or not hmac.compare_digest(hashlib.sha256(key.encode()).digest(), hashlib.sha256(self.server.admin_key.encode()).digest()):
                     raise Problem(401, 'invalid_key')
-                self.server.sessions = {k: v for k, v in self.server.sessions.items() if v > now}
-                token = secrets.token_urlsafe(32)
-                self.server.sessions[token] = now + 28800
-            return self.respond(200, dict(ok=True), 'water_session=' + token + '; Path=/water/api/; Secure; HttpOnly; SameSite=Strict; Max-Age=28800')
+                token = self.server.store.create_admin_session(self.server.admin_key)
+            return self.respond(200, dict(ok=True), 'water_session=' + token + '; Path=/water/api/; Secure; HttpOnly; SameSite=Strict; Max-Age=' + str(ADMIN_SESSION_TTL_SECONDS))
         token = self.session()
         if path == '/water/api/logout' and post:
-            with self.server.auth_lock:
-                self.server.sessions.pop(token, None)
+            self.server.store.revoke_admin_session(token)
             return self.respond(200, dict(ok=True), 'water_session=; Path=/water/api/; Secure; HttpOnly; SameSite=Strict; Max-Age=0')
         if path == '/water/api/status' and not post:
             return self.respond(200, self.server.store.snapshot())

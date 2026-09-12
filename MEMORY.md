@@ -1,5 +1,14 @@
 # 项目记忆
 
+## 2026-09-12 最新：网页登录 token 保留 999 天，输出仍待配置
+
+- 用户要求“服务端token保留999天”。网页登录会话从8小时内存保存改为登录后固定999天（86,313,600秒），保存到现有data/water.db的admin_sessions表，正常容器重启和部署后保留。仅存token摘要、到期时间和管理密钥摘要；退出立即撤销当前token，更换管理密钥并重启撤销旧会话。设备密钥、WSS会话/命令时限及板端0.7.3不变，无需刷板。
+- Cookie下发Max-Age=86313600，保留Secure/HttpOnly/SameSite=Strict、Origin校验和登录限频。首次从旧版内存会话升级后须重新登录一次；浏览器保存限制或清理Cookie可要求提前登录，不把服务器999天写成所有浏览器保证保存999天。
+- 54项Python测试及Edge本地HTTP联调通过；新增6项真实HTTP/临时持久库测试覆盖999天精确到期、读取不续期、重启保留、退出撤销跨重启、其他登录不受影响、数据库摘要不能登录、管理密钥轮换及过期清理。本轮未修改Lua，不重复上一轮166项Lua测试，也未发送实物开关命令。
+- 已部署，备份`/apps/water-auto-exchange/backups/20260912T084221Z-3796865`，容器healthy。真实公网HTTPS验证999天Cookie/数据库截止时间、认证status、退出后401，water及sms健康200；测试登录已退出，未注册模拟设备或发送控制命令。首次SSH握手中断发生在远端变更前，重试部署成功。
+- 用户随后报告网页曾显示在线、最近通信16:41:12，并贴出16:42:05 TLS成功（2220ms）、WS升级成功后认证阶段断开。该段不能称为TLS连接超时，具体关闭原因仍未证实；服务端通用关闭日志无法区分认证、旧会话占用及帧错误。此次部署约16:42:27停止旧容器，新容器启动于16:42:33.554，不能据此解释16:42:05的断开，也不能把曾在线当作稳定在线。
+- 用户问在线为什么不能补水/放水：实板0.7.3仍UNCONFIGURED/mapping_not_confirmed/ready=0/outputs_known=0，src/water_config.lua的enabled/mapping_confirmed/wiring_confirmed为false，两路GPIO及on/off电平为nil。网页按该状态禁用开水是当前设计；manual不需要液位或水流设备。用户已明确用途：补水接顶部DO2，排水接出纸电机口。用途确认不等于GPIO/电平确认：GPIO23为DO2强候选，GPIO5拉高时出纸口约6.1V；历史DO2高低均约12V、STOP后约0V仍不能证明低电平关断。已询问是否两路实测高开低关，未收到新测量前保持未配置。未恢复被Escape停止的computer-use或修改GPIO。
+
 ## 2026-09-12 最新：用户要求证书与短信项目一致，0.7.3
 
 - 已通过computer-use刷新项目列表、选water-online-0.7.3并点击下载脚本，16:29:47.736工具报告下载成功（保留CORE）。随后COM4实读0.7.3/manual/UNCONFIGURED；临时打包脚本版本、enabled=true、long_connection_cert=nil及私有密钥匹配均核对通过。

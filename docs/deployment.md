@@ -9,7 +9,7 @@
 | 应用源码 / 镜像构建 | `server/`、`deploy/Dockerfile` |
 | 网页 | `www/water/` |
 | 私有配置 | `config/water.env`，root 600 |
-| 数据库 | `data/water.db`，容器挂载到 `/data` |
+| 数据库 | `data/water.db`，容器挂载到 `/data`；包含操作记录与有效期 999 天的管理员会话摘要 |
 | Nginx 项目配置 | `config/nginx-water.conf` |
 | Docker 二进制、引擎数据与服务定义 | `runtime/` |
 | 备份 | `backups/`，目录权限 700 |

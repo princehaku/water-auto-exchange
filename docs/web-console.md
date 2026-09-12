@@ -44,7 +44,9 @@ DRAIN要求板端0.6.0，旧版显示“更新设备后可用”，API及USB网�
 
 ## 管理员登录
 
-服务器凭据集中保存在 `/apps/water-auto-exchange/config/water.env`，Docker 迁移保留已有两个独立密钥：`WATER_ADMIN_KEY` 用于网页登录，`WATER_DEVICE_KEY` 用于设备认证。该文件权限为 600，禁止提交 Git。管理会话有效期 8 小时，Cookie 使用 Secure / HttpOnly / SameSite=Strict；变更请求校验 Origin。登录入口每分钟最多 10 次尝试。
+服务器凭据集中保存在 `/apps/water-auto-exchange/config/water.env`，Docker 迁移保留已有两个独立密钥：`WATER_ADMIN_KEY` 用于网页登录，`WATER_DEVICE_KEY` 用于设备认证。该文件权限为 600，禁止提交 Git。网页登录 token 的服务端有效期为登录后 **999 天（86,313,600 秒）**，固定到期，不因轮询状态而延长。会话摘要及到期时间持久化到 `data/water.db` 的 `admin_sessions` 表，正常部署和容器重启后保留；数据库不保存可直接登录的明文 token。退出登录立即撤销当前 token；更换管理密钥并重启后撤销旧密钥下的所有会话。
+
+Cookie 下发 `Max-Age=86313600`，继续使用 Secure / HttpOnly / SameSite=Strict；浏览器自身的保存限制或清理 Cookie 可能要求提前登录。变更请求校验 Origin，登录入口每分钟最多 10 次尝试。首次从旧版内存会话升级后需重新登录一次，新会话才具有上述持久化和有效期。设备密钥的有效期及设备命令时限不受此修改影响。
 
 本轮提供的本地登录说明位于被 Git 忽略的 `build/console-access.private.txt`，设备配置位于 `build/device.private.json`。这些文件含凭据，请勿分享或提交；聊天记录和日志不打印密钥。
 

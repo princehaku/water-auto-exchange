@@ -23,7 +23,7 @@ class Problem(Exception):
 def validate_status(value):
     if not isinstance(value, dict):
         raise Problem(400, 'invalid_status')
-    if value.get('project') != 'water_auto_exchange' or value.get('version') not in ('0.3.0', '0.4.0', '0.5.0', '0.5.1', '0.5.2', '0.5.3', '0.6.0'):
+    if value.get('project') != 'water_auto_exchange' or value.get('version') not in ('0.3.0', '0.4.0', '0.5.0', '0.5.1', '0.5.2', '0.5.3', '0.6.0', '0.7.0'):
         raise Problem(409, 'firmware_mismatch')
     if value.get('state') not in ('UNCONFIGURED', 'IDLE', 'DONE', 'FAULT') + ACTIVE:
         raise Problem(400, 'invalid_state')
@@ -39,6 +39,10 @@ def validate_status(value):
             raise Problem(400, 'invalid_flag')
     if result['need_fill'] not in ('0', '1', 'unknown') or not result['cycle'].isdigit():
         raise Problem(400, 'invalid_level_or_cycle')
+    if result['version'] == '0.7.0':
+        if value.get('control_mode') not in ('manual', 'automatic'):
+            raise Problem(400, 'invalid_control_mode')
+        result['control_mode'] = value['control_mode']
     return result
 
 
@@ -89,12 +93,14 @@ class Store:
             if not self.online():
                 raise Problem(409, 'device_offline')
             s = self.status
-            if command == 'DRAIN' and s['version'] != '0.6.0':
+            if command == 'DRAIN' and s['version'] not in ('0.6.0', '0.7.0'):
                 raise Problem(409, 'firmware_upgrade_required')
+            if command == 'START' and s.get('control_mode') == 'manual':
+                raise Problem(409, 'automatic_mode_required')
             if command in ('START', 'FILL', 'DRAIN'):
                 if s['ready'] != '1' or s['outputs_known'] != '1' or s['overflow'] != '0' or s['state'] not in ('IDLE', 'DONE'):
                     raise Problem(409, 'device_not_ready')
-                if s['need_fill'] != ('1' if command == 'FILL' else '0'):
+                if s.get('control_mode') != 'manual' and s['need_fill'] != ('1' if command == 'FILL' else '0'):
                     raise Problem(409, 'level_not_ready')
             if command == 'RESET' and s['state'] != 'FAULT':
                 raise Problem(409, 'not_faulted')

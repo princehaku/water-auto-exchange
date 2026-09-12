@@ -35,11 +35,11 @@ class WebSocketTests(unittest.TestCase):
             time.sleep(.01)
         self.store.db.close()
 
-    def connect(self, auth=True):
+    def connect(self, auth=True, status=None):
         client = websocket.create_connection('ws://127.0.0.1:%d/water/api/device/ws' % self.server.server_port, timeout=2)
         self.clients.append(client)
         if auth:
-            client.send(json.dumps(dict(type='auth', key='b'*32, status=STATUS)))
+            client.send(json.dumps(dict(type='auth', key='b'*32, status=status or STATUS)))
             self.assertEqual(json.loads(client.recv())['type'], 'ready')
         return client
 
@@ -62,6 +62,18 @@ class WebSocketTests(unittest.TestCase):
         c.send(json.dumps(dict(type='auth', key='a'*32, status=STATUS)))
         self.assertEqual(c.recv(), '')
         self.assertFalse(self.store.snapshot()['online'])
+
+    def test_manual_switch_command_and_state_roundtrip(self):
+        status=dict(STATUS,version='0.7.0',control_mode='manual',need_fill='unknown')
+        c=self.connect(status=status)
+        self.store.enqueue('DRAIN','5'*32)
+        offer=json.loads(c.recv());self.assertEqual(offer['command'],'DRAIN')
+        c.send(json.dumps(dict(type='claim',id=offer['id'])))
+        self.assertEqual(json.loads(c.recv())['command'],'DRAIN')
+        c.send(json.dumps(dict(type='ack',ack=dict(id=offer['id'],status='succeeded',result='OK DRAIN drain_started'),status=dict(status,state='DRAINING',drain='1'))))
+        self.assertEqual(json.loads(c.recv())['type'],'received')
+        self.assertEqual(self.store.snapshot()['device']['control_mode'],'manual')
+        self.assertEqual(self.store.snapshot()['device']['need_fill'],'unknown')
 
     def test_probe_does_not_create_device_or_commands(self):
         c = self.connect(False)

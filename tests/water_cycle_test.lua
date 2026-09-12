@@ -315,6 +315,37 @@ test("a full exchange after independent drain still includes refilling", functio
     state(c, "SETTLING"); c:update(500, true, false); state(c, "FILLING", true)
 end)
 
+test("manual fill and drain run without water levels until explicitly stopped", function()
+    for _, method in ipairs({"start_fill", "start_drain"}) do
+        local c = fixture({mode="manual"})
+        c:update(0, nil, false); c:update(100, nil, false)
+        equal(c:status().need_fill, nil)
+        equal(c:start(100), false, "automatic START is unavailable")
+        assert(c[method](c, 100))
+        local target = method == "start_fill" and "FILLING" or "DRAINING"
+        c:update(200, true, false); c:update(400, false, false)
+        state(c, target, target == "FILLING", target == "DRAINING")
+        equal(c:status().need_fill, nil, "never invent a water level")
+        equal(c[method == "start_fill" and "start_drain" or "start_fill"](c,400), false)
+        assert(c:stop()); c:update(10000, nil, false); state(c, "IDLE")
+    end
+end)
+
+test("manual switches retain timeout and optional overflow shutdown", function()
+    for _, method in ipairs({"start_fill", "start_drain"}) do
+        for _, overflow in ipairs({false, true}) do
+            local c = fixture({mode="manual"})
+            c:update(0,nil,false); c:update(100,nil,false); assert(c[method](c,100))
+            c:update(overflow and 200 or 1100, nil, overflow)
+            state(c,"FAULT"); equal(c:stop(),false)
+            c:update(1200,nil,false); equal(c:reset(1200),not overflow)
+            c:update(1300,nil,false)
+            if overflow then assert(c:reset(1300)) end
+            state(c,"IDLE")
+        end
+    end
+end)
+
 local failures = 0
 for _, item in ipairs(tests) do
     local ok, reason = pcall(item[2])

@@ -19,6 +19,7 @@ end
 
 function M.validate(config)
     if type(config) ~= "table" then return false, "missing_config" end
+    if config.mode ~= nil and config.mode ~= "manual" and config.mode ~= "automatic" then return false, "invalid_mode" end
     if config.mapping_confirmed ~= true then return false, "mapping_not_confirmed" end
     if config.wiring_confirmed ~= true then return false, "wiring_not_confirmed" end
     if config.enabled ~= true then return false, "disabled" end
@@ -47,7 +48,7 @@ function M.validate(config)
     end
     for _, name in ipairs({"need_fill", "overflow"}) do
         local item = config.inputs[name]
-        if name ~= "overflow" or item.enabled then
+        if (name == "need_fill" and config.mode ~= "manual") or (name == "overflow" and item.enabled) then
             local ok, reason = pin(item, name)
             if not ok then return ok, reason end
             if not level(item.active_level) then return false, "invalid_input_level_" .. name end
@@ -64,7 +65,10 @@ end
 function M.new(config, dependencies)
     local cfg, deps = copy(config), dependencies or {}
     local valid, config_reason = M.validate(cfg)
-    local engine = cycle.new(valid and cfg.timing or nil)
+    local manual = type(cfg) == "table" and cfg.mode == "manual"
+    local timing = copy(valid and cfg.timing or {}) or {}
+    timing.mode = manual and "manual" or "automatic"
+    local engine = cycle.new(timing)
     local self = {}
     local initialized, running = false, false
     local sys, pins, pin_api, tick_fn, pio_api
@@ -165,7 +169,9 @@ function M.new(config, dependencies)
 
     local function sample()
         local ok, t, need_fill, overflow = pcall(function()
-            return now(), read("need_fill"), cfg.inputs.overflow.enabled and read("overflow") or false
+            local t, level = now(), nil
+            if not manual then level = read("need_fill") end
+            return t, level, cfg.inputs.overflow.enabled and read("overflow") or false
         end)
         if not ok then
             -- A recovered input must complete debounce again before RESET.
@@ -235,7 +241,7 @@ function M.new(config, dependencies)
             end
             for _, name in ipairs({"need_fill", "overflow"}) do
                 local item = cfg.inputs[name]
-                if name ~= "overflow" or item.enabled then
+                if (name == "need_fill" and not manual) or (name == "overflow" and item.enabled) then
                     local pulls = { UP = "PULLUP", DOWN = "PULLDOWN", NONE = "NOPULL" }
                     local pull = pio_api[pulls[item.pull]]
                     assert(pull ~= nil, "pull_api_unavailable")
@@ -301,6 +307,7 @@ function M.new(config, dependencies)
 
     function self.status()
         local s = engine:status()
+        s.control_mode = manual and "manual" or "automatic"
         if not valid then s.state, s.reason = "UNCONFIGURED", config_reason end
         if io_error then s.reason = s.reason .. ";" .. io_error end
         s.ready = initialized and running and s.state ~= "FAULT" and s.inputs_ready == true

@@ -524,6 +524,32 @@ test("DRAIN is refused without confirmed mapping and makes zero I/O calls", func
     equal(#h.events, 0)
 end)
 
+test("manual config requires only outputs and never configures or reads level GPIO", function()
+    local cfg=config(); cfg.mode="manual"; cfg.inputs.need_fill=nil
+    local h=fixture(cfg); h.on_read=function() error("unexpected_sensor_read") end
+    assert(h.controller.init()); h.poll(100)
+    equal(h.controller.status().control_mode,"manual")
+    equal(h.controller.status().need_fill,nil)
+    assert(h.controller.fill()); state(h,"FILLING",true)
+    equal(h.controller.drain(),false)
+    h.poll(100); assert(h.controller.stop()); state(h,"IDLE")
+    assert(h.controller.drain()); state(h,"DRAINING",false,true)
+    h.poll(100); assert(h.controller.stop()); h.poll(1000); state(h,"IDLE")
+    equal(h.reads,0)
+    for _, e in ipairs(h.events) do assert(e.kind~="input_setup") end
+end)
+
+test("manual config still validates outputs and monitors an enabled overflow input", function()
+    local cfg=config(); cfg.mode="manual"; cfg.inputs.need_fill=nil
+    cfg.outputs.fill.gpio=nil; equal(water.validate(cfg),false)
+    cfg.outputs.fill.gpio=5; cfg.mode="typo"; equal(water.validate(cfg),false)
+    cfg.mode="manual"; cfg.inputs.overflow.enabled=true
+    local h=fixture(cfg); assert(h.controller.init()); h.poll(100)
+    assert(h.controller.fill()); h.sensor("overflow",true); h.poll(100)
+    state(h,"FAULT"); equal(h.controller.reset(),false)
+    for _, e in ipairs(h.events) do if e.kind=="read" then equal(e.gpio,11) end end
+end)
+
 local failures = 0
 for _, item in ipairs(tests) do
     local ok, reason = pcall(item[2])

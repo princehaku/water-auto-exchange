@@ -68,7 +68,7 @@ function methods:update(now, need_fill, overflow)
         self.overflow = true
         self:fault("overflow")
     end
-    if type(need_fill) ~= "boolean" or type(overflow) ~= "boolean" then
+    if (self.mode ~= "manual" and type(need_fill) ~= "boolean") or type(overflow) ~= "boolean" then
         invalidate_samples(self)
         return self:fault("invalid_input")
     end
@@ -78,6 +78,21 @@ function methods:update(now, need_fill, overflow)
         self.clear_since = nil
     elseif self.clear_since == nil then
         self.clear_since = now
+    end
+    if self.mode == "manual" then
+        -- No synthetic water level: only optional overflow and output deadlines.
+        self.need_fill = nil
+        self.inputs_ready = not overflow and self.clear_since ~= nil
+            and now - self.clear_since >= self.settings.debounce_ms
+        if self.state == "FAULT" then return false, self.reason end
+        if self.state == "DRAINING" and now - self.phase_since >= self.settings.drain_timeout_ms then
+            return self:fault("drain_timeout")
+        elseif self.state == "FILLING" and now - self.phase_since >= self.settings.fill_timeout_ms then
+            return self:fault("fill_timeout")
+        elseif self.state == "IDLE" and self.reason == "waiting_for_inputs" and self.inputs_ready then
+            self.reason = "ready"
+        end
+        return true, self.reason
     end
     if self.candidate == nil or need_fill ~= self.candidate then
         self.candidate, self.candidate_since = need_fill, now
@@ -137,6 +152,7 @@ end
 function methods:start(now)
     local ok, reason = can_start(self, now)
     if not ok then return false, reason end
+    if self.mode == "manual" then return false, "automatic_mode_required" end
     if self.need_fill ~= false then return false, "level_not_ready" end
     self.drain_only = false
     self.cycle = self.cycle + 1
@@ -148,20 +164,20 @@ end
 function methods:start_drain(now)
     local ok, reason = can_start(self, now)
     if not ok then return false, reason end
-    if self.need_fill ~= false then return false, "level_not_ready" end
+    if self.mode ~= "manual" and self.need_fill ~= false then return false, "level_not_ready" end
     self.drain_only = true
     self.cycle = self.cycle + 1
-    enter(self, "DRAINING", "flushing", now)
+    enter(self, "DRAINING", self.mode == "manual" and "manual_draining" or "flushing", now)
     return true, "drain_started"
 end
 
 function methods:start_fill(now)
     local ok, reason = can_start(self, now)
     if not ok then return false, reason end
-    if self.need_fill ~= true then return false, "fill_not_requested" end
+    if self.mode ~= "manual" and self.need_fill ~= true then return false, "fill_not_requested" end
     self.drain_only = false
     self.cycle = self.cycle + 1
-    enter(self, "FILLING", "filling", now)
+    enter(self, "FILLING", self.mode == "manual" and "manual_filling" or "filling", now)
     return true, "fill_started"
 end
 
@@ -195,6 +211,8 @@ end
 function M.new(config)
     if config == nil then config = {} end
     assert(type(config) == "table", "invalid_config")
+    local mode = config.mode == nil and "automatic" or config.mode
+    assert(mode == "manual" or mode == "automatic", "invalid_mode")
     local settings = {}
     for key, value in pairs(defaults) do
         if config[key] ~= nil then value = config[key] end
@@ -204,7 +222,7 @@ function M.new(config)
         settings[key] = value
     end
     return setmetatable({
-        settings = settings, state = "IDLE", reason = "waiting_for_inputs",
+        settings = settings, mode = mode, state = "IDLE", reason = "waiting_for_inputs",
         fill = false, drain = false, overflow = false,
         inputs_ready = false, cycle = 0
     }, { __index = methods })

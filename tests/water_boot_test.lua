@@ -52,7 +52,7 @@ local function fixture(real_controller)
             f.trace = true
         end}
     end
-    _G.PROJECT, _G.VERSION = "water_auto_exchange", "0.6.0"
+    _G.PROJECT, _G.VERSION = "water_auto_exchange", "0.7.0"
     _G.uart = {
         USB = 0x81, PAR_NONE = 0, STOP_1 = 1,
         setup = function(id, baud, bits, parity, stop)
@@ -147,7 +147,7 @@ test("fragmented STATUS is read-only and unknown water level is explicit", funct
     f.feed("STA")
     equal(#f.replies, 1)
     f.feed("TUS\r")
-    contains(f.replies[2], "OK STATUS project=water_auto_exchange version=0.6.0")
+    contains(f.replies[2], "OK STATUS project=water_auto_exchange version=0.7.0")
     contains(f.replies[2], "ready=0 fill=0 drain=0 outputs_known=0 need_fill=unknown")
     f.feed("\n")
     equal(#f.replies, 2, "CRLF must yield one reply")
@@ -264,7 +264,7 @@ test("boot prints immediately and every 5 seconds without starting outputs", fun
     local f = fixture()
     f.boot()
     equal(PROJECT, "water_auto_exchange")
-    equal(VERSION, "0.6.0")
+    equal(VERSION, "0.7.0")
     equal(f.sys_init[1], 0)
     equal(f.sys_init[2], 0)
     equal(f.sys_run, true)
@@ -275,7 +275,7 @@ test("boot prints immediately and every 5 seconds without starting outputs", fun
     equal(f.calls.start, nil)
     equal(f.calls.fill, nil)
     equal(f.gpio_calls, 0)
-    contains(table.concat(f.logs), "WATER STATUS project=water_auto_exchange version=0.6.0")
+    contains(table.concat(f.logs), "WATER STATUS project=water_auto_exchange version=0.7.0")
     equal(#f.timers, 1)
     equal(f.timers[1].ms, 5000)
     local replies, status_calls = #f.replies, f.calls.status

@@ -1,6 +1,14 @@
-> 2026-09-12：当前源码0.6.0，支持独立补水和冲水，保留完整换水。真实板端0.5.3/UNCONFIGURED已确认，等待移动网络；版本核对与9项下载清单以 [Web与4G接入](web-console.md) 为准。
+> 当前源码0.7.0，默认手动开关，不要求传感器或水流验证。后面的液位流程仅用于未来automatic模式。
 
-# 自动换水控制（0.6.0）
+# 手动开关控制（0.7.0）
+
+当前默认 `water_config.mode="manual"`。确认两路输出GPIO和启停电平后，FILL打开补水、DRAIN打开冲水，STOP关闭。没有水位传感器也可以使用，need_fill引脚不会被初始化或读取，状态报告为unknown。不能在一路开启时直接开启另一路，先STOP关闭即可切换。
+
+手动模式保留单次120秒超时，可按实际用途调整timing中的fill_timeout_ms/drain_timeout_ms；超时会关闭并锁存FAULT。可选overflow启用时仍受监测；未启用时不需要任何输入引脚。远程活动连接失联会尝试停止输出。RESET只复位，不重新打开。
+
+网页开关和设备回报同步，按同一开关第二次会发送STOP。此阶段只验收软件开关和命令逻辑，不要求实际水流验证。当前生成包是0.7.0，下载清单仍为8Lua+CA，见[Web与4G接入](web-console.md)。
+
+## 自动液位控制参考（需显式配置mode=automatic）
 
 当前应用为 `water_auto_exchange 0.6.0`，使用既有 Air724UG V4035 FLOAT / LuaTask V2.4.4。本地USB控制无需SIM或网络，网页控制需4G联网；通过命令启动一轮，重启后待机，不恢复未完成的换水。还未加入定时计划或持续自动补水。
 
@@ -86,6 +94,6 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\water-command.ps1 -P
 
 ## 下载与验证边界
 
-LuaTools选择water-online-0.6.0项目，使用build/firmware/flash-files.txt中的完整8个Lua文件和1个CA证书，保留既有CORE、默认库及USB trace。准备与验证步骤见[Web与4G接入](web-console.md)。旧water-exchange的5文件清单不包含网络功能，不能用于当前联网版本。用户已授权助手刷写；执行工具不可用时不能宣称已下载。
+LuaTools选择water-online-0.7.0项目，使用build/firmware/flash-files.txt中的完整8个Lua文件和1个CA证书，保留既有CORE、默认库及USB trace。准备与验证步骤见[Web与4G接入](web-console.md)。旧water-exchange的5文件清单不包含网络功能，不能用于当前联网版本。用户已授权助手刷写；执行工具不可用时不能宣称已下载。
 
-本地测试覆盖控制逻辑、故障、单独冲水不自动补水及端到端命令交付。所有GPIO测试都是模拟，真实板端仍为0.5.3/UNCONFIGURED，0.6.0和实际泵、探针尚未验证。
+本地测试覆盖控制逻辑、故障、单独冲水不自动补水及端到端命令交付。所有GPIO测试都是模拟，真实板端仍为0.5.3/UNCONFIGURED，0.7.0尚未刷入；实际泵、探针测试不在本阶段范围内。

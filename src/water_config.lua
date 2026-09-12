@@ -1,10 +1,13 @@
--- Automatic water exchange using one hysteretic liquid-level relay.
+-- Manual water switches; optional automatic mode uses a liquid-level relay.
 -- Set the wiring and measured active/OFF levels before enabling real outputs.
 return {
+    -- Manual switches need only confirmed outputs; no level sensor is required.
+    -- Set automatic only when the level feedback is installed and verified.
+    mode = "manual",
     enabled = false,
     mapping_confirmed = false,
-    -- Confirm: isolated input, working level board, and fill cannot run while
-    -- fill permission is OFF (the level board must not bypass this interlock).
+    -- Confirm output wiring and OFF behavior. Automatic mode additionally
+    -- requires isolated level feedback and no bypass of the fill permission.
     wiring_confirmed = false,
 
     outputs = {

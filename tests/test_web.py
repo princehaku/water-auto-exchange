@@ -57,6 +57,33 @@ class StoreTests(unittest.TestCase):
         with self.assertRaises(Problem):
             self.command()
 
+    def test_manual_switches_allow_unknown_water_level_and_preserve_interlock(self):
+        self.online(version='0.7.0', control_mode='manual', need_fill='unknown')
+        with self.assertRaises(Problem):
+            self.command('START')
+        self.assertEqual(self.command('FILL')['command'], 'FILL')
+        self.online(version='0.7.0', control_mode='manual', need_fill='unknown')
+        active=dict(STATUS,version='0.7.0',control_mode='manual',need_fill='unknown',state='FILLING',fill='1')
+        self.store.poll(GATEWAY,active,dict(id='{:032x}'.format(1),status='succeeded',result='OK FILL fill_started'))
+        with self.assertRaises(Problem):
+            self.command('DRAIN',2)
+        self.assertEqual(self.command('STOP',3)['command'],'STOP')
+        self.store.poll(GATEWAY,active)
+        off=dict(active,state='IDLE',fill='0')
+        self.store.poll(GATEWAY,off,dict(id='{:032x}'.format(3),status='succeeded',result='OK STOP stopped'))
+        self.assertEqual(self.command('DRAIN',4)['command'],'DRAIN')
+
+    def test_manual_mode_is_explicit_and_legacy_cannot_bypass_level_checks(self):
+        for mode in (None,'typo',True):
+            with self.assertRaises(Problem):
+                self.online(version='0.7.0',control_mode=mode)
+        self.online(version='0.6.0',control_mode='manual',need_fill='unknown')
+        with self.assertRaises(Problem):
+            self.command('FILL')
+        self.online(version='0.7.0',control_mode='manual',need_fill='unknown',state='UNCONFIGURED',ready='0')
+        with self.assertRaises(Problem):
+            self.command('FILL')
+
     def test_drain_requires_new_firmware_and_independent_delivery(self):
         self.online(version='0.5.3')
         with self.assertRaises(Problem) as error:

@@ -23,6 +23,7 @@ function M.format_status(state)
         .. " overflow=" .. flag(state.overflow)
         .. " cycle=" .. token(state.cycle or 0)
         .. " overflow_protection=" .. flag(state.overflow_protection)
+        .. " control_mode=" .. token(state.control_mode or "automatic")
 end
 
 function M.start(controller)

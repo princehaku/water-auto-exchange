@@ -38,11 +38,12 @@ test("socket operations may yield in the owner coroutine",function()
         send=function(_,value) sent[#sent+1]=value;return coroutine.yield("SEND") end,
         recv=function() return coroutine.yield("RECV") end,
         close=function() coroutine.yield("CLOSE") end}
-    local sys={taskInit=function(fn) co=coroutine.create(fn);return co end,publish=function() end,wait=function(ms) coroutine.yield("WAIT",ms) end}
+    local sys={subscribe=function() end,taskInit=function(fn) co=coroutine.create(fn);return co end,publish=function() end,wait=function(ms) coroutine.yield("WAIT",ms) end}
     local client
     client=ws.new({url="wss://example.test/water/api/device/ws",device_key=string.rep("k",32),ca_cert="water-ca.crt"},{
         open=function() opened=true;assert(client:send("queued")) end,
         message=function(value) received=value end,close=function() closed=true end},{sys=sys,
+        link={shut=function() end},net={getState=function() return "REGISTERED" end},ril={request=function() end},
         socket={isReady=function() return true end,tcp=function(_,cert) assert(cert.insist==0 and cert.hostNameFlag==1);return io end},
         crypto={sha1=function() return string.rep("0",40) end,base64_encode=function(_,size) return "base64_"..size end}})
     local function resume(expected,...)
@@ -57,18 +58,28 @@ test("socket operations may yield in the owner coroutine",function()
     io.connect=function() error("injected owner failure") end
     local ok=coroutine.resume(co);assert(not ok and client:failed())
 end)
-local function timed_fixture()
-    local f={tick=0,opened=false}
+local function timed_fixture(options)
+    options=options or {}
+    local f={tick=options.tick or 0,opened=false,ready=options.ready~=false,registered=options.registered or "REGISTERED",recoveries={},closed=0,queries={},subscriptions={}}
     _G.rtos={tick=function() return f.tick end}
     local io={connect=function() return coroutine.yield("CONNECT") end,
         send=function() return coroutine.yield("SEND") end,
         recv=function() return coroutine.yield("RECV") end,
-        close=function() coroutine.yield("CLOSE") end}
+        close=function() f.socket_closed=true;coroutine.yield("CLOSE") end}
     local sys={taskInit=function(fn) f.co=coroutine.create(fn);return f.co end,
+        subscribe=function(event,fn) f.subscriptions[event]=fn end,
         publish=function() end,wait=function(ms) coroutine.yield("WAIT",ms) end}
     f.client=ws.new({url="wss://example.test/water/api/device/ws",device_key=string.rep("k",32),ca_cert="water-ca.crt"},
-        {open=function() f.opened=true end},{sys=sys,
-        socket={isReady=function() return true end,tcp=function() return io end},
+        {open=function() f.opened=true end,close=function() f.closed=f.closed+1 end},{sys=sys,
+        link={shut=function()
+            assert(not f.client.connected and #f.client.queue==0)
+            if f.opened then assert(f.closed>0 and f.socket_closed) end
+            f.recoveries[#f.recoveries+1]=f.tick
+            f.ready=false;f.subscriptions.IP_ERROR_IND()
+        end},
+        net={getState=function() return f.registered end},
+        ril={request=function(cmd,_,cb) f.queries[#f.queries+1]=cmd;if cb then f.diagnostic_done=cb end end},
+        socket={isReady=function() return f.ready end,tcp=function() if not options.no_socket then return io end end},
         crypto={sha1=function() return string.rep("0",40) end,base64_encode=function(_,size) return "base64_"..size end}})
     function f.resume(expected,...)
         local ok,phase,value=coroutine.resume(f.co,...)
@@ -79,7 +90,7 @@ local function timed_fixture()
         f.resume("RECV",true,"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: base64_20\r\n\r\n")
         assert(f.opened)
     end
-    f.client:start();f.resume("CONNECT")
+    f.client:start();f.resume((options.ready==false or options.no_socket) and "WAIT" or "CONNECT")
     return f
 end
 
@@ -98,4 +109,86 @@ test("backoff resets only after 60 real seconds online",function()
         assert(f.resume("WAIT")==(ticks==12000 and 1000 or 2000))
     end
 end)
+test("retries indefinitely with capped exponential delays and throttled PDP recovery",function()
+    local f=timed_fixture()
+    for attempt,delay in ipairs({1000,2000,4000,8000,16000,32000,60000,60000,60000,60000,60000,60000,60000}) do
+        f.resume("CLOSE",false);assert(f.closed==attempt)
+        assert(f.resume("WAIT")==delay)
+        if attempt==6 then assert(#f.recoveries==1) end
+        if attempt==11 then assert(#f.recoveries==1) end
+        if attempt==12 then assert(#f.recoveries==2) end
+        if attempt==13 then assert(#f.recoveries==2) end
+        f.tick=f.tick+delay/5;f.ready=true;f.resume("CONNECT")
+    end
+end)
+
+test("no IP for 120 seconds recovers bearer once and enforces five minute cooldown",function()
+    local f=timed_fixture({ready=false})
+    f.tick=23999;f.resume("WAIT");assert(#f.recoveries==0)
+    f.tick=24000;f.resume("WAIT");assert(#f.recoveries==1)
+    f.tick=83999;f.resume("WAIT");assert(#f.recoveries==1)
+    f.tick=84000;f.resume("WAIT");assert(#f.recoveries==2)
+    f.ready=true;f.resume("CONNECT");f.upgrade()
+end)
+
+test("unregistered network waits without resetting radio or creating sockets",function()
+    local f=timed_fixture({ready=false,registered="UNREGISTER"})
+    for i=1,10 do f.tick=i*120000;assert(f.resume("WAIT")==1000) end
+    assert(#f.recoveries==0 and not f.opened)
+    f.registered="REGISTERED";f.resume("WAIT");assert(#f.recoveries==1)
+    f.ready=true;f.resume("CONNECT");f.upgrade()
+end)
+
+test("diagnostic queries are read only rate limited and cannot pile up on a stalled AT channel",function()
+    local f=timed_fixture({ready=false,registered="UNREGISTER"})
+    assert(table.concat(f.queries,",")=="AT+CPIN?,AT+CREG?,AT+CGREG?,AT+CEREG?,AT+CSQ")
+    for i=1,10 do f.tick=i*12000;f.resume("WAIT") end
+    assert(#f.queries==5)
+    f.diagnostic_done(nil,true,nil,"+CSQ: 11,99")
+    for _=1,5 do f.resume("WAIT") end
+    assert(#f.queries==10)
+    f.diagnostic_done(nil,false,nil,nil)
+    f.tick=f.tick+11999
+    for _=1,5 do f.resume("WAIT") end
+    assert(#f.queries==10)
+    f.tick=f.tick+1
+    for _=1,5 do f.resume("WAIT") end
+    assert(#f.queries==15)
+end)
+
+test("IP loss immediately closes application session before blocking socket cleanup",function()
+    local f=timed_fixture();f.upgrade();assert(f.client:send("old-command"))
+    f.ready=false;f.subscriptions.IP_ERROR_IND()
+    assert(f.closed==1 and not f.client.connected and #f.client.queue==0 and not f.socket_closed)
+    f.resume("CLOSE",false,"closed");f.resume("WAIT")
+    f.ready=true;f.resume("CONNECT");f.upgrade();assert(#f.client.queue==0)
+end)
+
+test("IP loss resets backoff only if the connection was already stable at loss",function()
+    for _,ticks in ipairs({11999,12000}) do
+        local f=timed_fixture();f.resume("CLOSE",false);f.resume("WAIT")
+        f.resume("CONNECT");f.upgrade();f.tick=ticks
+        f.subscriptions.IP_ERROR_IND();f.tick=f.tick+1000
+        f.resume("CLOSE",false,"closed")
+        assert(f.resume("WAIT")== (ticks==12000 and 1000 or 2000))
+    end
+end)
+
+test("permanent stop never retries or recovers after pending connect returns",function()
+    local f=timed_fixture();f.client:close(true);f.resume("CLOSE",false);f.resume(nil)
+    assert(coroutine.status(f.co)=="dead" and not f.client:failed() and #f.recoveries==0)
+end)
+
+test("socket allocation failure follows retry policy instead of terminating task",function()
+    local f=timed_fixture({no_socket=true})
+    assert(f.closed==1);assert(f.resume("WAIT")==2000);assert(f.closed==2 and not f.client:failed())
+end)
+
+test("PDP timeout and recovery cooldown handle raw tick wrap",function()
+    local f=timed_fixture({ready=false,tick=4294967000})
+    f.tick=(f.tick+24000)%4294967296;f.resume("WAIT");assert(#f.recoveries==1)
+    f.tick=(f.tick+59999)%4294967296;f.resume("WAIT");assert(#f.recoveries==1)
+    f.tick=f.tick+1;f.resume("WAIT");assert(#f.recoveries==2)
+end)
+
 print("water_ws_transport: "..count.." tests passed")

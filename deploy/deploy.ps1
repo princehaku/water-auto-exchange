@@ -9,7 +9,7 @@ $buildDir = Join-Path $projectRoot "build"
 New-Item -ItemType Directory -Force $buildDir | Out-Null
 $bundle = Join-Path $buildDir "water-deploy.tar.gz"
 $remote = "${SshUser}@${ServerHost}"
-& tar -czf $bundle --exclude=__pycache__ --exclude=*.pyc -C $projectRoot deploy server docs/deployment.md docs/web-console.md README.md MEMORY.md AGENTS.md
+& tar -czf $bundle --exclude=__pycache__ --exclude=*.pyc -C $projectRoot deploy server docs/deployment.md docs/web-console.md docs/network-recovery.md README.md MEMORY.md AGENTS.md
 if ($LASTEXITCODE -ne 0) { throw "Archive failed" }
 & ssh -p $SshPort $remote "mkdir -p /apps/water-auto-exchange"
 if ($LASTEXITCODE -ne 0) { throw "Remote directory setup failed" }

@@ -24,7 +24,7 @@ local function fixture()
         sys={timerLoopStart=function(fn) f.step=fn; return 1 end},
         transport={new=function(_,callbacks) f.callbacks=callbacks; return f.client end},
         json={encode=function(value) return value end,decode=function() if f.decode_fail then error("decode") end; return f.decoded end},
-        usb={format_status=function() return "project=water_auto_exchange version=0.7.0 state="..f.state end},
+        usb={format_status=function() return "project=water_auto_exchange version=0.7.1 state="..f.state end},
         read_cert=function() return f.no_cert and "" or "-----BEGIN CERTIFICATE-----" end}
     -- Ordinary messages use fake JSON tokens; auth concatenation needs strings.
     local serial=0
@@ -101,6 +101,18 @@ test("duplicate command never repeats",function() local f=fixture();f.connect();
 test("USB stop invalidates pending execute",function() local f=fixture();f.connect();f.offer("START");f.controller.stop();f.execute("START");assert(#f.calls==1 and f.closed) end)
 test("STOP offer invalidates prior claim",function() local f=fixture();f.connect();f.offer("START");f.offer("STOP",string.rep("c",32));f.execute("START");assert(#f.calls==0);f.execute("STOP",8000,string.rep("c",32));assert(f.calls[1]=="STOP") end)
 test("disconnect stops owned cycle",function() local f=fixture();f.connect();f.offer("START");f.execute("START");f.callbacks.close();assert(f.calls[2]=="STOP") end)
+
+test("reconnection does not resume manual outputs or execute old pending commands",function()
+    for _,command in ipairs({"FILL","DRAIN"}) do
+        local f=fixture();f.connect();f.offer(command);f.execute(command)
+        f.offer(command,string.rep("d",32));f.callbacks.close()
+        assert(f.state=="IDLE" and f.calls[2]=="STOP")
+        f.callbacks.open();f.reply({type="ready",session=string.rep("c",32)})
+        f.execute(command,8000,string.rep("d",32))
+        f.advance(1000);f.reply({type="pong",seq=f.last().seq})
+        assert(#f.calls==2 and f.state=="IDLE")
+    end
+end)
 test("active heartbeat follows one second boundaries",function() local f=fixture();f.connect();f.offer("START");f.execute("START");for i=1,15 do local n=#f.sent;f.advance(500);assert(#f.sent==n);f.advance(500);assert(#f.sent==n+1 and f.last().type=="ping");f.reply({type="pong",seq=f.last().seq}) end;assert(not f.closed and #f.calls==1) end)
 test("active timeout stops outputs",function() local f=fixture();f.connect();f.offer("START");f.execute("START");f.advance(10000);assert(f.calls[2]=="STOP" and f.closed) end)
 test("pong preserves connection across idle heartbeat",function() local f=fixture();f.connect();for i=1,4 do f.advance(30000);f.reply({type="pong",seq=f.last().seq}) end;assert(not f.closed) end)

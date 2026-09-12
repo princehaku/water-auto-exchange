@@ -74,9 +74,10 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(self.command('DRAIN',4)['command'],'DRAIN')
 
     def test_manual_mode_is_explicit_and_legacy_cannot_bypass_level_checks(self):
-        for mode in (None,'typo',True):
-            with self.assertRaises(Problem):
-                self.online(version='0.7.0',control_mode=mode)
+        for version in ('0.7.0','0.7.1'):
+            for mode in (None,'typo',True):
+                with self.assertRaises(Problem):
+                    self.online(version=version,control_mode=mode)
         self.online(version='0.6.0',control_mode='manual',need_fill='unknown')
         with self.assertRaises(Problem):
             self.command('FILL')

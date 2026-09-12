@@ -64,7 +64,13 @@ class WebSocketTests(unittest.TestCase):
         self.assertFalse(self.store.snapshot()['online'])
 
     def test_manual_switch_command_and_state_roundtrip(self):
-        status=dict(STATUS,version='0.7.0',control_mode='manual',need_fill='unknown')
+        self.manual_roundtrip('0.7.0')
+
+    def test_reconnection_firmware_manual_roundtrip(self):
+        self.manual_roundtrip('0.7.1')
+
+    def manual_roundtrip(self, version):
+        status=dict(STATUS,version=version,control_mode='manual',need_fill='unknown')
         c=self.connect(status=status)
         self.store.enqueue('DRAIN','5'*32)
         offer=json.loads(c.recv());self.assertEqual(offer['command'],'DRAIN')

@@ -70,9 +70,40 @@ function M.new(config, callbacks, deps)
     deps = deps or {}
     local sys = deps.sys or require "sys"
     local socket = deps.socket or require "socket"
+    local link = deps.link or require "link"
+    local net = deps.net or require "net"
+    local ril = deps.ril or require "ril"
     local crypto = deps.crypto or _G.crypto
     local client = {queue = {}, connected = false, cancelled = false}
     local event, serial = "WATER_WS_WAKE", 0
+    local last_recovery, last_diagnostic, diagnostic_pending
+    local function age(tick)
+        return ((rtos.tick() - tick) % 4294967296) * 5
+    end
+    local function diagnose()
+        if diagnostic_pending or (last_diagnostic and age(last_diagnostic) < 60000) then return end
+        last_diagnostic, diagnostic_pending = rtos.tick(), true
+        -- Query only; preserve the library's URC handlers and operator/APN selection.
+        -- The final callback bounds the queue even when the AT channel stalls.
+        for _, command in ipairs({"AT+CPIN?", "AT+CREG?", "AT+CGREG?", "AT+CEREG?"}) do
+            ril.request(command)
+        end
+        ril.request("AT+CSQ", nil, function(_, ok, _, intermediate)
+            diagnostic_pending = false
+            local csq = ok and type(intermediate) == "string" and intermediate:match("%+CSQ:%s*(%d+)")
+            print("WATER NET diagnostic csq=" .. tostring(csq or "unknown") .. "; see CPIN/CREG/CGREG/CEREG above")
+        end)
+    end
+    local function recover(reason)
+        if client.stopped or (last_recovery and age(last_recovery) < 300000) then return false end
+        if net.getState() ~= "REGISTERED" then return false end
+        last_recovery = rtos.tick()
+        print("WATER WS pdp_recover reason=" .. reason .. " cooldown_ms=300000")
+        -- V2.4.4 shut invalidates local IP readiness and re-queries the LTE bearer.
+        -- It does not force a radio restart or bypass network registration denial.
+        link.shut()
+        return true
+    end
     local function random_bytes(length)
         serial = serial + 1
         local value = config.device_key .. ":" .. tostring(os.time()) .. ":" .. tostring(rtos.tick()) .. ":" .. serial
@@ -155,28 +186,52 @@ function M.new(config, callbacks, deps)
         end
     end
     function client:start()
+        sys.subscribe("IP_ERROR_IND", function()
+            if client.stopped then return end
+            client:close()
+            -- Stop a remotely owned output even if connect/recv has not returned.
+            if client.connected then
+                client.stable_before_loss = age(client.connected_at) >= 60000
+                client.connected = false
+                notify("close")
+            end
+        end)
         self.task = sys.taskInit(function()
-            local backoff = 1000
+            local backoff, failures = 1000, 0
             while not client.stopped do
                 client.cancelled = false
-                local waiting = 0
+                local waiting, waiting_since = 0, rtos.tick()
                 while not socket.isReady() and not client.stopped do
-                    if waiting % 5 == 0 then print("WATER WS waiting_pdp; check SIM, antenna and registration") end
+                    if waiting % 5 == 0 then
+                        print("WATER WS waiting_pdp registration=" .. tostring(net.getState()))
+                        diagnose()
+                    end
+                    if age(waiting_since) >= 120000 and recover("pdp_wait_timeout") then
+                        waiting_since = rtos.tick()
+                    end
                     waiting = waiting + 1
                     sys.wait(1000)
                 end
                 if client.stopped then return end
+                client.cancelled = false
+                client.stable_before_loss = false
                 local io = socket.tcp(true, {caCert = config.ca_cert, hostNameFlag = 1, insist = 0})
                 if io then
                     -- Never put these yielding operations inside pcall/xpcall.
                     run_connection(io)
-                    io:close()
                 else print("WATER WS socket_create_failed") end
-                local stable = client.connected and ((rtos.tick() - client.connected_at) % 4294967296) * 5 >= 60000
+                local stable = client.stable_before_loss or (client.connected and age(client.connected_at) >= 60000)
+                local cancelled = client.cancelled
                 client.connected, client.queue = false, {}
+                -- Invalidate the session and stop outputs before yielding in close/recovery.
                 notify("close")
-                if stable then backoff = 1000 end
-                print("WATER WS retry_ms=" .. backoff)
+                if io then io:close() end
+                if client.stopped then return end
+                if stable then backoff, failures = 1000, 0
+                elseif not cancelled then failures = math.min(failures + 1, 6) end
+                diagnose()
+                if failures >= 6 and recover("consecutive_failures") then failures = 0 end
+                print("WATER WS retry_ms=" .. backoff .. " failures=" .. failures)
                 sys.wait(backoff)
                 backoff = math.min(backoff * 2, 60000)
             end

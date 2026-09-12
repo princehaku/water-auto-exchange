@@ -1,5 +1,16 @@
 # 2026-09-12 实板联网联调
 
+## 上午接续：0.5.3已上板，0.6.0独立按钮已实现
+
+- 用户10:13提供的0.5.2日志显示IP_READY之后TLS连接10秒TIMEOUT，尚未到WSS认证/心跳阶段，不能以旧心跳换算解释该次失败。
+- 10:20:41现有trace记录0.5.3启动；10:22左右通过COM4实读STATUS确认版本和UNCONFIGURED。CPIN:READY、CEREG:2、CSQ8–10，之后持续waiting_pdp至本次观察结束；新版稳定WSS连接尚未验证。仅凭这些信息不能认定欠费、APN错误或天线损坏。
+- 电脑以公开CA验证bytegallop.com的TLS1.2通过（一次约0.08秒），公网API200；生产状态为离线及旧0.5.2历史信息、一条此前STOP记录。本轮未发泵控制命令。COM3打开时报拒绝访问，未发送只读AT查询。
+- 本轮没有computer-use所需node_repl/sky执行入口，未操作桌面。用户已保留助手刷写授权；最新0.6.0未刷写，不能声称实板联调完成。
+- 独立按钮FILL补到高位、DRAIN排到低位后结束，完整START保留。138Lua、42Python和本地Edge无头HTTP联调通过；浏览器使用隔离模拟设备，桌面/手机截图在build/browser，不能作为真实在线证据。官方LuaFLOAT、PS语法、生成包与凭据及九文件清单核对通过。
+- Web和后端已部署，备份 `/apps/water-auto-exchange/backups/20260912T022704Z-3677505`，容器healthy；公网四个静态文件一致、API及/sms200、凭据WSS probe通过。0.6.0本地项目water-online-0.6.0指向build/firmware。默认GPIO映射仍禁用，未验证真实水流。
+
+下方为夜间联调记录，其中“0.5.3未上板”的历史快照已由上方COM4新证据更新。
+
 本次用户授权助手自行使用computer-use下载和测试。项目是工科物联GK21.5PTM rev0.3、Air724UG-NFM，保留V4035 TTS NOLVGL FLOAT CORE。GPIO12作为已确认网络灯；泵和液位映射仍未配置。
 
 ## 已取得的实板证据

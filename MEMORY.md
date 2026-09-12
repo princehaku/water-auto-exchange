@@ -1,5 +1,14 @@
 # 项目记忆
 
+## 2026-09-12 最新：两个独立按钮与0.6.0
+
+- 页面及后端已部署；备份 `/apps/water-auto-exchange/backups/20260912T022704Z-3677505`。容器healthy，四个公网静态文件与本地一致，API和/sms健康200，凭据WSS probe通过；没有向生产注入模拟数据。
+- Web新增并排“补水/FILL”和“冲水/DRAIN”；按已告知的暂定语义，冲水只排到低位停止，不自动补水，完整换水START保留折叠入口。语义问题尚未收到答复。DRAIN已贯通固件、USB、WSS、API及网关，沿用超时/防抖/互锁/故障/断网停止；旧固件禁止DRAIN。
+- 源码和build/firmware当前0.6.0，完整8Lua+CA，water-online-0.6.0项目已准备；控制GPIO仍禁用。138Lua、42Python及隔离Edge无头浏览器HTTP联调通过，LuaFLOAT/PS检查通过，未操作真实泵。
+- 实板已更新为0.5.3：10:20:41trace启动、10:22左右COM4实读确认UNCONFIGURED。SIM已识别CPIN:READY，但CEREG:2、CSQ8–10并持续waiting_pdp；目前未证实新版成功联网。此前0.5.2的十秒TLS TIMEOUT发生在心跳前，应与旧75秒断线缺陷区分。
+- 电脑到公网TLS1.2校验通过、API200，生产设备仍离线、历史0.5.2状态及一条真实STOP保留。本轮未发送START/FILL/DRAIN到生产；COM3打开即占用失败，未发AT。已向用户询问天线与位置。
+- computer-use技能已读，本轮工具无node_repl/sky执行入口，未操作UI或刷写；0.6.0尚未上板。此前刷写授权持续有效，阻塞原因是执行工具和现场移动网络，不是待审批。旧LuaTools项目同样指向build/firmware，刷入时务必核对包内VERSION。
+
 ## 2026-09-12 最新：真实WSS及STOP已通，0.5.3修正版待刷写
 
 - 用户明确“我要去睡觉了，你自己用computer use测试，一定要测完”，已授权本次助手点击下载并联调，覆盖早先“用户亲自刷写”的限制。01:26:12通过computer-use下载完整0.5.2包成功，原CORE保留；不是src禁用网络包。

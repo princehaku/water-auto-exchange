@@ -11,6 +11,7 @@ local function fixture()
         status=function() return {state=f.state} end,
         start=function() f.calls[#f.calls+1]="START"; f.state="DRAINING"; return true,"started" end,
         fill=function() f.calls[#f.calls+1]="FILL"; f.state="FILLING"; return true,"fill_started" end,
+        drain=function() f.calls[#f.calls+1]="DRAIN"; f.state="DRAINING"; return true,"drain_started" end,
         stop=function() f.calls[#f.calls+1]="STOP"; f.state="IDLE"; return true,"stopped" end,
         reset=function() return false,"not_faulted" end
     }
@@ -23,7 +24,7 @@ local function fixture()
         sys={timerLoopStart=function(fn) f.step=fn; return 1 end},
         transport={new=function(_,callbacks) f.callbacks=callbacks; return f.client end},
         json={encode=function(value) return value end,decode=function() if f.decode_fail then error("decode") end; return f.decoded end},
-        usb={format_status=function() return "project=water_auto_exchange version=0.5.3 state="..f.state end},
+        usb={format_status=function() return "project=water_auto_exchange version=0.6.0 state="..f.state end},
         read_cert=function() return f.no_cert and "" or "-----BEGIN CERTIFICATE-----" end}
     -- Ordinary messages use fake JSON tokens; auth concatenation needs strings.
     local serial=0
@@ -47,6 +48,12 @@ end
 test("shipped heartbeat defaults are one second",function() local c=require "water_network_config";assert(c.heartbeat_ms==1000 and c.active_heartbeat_ms==1000);assert(c.offline_stop_ms==10000 and c.idle_timeout_ms==75000) end)
 
 test("disabled network has no I/O",function() assert(not network.start({}, {enabled=false})) end)
+test("remote DRAIN executes once and disconnect stops the owned drain",function()
+    local f=fixture();f.connect();f.offer("DRAIN");f.execute("DRAIN");f.execute("DRAIN")
+    assert(#f.calls==1 and f.calls[1]=="DRAIN")
+    assert(f.last().ack.result=="OK DRAIN drain_started")
+    f.callbacks.close();assert(f.calls[2]=="STOP" and f.state=="IDLE")
+end)
 test("plaintext and old HTTP URL rejected",function() local f=fixture();f.config.url="https://example.test/water";assert(not f.start()) end)
 test("missing CA prevents connection",function() local f=fixture();f.no_cert=true;assert(not f.start());assert(not f.started) end)
 test("auth key has a fixed nonsecret prefix",function() local f=fixture();f.connect();assert(f.sent[1]:find('{"type":"auth","protocol":"water-ws-v1","key"',1,true)==1) end)

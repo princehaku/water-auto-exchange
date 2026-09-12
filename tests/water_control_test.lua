@@ -506,6 +506,24 @@ test("logging failure cannot interrupt cleanup or sensor monitoring", function()
     h.poll(100); state(h, "IDLE")
 end)
 
+test("DRAIN uses only drain output and retains measured OFF levels at low water", function()
+    local h = fixture(); h.ready(false)
+    local baseline = #h.events
+    assert(h.controller.drain()); state(h, "DRAINING", false, true)
+    h.sensor("need_fill", true); h.poll(100); h.poll(100)
+    state(h, "DONE")
+    h.poll(1000); state(h, "DONE")
+    equal(h.writes_since(baseline, 5, 1), 0, "fill must never turn on")
+    equal(h.levels[9], 1, "drain must retain its configured OFF level")
+end)
+
+test("DRAIN is refused without confirmed mapping and makes zero I/O calls", function()
+    local cfg = config(); cfg.mapping_confirmed = false
+    local h = fixture(cfg)
+    equal(h.controller.drain(), false)
+    equal(#h.events, 0)
+end)
+
 local failures = 0
 for _, item in ipairs(tests) do
     local ok, reason = pcall(item[2])

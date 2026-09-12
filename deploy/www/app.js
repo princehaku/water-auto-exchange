@@ -1,10 +1,13 @@
 'use strict';
 const $ = id => document.getElementById(id);
-const names = {START:'开始换水',FILL:'单独补水',STOP:'停止输出',RESET:'故障复位'};
+const names = {START:'完整换水',FILL:'补水',DRAIN:'冲水',STOP:'停止输出',RESET:'故障复位'};
 const states = {UNCONFIGURED:'等待配置',IDLE:'待机',DRAINING:'正在排水',SETTLING:'切换间隔',FILLING:'正在补水',DONE:'本轮已完成',FAULT:'故障锁定'};
 const results = {queued:'等待设备领取',delivered:'等待回执',succeeded:'设备已确认',rejected:'设备已拒绝',expired:'已过期',uncertain:'结果待核实',cancelled:'已取消'};
 const reasons = {mapping_not_confirmed:'输出映射尚未确认',wiring_not_confirmed:'接线尚未确认',ready:'输入已稳定，可以启动',waiting_for_inputs:'等待液位输入稳定',stopped:'输出已停止',completed:'本轮换水完成',overflow:'超高水位触发',drain_timeout:'排水超时',fill_timeout:'补水超时',sensor_sequence:'液位反馈顺序异常',sensor_unstable_timeout:'液位输入持续不稳定',disabled:'控制配置未启用',draining:'等待低位补水请求',settling:'输出关闭，等待切换',filling:'等待补水请求解除',reset:'故障已复位'};
 const errors = {login_required:'请先登录。',invalid_key:'管理密钥不正确。',try_later:'尝试过于频繁，请稍后再试。',device_offline:'设备已离线，命令未提交。',device_not_ready:'设备尚未就绪。',level_not_ready:'当前液位反馈不满足启动条件。',command_pending:'上一条命令尚在等待回执。',not_faulted:'设备当前无待复位故障。'};
+reasons.flushing='正在单独排水，到低位后停止';
+reasons.drain_completed='冲水完成，排水已停止';
+errors.firmware_upgrade_required='请先更新设备固件，再使用单独冲水。';
 let snapshot=null, signedIn=false, busy=false, refreshing=false, lastSuccess=0, submittedId=null;
 function message(text){$('message').textContent=text;}
 async function api(path, body){
@@ -18,6 +21,7 @@ function timeLabel(t){return t?new Date(t*1000).toLocaleString('zh-CN',{hour12:f
 function can(command){
   const d=snapshot?.device;if(!snapshot?.online||!d||Date.now()-lastSuccess>10000)return false;
   if(command==='STOP')return true;
+  if(command==='DRAIN'&&d.version!=='0.6.0')return false;
   if(busy||snapshot.commands.some(c=>['queued','delivered'].includes(c.status)))return false;
   if(command==='RESET')return d.state==='FAULT';
   return d.ready==='1'&&d.outputs_known==='1'&&d.overflow==='0'&&['IDLE','DONE'].includes(d.state)&&d.need_fill===(command==='FILL'?'1':'0');
@@ -37,6 +41,7 @@ function render(data){
   $('cycle').textContent=d?d.cycle:'—';
   $('protection').textContent=d?(d.overflow==='1'?'超高水位已触发，请检查现场。':d.overflow_protection==='1'?'已配置额外超高输入；软件保护生效。':'额外超高输入未启用。'):'等待保护状态';
   $('control-hint').textContent=!online?'设备离线，恢复 4G 连接后即可查看实时状态。':d.state==='UNCONFIGURED'?'请先完成泵和液位反馈接线配置。':d.state==='FAULT'?'排除故障并等待输入稳定后复位。':'操作将发送到设备，请查看下方执行回执。';
+  $('drain-hint').textContent=d&&d.version!=='0.6.0'?'更新设备后可用':'只排水，到低位停止';
   document.querySelectorAll('[data-state]').forEach(e=>e.classList.toggle('current',online&&e.dataset.state===d?.state));
   $('history').replaceChildren();
   for(const item of data.commands){const row=document.createElement('tr');for(const value of [timeLabel(item.created),names[item.command]||item.command,results[item.status]||item.status,item.result||'—']){const cell=document.createElement('td');cell.textContent=value;row.append(cell);}$('history').append(row);}
@@ -51,7 +56,7 @@ async function refresh(){
 $('login-form').addEventListener('submit',async e=>{e.preventDefault();const button=e.target.querySelector('button');button.disabled=true;try{await api('login',{key:$('key').value});$('key').value='';message('');await refresh();}catch(e){message(e.message);}finally{button.disabled=false;}});
 $('logout').addEventListener('click',async()=>{try{await api('logout',{});showLogin();message('已退出。');}catch(e){message(e.message);}});
 $('refresh').addEventListener('click',()=>refresh());
-async function confirmCommand(command){if(command==='STOP')return true;const dialog=$('confirm');$('confirm-title').textContent='确认'+names[command]+'？';$('confirm-body').textContent=command==='START'?'设备将先排水，再按液位请求补水。请确认现场管路已就绪。':command==='FILL'?'设备将开始补水，直到液位板解除补水请求。':'确认故障原因已经排除。设备会检查输入，复位后保持待机。';dialog.returnValue='cancel';dialog.showModal();return new Promise(resolve=>dialog.addEventListener('close',()=>resolve(dialog.returnValue==='ok'),{once:true}));}
+async function confirmCommand(command){if(command==='STOP')return true;const dialog=$('confirm');$('confirm-title').textContent='确认'+names[command]+'？';$('confirm-body').textContent=command==='START'?'设备将先排水，再按液位请求补水。请确认现场管路已就绪。':command==='DRAIN'?'设备将单独排水，到低位后停止。本次操作不会自动补水。':command==='FILL'?'设备将开始补水，直到液位板解除补水请求。':'确认故障原因已经排除。设备会检查输入，复位后保持待机。';dialog.returnValue='cancel';dialog.showModal();return new Promise(resolve=>dialog.addEventListener('close',()=>resolve(dialog.returnValue==='ok'),{once:true}));}
 for(const button of document.querySelectorAll('[data-command]'))button.addEventListener('click',async()=>{
   const command=button.dataset.command;if(!can(command)||!await confirmCommand(command)||!can(command))return;
   busy=true;controls();

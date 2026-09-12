@@ -12,7 +12,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 
 ACTIVE = ('DRAINING', 'SETTLING', 'FILLING')
-COMMANDS = ('START', 'FILL', 'STOP', 'RESET')
+COMMANDS = ('START', 'FILL', 'DRAIN', 'STOP', 'RESET')
 
 
 class Problem(Exception):
@@ -23,7 +23,7 @@ class Problem(Exception):
 def validate_status(value):
     if not isinstance(value, dict):
         raise Problem(400, 'invalid_status')
-    if value.get('project') != 'water_auto_exchange' or value.get('version') not in ('0.3.0', '0.4.0', '0.5.0', '0.5.1', '0.5.2', '0.5.3'):
+    if value.get('project') != 'water_auto_exchange' or value.get('version') not in ('0.3.0', '0.4.0', '0.5.0', '0.5.1', '0.5.2', '0.5.3', '0.6.0'):
         raise Problem(409, 'firmware_mismatch')
     if value.get('state') not in ('UNCONFIGURED', 'IDLE', 'DONE', 'FAULT') + ACTIVE:
         raise Problem(400, 'invalid_state')
@@ -89,7 +89,9 @@ class Store:
             if not self.online():
                 raise Problem(409, 'device_offline')
             s = self.status
-            if command in ('START', 'FILL'):
+            if command == 'DRAIN' and s['version'] != '0.6.0':
+                raise Problem(409, 'firmware_upgrade_required')
+            if command in ('START', 'FILL', 'DRAIN'):
                 if s['ready'] != '1' or s['outputs_known'] != '1' or s['overflow'] != '0' or s['state'] not in ('IDLE', 'DONE'):
                     raise Problem(409, 'device_not_ready')
                 if s['need_fill'] != ('1' if command == 'FILL' else '0'):

@@ -25,6 +25,7 @@ end
 
 function methods:fault(reason)
     outputs_off(self)
+    self.drain_only = false
     if self.state ~= "FAULT" then
         self.state = "FAULT"
         self.reason = type(reason) == "string" and reason ~= "" and reason or "external_fault"
@@ -95,7 +96,12 @@ function methods:update(now, need_fill, overflow)
             return self:fault("drain_timeout")
         end
         if self.need_fill == true then
-            enter(self, "SETTLING", "settling", now)
+            if self.drain_only then
+                self.drain_only = false
+                enter(self, "DONE", "drain_completed", now)
+            else
+                enter(self, "SETTLING", "settling", now)
+            end
         end
     elseif self.state == "SETTLING" then
         if self.need_fill == false then
@@ -132,15 +138,28 @@ function methods:start(now)
     local ok, reason = can_start(self, now)
     if not ok then return false, reason end
     if self.need_fill ~= false then return false, "level_not_ready" end
+    self.drain_only = false
     self.cycle = self.cycle + 1
     enter(self, "DRAINING", "draining", now)
     return true, "started"
+end
+
+-- Independent drain: stop at B without entering the automatic refill phase.
+function methods:start_drain(now)
+    local ok, reason = can_start(self, now)
+    if not ok then return false, reason end
+    if self.need_fill ~= false then return false, "level_not_ready" end
+    self.drain_only = true
+    self.cycle = self.cycle + 1
+    enter(self, "DRAINING", "flushing", now)
+    return true, "drain_started"
 end
 
 function methods:start_fill(now)
     local ok, reason = can_start(self, now)
     if not ok then return false, reason end
     if self.need_fill ~= true then return false, "fill_not_requested" end
+    self.drain_only = false
     self.cycle = self.cycle + 1
     enter(self, "FILLING", "filling", now)
     return true, "fill_started"
@@ -148,6 +167,7 @@ end
 
 function methods:stop()
     outputs_off(self)
+    self.drain_only = false
     if self.state == "FAULT" then return false, "fault_latched" end
     self.state, self.reason, self.phase_since = "IDLE", "stopped", nil
     return true, "stopped"
@@ -158,6 +178,7 @@ function methods:reset(now)
     if self.state ~= "FAULT" then return false, "not_faulted" end
     if self.overflow then return false, "overflow_active" end
     if not self.inputs_ready then return false, "inputs_not_stable" end
+    self.drain_only = false
     enter(self, "IDLE", "reset", now)
     return true, "reset"
 end

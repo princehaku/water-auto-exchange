@@ -1,7 +1,7 @@
 -- WSS application protocol; socket I/O is queued to water_ws_transport's task.
 local M = {}
 local ACTIVE = { DRAINING = true, SETTLING = true, FILLING = true }
-local ALLOWED = { START = "start", FILL = "fill", STOP = "stop", RESET = "reset" }
+local ALLOWED = { START = "start", FILL = "fill", DRAIN = "drain", STOP = "stop", RESET = "reset" }
 
 function M.start(controller, config, deps)
     if type(config) ~= "table" or config.enabled ~= true then return false, "network_disabled" end
@@ -130,7 +130,7 @@ function M.start(controller, config, deps)
                 else
                     ack.status = ok == true and "succeeded" or "rejected"
                     ack.result = (ok == true and "OK " or "ERROR ") .. value.command .. " " .. tostring(reason):sub(1,160)
-                    if ok == true and (value.command == "START" or value.command == "FILL") then owned = true end
+                    if ok == true and (value.command == "START" or value.command == "FILL" or value.command == "DRAIN") then owned = true end
                 end
             end
             last_ok = time

@@ -57,6 +57,32 @@ class StoreTests(unittest.TestCase):
         with self.assertRaises(Problem):
             self.command()
 
+    def test_drain_requires_new_firmware_and_independent_delivery(self):
+        self.online(version='0.5.3')
+        with self.assertRaises(Problem) as error:
+            self.command('DRAIN')
+        self.assertEqual(error.exception.message, 'firmware_upgrade_required')
+        self.online(version='0.6.0')
+        c = self.command('DRAIN')
+        delivered = self.online(version='0.6.0')['command']
+        self.assertEqual(delivered['command'], 'DRAIN')
+        self.assertEqual(delivered['id'], c['id'])
+        status = dict(STATUS, version='0.6.0', state='DONE', need_fill='1', reason='drain_completed')
+        self.store.poll(GATEWAY, status, dict(id=c['id'], status='succeeded', result='OK DRAIN drain_started'))
+        self.assertEqual(self.store.snapshot()['commands'][0]['status'], 'succeeded')
+        self.assertEqual(self.command('FILL', 2)['command'], 'FILL')
+
+    def test_drain_guards_and_stop_priority(self):
+        for patch in (dict(need_fill='1'), dict(ready='0'), dict(overflow='1'),
+                      dict(outputs_known='0'), dict(state='FAULT'), dict(state='DRAINING')):
+            self.online(version='0.6.0', **patch)
+            with self.assertRaises(Problem):
+                self.command('DRAIN')
+        self.online(version='0.6.0')
+        self.command('DRAIN'); self.command('STOP', 2)
+        self.assertEqual(self.online(version='0.6.0')['command']['command'], 'STOP')
+        self.assertEqual(self.store.snapshot()['commands'][1]['status'], 'cancelled')
+
     def test_delivery_once_and_ack(self):
         self.online()
         c = self.command()
@@ -258,6 +284,16 @@ class FakeController:
 
 
 class GatewayTests(unittest.TestCase):
+    def test_drain_reidentifies_and_rejects_unsupported_firmware(self):
+        controller = FakeController()
+        result = gateway.execute(controller, dict(id='x', command='DRAIN'), 8000, 0)
+        self.assertEqual(result['result'], 'firmware_upgrade_required')
+        self.assertEqual(controller.calls, ['STATUS'])
+        controller.status = lambda: dict(STATUS, version='0.6.0')
+        result = gateway.execute(controller, dict(id='y', command='DRAIN'), 8000, 0)
+        self.assertEqual(result['status'], 'succeeded')
+        self.assertEqual(controller.calls[-1], 'DRAIN')
+
     def test_parse_old_firmware_rejected(self):
         with self.assertRaises(ValueError):
             gateway.parse_status('OK STATUS project=gk21_motor_test version=0.2.8')

@@ -33,7 +33,7 @@ def main():
     server.origin = 'http://127.0.0.1:' + str(server.server_port)
     worker = threading.Thread(target=server.serve_forever, daemon=True)
     worker.start()
-    status = dict(project='water_auto_exchange', version='0.5.0', state='IDLE', reason='ready',
+    status = dict(project='water_auto_exchange', version='0.6.0', state='IDLE', reason='ready',
                   ready='1', fill='0', drain='0', outputs_known='1', need_fill='0',
                   overflow='0', cycle='0', overflow_protection='0')
     device = 'a' * 32
@@ -55,14 +55,59 @@ def main():
             expect(page.locator('#console')).to_be_visible()
             expect(page.locator('#start')).to_be_disabled()
             expect(page.locator('#stop')).to_be_disabled()
+            expect(page.locator('#drain-button')).to_be_disabled()
             page.screenshot(path=str(output / 'offline-desktop.png'), full_page=True)
             store.poll(device, status)
             page.locator('#refresh').click()
             expect(page.locator('#start')).to_be_enabled()
             expect(page.locator('#fill-button')).to_be_disabled()
-            page.locator('#start').click()
+            expect(page.locator('#drain-button')).to_be_enabled()
+            expect(page.locator('#drain-button span')).to_have_text('冲水')
+            expect(page.locator('#fill-button span')).to_have_text('补水')
+            page.locator('#drain-button').click()
+            expect(page.locator('#confirm-body')).to_contain_text('不会自动补水')
             page.get_by_role('button', name='取消', exact=True).click()
             assert store.snapshot()['commands'] == []
+            page.locator('#drain-button').click()
+            page.get_by_role('button', name='确认执行', exact=True).click()
+            expect(page.locator('#history')).to_contain_text('等待设备领取')
+            item = store.poll(device, status)['command']
+            assert item['command'] == 'DRAIN'
+            status.update(state='DRAINING', reason='flushing', drain='1')
+            store.poll(device, status, dict(id=item['id'], status='succeeded', result='OK DRAIN drain_started'))
+            page.locator('#refresh').click()
+            expect(page.locator('#drain-button')).to_be_disabled()
+            expect(page.locator('#fill-button')).to_be_disabled()
+            expect(page.locator('#history')).to_contain_text('冲水')
+            page.locator('#stop').click()
+            expect(page.locator('#history')).to_contain_text('等待设备领取')
+            item = store.poll(device, status)['command']
+            assert item['command'] == 'STOP'
+            status.update(state='IDLE', reason='stopped', drain='0', need_fill='1')
+            store.poll(device, status, dict(id=item['id'], status='succeeded', result='OK STOP stopped'))
+            page.locator('#refresh').click()
+            expect(page.locator('#drain-button')).to_be_disabled()
+            page.locator('#fill-button').click()
+            page.get_by_role('button', name='确认执行', exact=True).click()
+            expect(page.locator('#history')).to_contain_text('等待设备领取')
+            item = store.poll(device, status)['command']
+            assert item['command'] == 'FILL'
+            status.update(state='DONE', reason='completed', need_fill='0')
+            store.poll(device, status, dict(id=item['id'], status='succeeded', result='OK FILL fill_started'))
+            page.locator('#refresh').click()
+            expect(page.locator('#drain-button')).to_be_enabled()
+            page.screenshot(path=str(output / 'independent-buttons.png'), full_page=True)
+            status['version'] = '0.5.3'
+            store.poll(device, status); page.locator('#refresh').click()
+            expect(page.locator('#drain-button')).to_be_disabled()
+            expect(page.locator('#drain-hint')).to_contain_text('更新设备')
+            status['version'] = '0.6.0'
+            store.poll(device, status); page.locator('#refresh').click()
+            page.locator('.exchange-option summary').click()
+            before = len(store.snapshot()['commands'])
+            page.locator('#start').click()
+            page.get_by_role('button', name='取消', exact=True).click()
+            assert len(store.snapshot()['commands']) == before
             page.locator('#start').click()
             page.get_by_role('button', name='确认执行', exact=True).click()
             expect(page.locator('#history')).to_contain_text('等待设备领取')
@@ -76,7 +121,7 @@ def main():
             expect(page.locator('#start')).to_be_disabled()
             page.screenshot(path=str(output / 'active-desktop.png'), full_page=True)
             page.locator('#stop').click()
-            expect(page.locator('#history')).to_contain_text('停止输出')
+            expect(page.locator('#history')).to_contain_text('等待设备领取')
             item = store.poll(device, status)['command']
             assert item['command'] == 'STOP'
             status.update(state='IDLE', reason='stopped', drain='0', need_fill='1')
@@ -101,7 +146,7 @@ def main():
             expect(page.locator('#login-panel')).to_be_visible()
             assert not errors, errors
             browser.close()
-            print('PASS browser: login, offline, START/cancel/ack, STOP, FILL guard, fault, XSS text, mobile, expiry, logout')
+            print('PASS browser: independent FILL/DRAIN, legacy guard, busy guard, cancel/ack, START, STOP, login/offline, fault/XSS, mobile, expiry, logout')
     finally:
         server.shutdown()
         server.server_close()

@@ -1,6 +1,14 @@
 # Web 控制台与 4G 接入
 
-## 2026-09-12 当前状态：0.5.3 计时修正，待上板
+## 2026-09-12 当前：补水和冲水独立操作（0.6.0）
+
+控制区提供两个独立按钮：**补水**发送FILL，有补水请求时补到高位；**冲水**发送DRAIN，无补水请求时排到低位并停止，本次不自动补水。“完整换水”折叠入口仍发送START，执行排水→间隔→补水。停止输出随时优先，所有动作仍需设备在线、接线映射确认和稳定液位反馈；未配置时不启用按钮。
+
+DRAIN要求板端0.6.0，旧版显示“更新设备后可用”，API及USB网关也拒绝新命令。该版本保留0.5.3的时基和心跳修正。138项Lua、42项Python及隔离Edge浏览器联调通过；浏览器回执使用模拟设备，不证明现场泵动作。
+
+真实板端10:20:41启动0.5.3，COM4实读确认UNCONFIGURED；SIM为CPIN:READY，持续waiting_pdp，尚未完成新版稳定联网。电脑TLS1.2验证和公网API正常。0.6.0生成包已准备，未刷入；本轮computer-use缺少执行接口，未操作界面。最新详细状态见MEMORY/AGENTS，下方0.5.x为历史记录。
+
+## 历史：0.5.3计时修正与夜间联调
 
 真实板端0.5.2已通过4G/TLS/WSS认证，服务器收到了UNCONFIGURED状态；向真实板下发的一条STOP已回执 `OK STOP stopped`。原“等待设备连接”的直接原因是LuaTools选了src项目，联网关闭、设备密钥为空。改用生成包后可连接，但旧tick换算导致本应1秒的心跳拖到约80秒，先被服务器75秒超时断开。不能把短暂online描述成稳定运行。
 
@@ -18,11 +26,11 @@
 
 新版打印 `waiting_pdp`、`connecting_tls`、`upgrading_http`、`upgraded; authenticating` 及失败阶段；`WATER NET disabled` 表示下载了未启用网络的源码配置，应使用生成包。源码不含设备密钥。当前下载目标 **0.5.2**，清单仍为生成目录中的 8 个 Lua 文件和 1 个 CA，按下述准备步骤操作。控制 GPIO 保持禁用；除明确的网络灯外不配置输出。下方 0.5.1/0.2.8 为此前版本记录，不能替代本次 COM4 实读。
 
-设备通过 Air724UG 自带 4G 网络建立 WSS 长连接，网页入口为 `https://bytegallop.com/water/`，无需电脑常开。网页提供管理密钥登录、在线状态、补水请求、软件输出、故障说明、START / FILL / STOP / RESET 和最近 60 条操作记录。当前为单设备控制台，不配置未经确认的定时换水或自动补水规则。
+设备通过 Air724UG 自带 4G 网络建立 WSS 长连接，网页入口为 `https://bytegallop.com/water/`，无需电脑常开。网页提供管理密钥登录、在线状态、补水请求、软件输出、故障说明、START / FILL / DRAIN / STOP / RESET 和最近 60 条操作记录。当前为单设备控制台，不配置未经确认的定时换水或自动补水规则。
 
 ## 软件与实板边界
 
-当前源码0.5.3、真实板端0.5.2，详情以上方最新记录为准。默认GPIO配置继续禁用，只有已确认的GPIO12网络灯启用。接线、启停电平、液位反馈和真实水流仍需实测；网络联调不能作为泵控制验证。
+当前源码0.6.0、真实板端0.5.3，详情以上方最新记录为准。默认GPIO配置继续禁用，只有已确认的GPIO12网络灯启用。接线、启停电平、液位反馈和真实水流仍需实测；网络联调不能作为泵控制验证。
 
 ## 管理员登录
 
@@ -35,8 +43,8 @@
 1. 准备可联网的 SIM、天线和供电；板端输出仍保持禁用，先验证网络及状态上报。GPIO23 复用 SIM 在位检测的硬件约束继续有效，不能据此猜测泵映射。
 2. 本轮已提供 `build/device.private.json`。后续使用自己的 JSON 文件，格式为 `{"url":"https://bytegallop.com/water","device_key":"填入设备密钥"}`。
 3. 在仓库运行 `python tools/build-firmware.py --config build/device.private.json`。脚本复制源码到 `build/firmware/`，仅在该目录启用联网并填入设备密钥，源文件与 GPIO 配置保持原状。
-4. 本机LuaTools“刷新列表”后选 `water-online-0.5.3`。其他机器按 `build/firmware/flash-files.txt` 创建项目并加入 **8个Lua文件和1个CA证书**，全部来自同一个生成目录。保留现有CORE、默认LuaTask V2.4.4库及USB trace。每条require独占一行；JSON为CORE内置全局模块。
-5. 按当前用户授权点击“下载脚本”。下载后核对 `project=water_auto_exchange version=0.5.3`、`UNCONFIGURED` 和生成配置，并查看服务器是否收到真实上报。持续观察至少跨过原75秒断线窗口，确认5秒日志中的心跳seq/ack继续增长、服务器last_seen持续刷新，再验证重连。仅版本号或一次online不足以通过联调。
+4. 本机LuaTools“刷新列表”后选 `water-online-0.6.0`。其他机器按 `build/firmware/flash-files.txt` 创建项目并加入 **8个Lua文件和1个CA证书**，全部来自同一个生成目录。保留现有CORE、默认LuaTask V2.4.4库及USB trace。每条require独占一行；JSON为CORE内置全局模块。
+5. 按当前用户授权点击“下载脚本”。下载后核对 `project=water_auto_exchange version=0.6.0`、`UNCONFIGURED` 和生成配置，并查看服务器是否收到真实上报。持续观察至少跨过原75秒断线窗口，确认5秒日志中的心跳seq/ack继续增长、服务器last_seen持续刷新，再验证重连。仅版本号或一次online不足以通过联调。
 6. 只有确认输出启停、液位板隔离反馈接线与超时参数后，才修改 `src/water_config.lua`，重新生成整包、验证、提交并推送，再由用户刷写。不能直接在生成目录内做长期配置修改，重新生成会覆盖该目录文件。
 
 下载清单：`main.lua`、`water_config.lua`、`water_cycle.lua`、`water_control.lua`、`water_usb.lua`、`water_network.lua`、`water_network_config.lua`、`water_ws_transport.lua`、`water-ca.crt`。
@@ -49,8 +57,8 @@ TLS强制提供CA文件并开启SNI。CA来源与指纹见[证书说明](../cert
 
 - 状态不变时不重复上传完整状态，不自动回退到 HTTP 轮询。断线立即标记离线，半开连接空闲最多 75 秒判离线；活动状态最多 10 秒。
 - 握手后先认证，设备密钥只在 TLS 加密消息中传送，不放 URL；认证前不读取设备状态、不交付命令。诊断 `probe` 只检查鉴权，不注册设备或更改线上记录。
-- 命令有效期仍为 8 秒。服务器推送 offer，设备发送 claim 并记录本地单调时钟；服务器检查剩余有效期后返回 execute。设备再检查 claim 往返耗时与剩余有效期，避免延迟缓存的旧命令启动输出。命令交付、执行与设备回执分别记录，回执丢失显示“结果待核实”，不自动重发 START/FILL。
-- START/FILL/RESET 仍由原控制器检查液位、防抖、互锁、超时和故障。STOP 优先，取消仍排队的命令；设备收到 STOP offer 会清除尚未执行的其他 claim。
+- 命令有效期仍为 8 秒。服务器推送 offer，设备发送 claim 并记录本地单调时钟；服务器检查剩余有效期后返回 execute。设备再检查 claim 往返耗时与剩余有效期，避免延迟缓存的旧命令启动输出。命令交付、执行与设备回执分别记录，回执丢失显示“结果待核实”，不自动重发 START/FILL/DRAIN。
+- START/FILL/DRAIN/RESET 仍由原控制器检查液位、防抖、互锁、超时和故障。STOP 优先，取消仍排队的命令；设备收到 STOP offer 会清除尚未执行的其他 claim。
 - USB STOP 会作废在途远程响应并关闭当前连接；新连接创建新会话，旧命令不能恢复泵。远程 STOP 保留连接以便立即回传结果。
 - `water_ws_transport.lua` 的单一任务持有 socket；connect/send/recv/close 直接在该任务中执行，不放进外层 pcall。业务调用 send 只入队，不直接等待底层 SOCKET_SEND。
 - 收发支持 TCP 分包、粘包、126 字节边界、WebSocket 分片及 Ping/Pong。每条消息上限 8192 字节，发送队列上限 8 条；异常输入、队列失败及超时会断线并尝试关闭远程输出。应用/传输层不打印认证消息，认证固定前缀避免底层 socket 调试预览包含密钥。

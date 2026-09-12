@@ -275,6 +275,7 @@ function M.new(config, dependencies)
 
     function self.start() return command("start") end
     function self.fill() return command("start_fill") end
+    function self.drain() return command("start_drain") end
     function self.reset() return command("reset") end
 
     function self.stop()

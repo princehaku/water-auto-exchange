@@ -1,8 +1,8 @@
-> 2026-09-07：当前源码 0.5.1，在原有控制器基础上新增 4G WSS 长连接与 Web。状态机/接线条件沿用下文，版本核对与下载清单以 [Web 与 4G 接入](web-console.md) 为准。最近历史实读板上仍为已 STOP 的 0.2.8。
+> 2026-09-12：当前源码0.6.0，支持独立补水和冲水，保留完整换水。真实板端0.5.3/UNCONFIGURED已确认，等待移动网络；版本核对与9项下载清单以 [Web与4G接入](web-console.md) 为准。
 
-# 自动换水控制（0.3.0）
+# 自动换水控制（0.6.0）
 
-当前应用为 `water_auto_exchange 0.3.0`，使用既有 Air724UG V4035 FLOAT / LuaTask V2.4.4。无需 SIM 或网络；通过 USB 命令启动一轮，重启后待机，不恢复未完成的换水。还未加入定时计划或持续自动补水。
+当前应用为 `water_auto_exchange 0.6.0`，使用既有 Air724UG V4035 FLOAT / LuaTask V2.4.4。本地USB控制无需SIM或网络，网页控制需4G联网；通过命令启动一轮，重启后待机，不恢复未完成的换水。还未加入定时计划或持续自动补水。
 
 ## 液位板的信号
 
@@ -18,7 +18,9 @@
 ```mermaid
 stateDiagram-v2
     IDLE --> DRAINING: START 且无补水请求
-    DRAINING --> SETTLING: 补水请求有效并通过防抖
+    DRAINING --> SETTLING: START模式，补水请求有效并通过防抖
+    IDLE --> DRAINING: DRAIN 且无补水请求
+    DRAINING --> DONE: DRAIN模式，补水请求有效并通过防抖
     SETTLING --> FILLING: 进排水均关，等待 1 秒
     FILLING --> DONE: 补水请求解除并通过防抖
     IDLE --> FILLING: FILL 且有补水请求
@@ -51,7 +53,7 @@ stateDiagram-v2
 3. 干接点使用 COM 接逻辑地、NO 接上拉输入时，通常闭合读 0；仍须实测“请求补水”对应的触点状态后填写 `active_level`。程序未预填该极性。
 4. 实测低于 B、到 C 及 B/C 之间的保持行为。电极、水质和控制板供电必须能可靠检测。单路普通触点无法可靠区分断线、控制板失电与正常的某一状态；超时不能覆盖全部溢流风险。
 
-当前适配器只接纳固定 1.8V 域且已有资料支持的 GPIO：`5,9,10,11,12,13,14,15,17,18,19,22,23`。这是可配置集合，不代表这些脚在定制板上空闲。输入、输出必须各用不同 GPIO。未自动处理 LDO、物理 UART 或 SIM 复用；选脚前须核对现有外围，尤其 GPIO23 的 SIM 在位检测和 GPIO13 的启动条件。
+当前适配器只接纳固定 1.8V 域且已有资料支持的 GPIO：`5,9,10,11,13,14,15,17,18,19,22,23`（GPIO12保留给网络灯）。这是可配置集合，不代表这些脚在定制板上空闲。输入、输出必须各用不同 GPIO。未自动处理 LDO、物理 UART 或 SIM 复用；选脚前须核对现有外围，尤其 GPIO23 的 SIM 在位检测和 GPIO13 的启动条件。
 
 已有测量不能直接填成泵映射：GPIO5 HIGH 时出纸口约 6.1V，LOW 未确认；GPIO12 对应板灯；GPIO23 的 DO2 在 HIGH/LOW 阶段均约 12V，而 STOP 后约 0V，尚未分清写 LOW 与释放引脚的效果。新程序使用明确的 `off_level` 保持关断，不以释放 GPIO 作为关断方式。
 
@@ -70,6 +72,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\water-command.ps1 -P
 | `STATUS` | 查询状态，不启动输出 |
 | `START` | 手动启动一次“排水→补水”；有补水请求时拒绝，先处理初始水位 |
 | `FILL` | 有补水请求时，只补水到 C；适合首次加水 |
+| `DRAIN` | 单独冲水：排到B低位后停止，不自动补水；已请求补水时拒绝 |
 | `STOP` | 取消当前运行并尝试关断两个输出，继续监测输入 |
 | `RESET` | 故障原因解除且输入重新稳定后，清除锁存并待机 |
 
@@ -79,20 +82,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\water-command.ps1 -P
 
 `fill`、`drain` 是软件输出记录，不是板端电压/水流反馈；写入失败时可能保留最后的开启请求。`outputs_known=0` 表示输出尚未初始化或写入结果不确定，此时不能据 `fill=0` 推断硬件已断电。故障原因会保留原始原因，并附加关断失败信息。
 
-`drain_timeout`、`fill_timeout`、`overflow`、传感器读取错误等会锁存为 `FAULT`。关断失败时两个输出都会独立尝试关闭，不能仅凭 STOP 应答代替电压确认。轮询定时器失效后禁止重新 START/FILL，修复问题后重启应用；普通传感器故障则可恢复稳定后 RESET。
+`drain_timeout`、`fill_timeout`、`overflow`、传感器读取错误等会锁存为 `FAULT`。关断失败时两个输出都会独立尝试关闭，不能仅凭 STOP 应答代替电压确认。轮询定时器失效后禁止重新 START/FILL/DRAIN，修复问题后重启应用；普通传感器故障则可恢复稳定后 RESET。
 
 ## 下载与验证边界
 
-LuaTools 的 `water-exchange` 项目保留原 CORE、默认库及 trace 设置，应用文件清单改为：
+LuaTools选择water-online-0.6.0项目，使用build/firmware/flash-files.txt中的完整8个Lua文件和1个CA证书，保留既有CORE、默认库及USB trace。准备与验证步骤见[Web与4G接入](web-console.md)。旧water-exchange的5文件清单不包含网络功能，不能用于当前联网版本。用户已授权助手刷写；执行工具不可用时不能宣称已下载。
 
-```text
-main.lua
-water_config.lua
-water_cycle.lua
-water_control.lua
-water_usb.lua
-```
-
-项目配置文件位于 `tools/vendor/luatools/project/water-exchange.ini`。若界面仍显示旧的 motor/probe 文件，应重新载入项目并核对上述 5 个文件后，由用户点击“下载脚本”。旧诊断源码保留在仓库，不在新版启动路径和项目清单中。
-
-本地 Lua 状态机、模拟 GPIO/计时器、USB 与开机测试覆盖逻辑和故障路径；不能据此认定实际泵、探针或硬件断水已经验证。最近确认板上仍是已 STOP 的 `gk21_motor_test 0.2.8`，0.3.0 需用户手动下载并核对 `STATUS`。
+本地测试覆盖控制逻辑、故障、单独冲水不自动补水及端到端命令交付。所有GPIO测试都是模拟，真实板端仍为0.5.3/UNCONFIGURED，0.6.0和实际泵、探针尚未验证。

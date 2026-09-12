@@ -272,6 +272,49 @@ test("status snapshots cannot mutate the controller", function()
     assert(c:start(100))
 end)
 
+test("independent drain stops at debounced low level and never refills", function()
+    local c = fixture(); sample_ready(c, false)
+    assert(c:start_drain(100)); state(c, "DRAINING", false, true)
+    equal(c:status().reason, "flushing")
+    c:update(200, true, false); c:update(299, true, false)
+    state(c, "DRAINING", false, true)
+    c:update(300, true, false)
+    equal(state(c, "DONE").reason, "drain_completed")
+    c:update(100000, true, false); state(c, "DONE")
+    assert(c:start_fill(100000)); state(c, "FILLING", true)
+end)
+
+test("independent drain rejects low, unstable, busy and faulted inputs", function()
+    local c = fixture()
+    equal(c:start_drain(0), false)
+    sample_ready(c, true); equal(c:start_drain(100), false)
+    assert(c:start_fill(100)); equal(c:start_drain(100), false)
+    c:fault("overflow"); equal(c:start_drain(100), false)
+    state(c, "FAULT")
+end)
+
+test("independent drain timeout, overflow, STOP and bad inputs turn outputs off", function()
+    for _, action in ipairs({"timeout", "overflow", "stop", "bad_input"}) do
+        local c = fixture(); sample_ready(c, false); assert(c:start_drain(100))
+        if action == "stop" then
+            assert(c:stop()); c:update(300, true, false); c:update(10000, true, false)
+            state(c, "IDLE")
+        else
+            if action == "timeout" then c:update(1100, true, false)
+            elseif action == "overflow" then c:update(200, false, true)
+            else c:update(200, nil, false) end
+            state(c, "FAULT")
+        end
+    end
+end)
+
+test("a full exchange after independent drain still includes refilling", function()
+    local c = fixture(); sample_ready(c, false); assert(c:start_drain(100))
+    assert(c:stop()); assert(c:start(100))
+    c:update(200, true, false); c:update(300, true, false)
+    state(c, "SETTLING"); c:update(500, true, false); state(c, "FILLING", true)
+end)
+
 local failures = 0
 for _, item in ipairs(tests) do
     local ok, reason = pcall(item[2])

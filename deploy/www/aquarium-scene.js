@@ -97,6 +97,15 @@ export function createAquarium(canvas) {
     const pane=box(w,h,d,x,y,z,glassMat);
     const lines=new THREE.LineSegments(new THREE.EdgesGeometry(pane.geometry),edgeMat);lines.position.copy(pane.position);habitat.add(lines);
   }
+  function slopedSideGlass(x,backZ,frontZ,bottom,backTop,frontTop) {
+    const outline=new THREE.Shape();
+    outline.moveTo(backZ,bottom);outline.lineTo(frontZ,bottom);
+    outline.lineTo(frontZ,frontTop);outline.lineTo(backZ,backTop);outline.closePath();
+    const geometry=new THREE.ExtrudeGeometry(outline,{depth:.025,bevelEnabled:false});
+    geometry.rotateY(-Math.PI/2);geometry.translate(x+.0125,0,0);
+    habitat.add(new THREE.Mesh(geometry,glassMat));
+    habitat.add(new THREE.LineSegments(new THREE.EdgesGeometry(geometry),edgeMat));
+  }
   const dummy = new THREE.Object3D();
   function instances(geometry,mat,items) {
     const mesh=new THREE.InstancedMesh(geometry,mat,items.length);
@@ -136,14 +145,14 @@ export function createAquarium(canvas) {
     box(w,.12,.2,x,1.35,2.13);
     glass(w,1.48,.025,x,2.15,2.13);
   }
-  // The pool's three outer panes form one continuous enclosure up to the land glazing.
-  // Their edges extend into the corner posts; only the internal access ramp stays open.
-  const poolGlassBottom=.275,poolGlassTop=2.89;
-  const poolGlassHeight=poolGlassTop-poolGlassBottom,poolGlassY=(poolGlassTop+poolGlassBottom)/2;
-  glass(.025,poolGlassHeight,4.28,-6.0,poolGlassY,0);
-  glass(3.88,poolGlassHeight,.025,-4.06,poolGlassY,2.13);
-  glass(3.88,poolGlassHeight,.025,-4.06,poolGlassY,-2.13);
-  for(const [x,z,h] of [[-6,-2.14,3.01],[-6,2.14,3.01],[-2.12,2.14,3.01],[1.87,2.14,3.05],[6.02,2.14,3.92]]) {
+  // Glazing reaches the actual frame tops: front post caps and the higher rear rail.
+  // The side is a solid sloped pane between them, not a low rectangle with an outline above.
+  const poolGlassBottom=.275,poolFrontTop=3.245,poolBackTop=3.83;
+  slopedSideGlass(-6,-2.14,2.14,poolGlassBottom,poolBackTop,poolFrontTop);
+  glass(3.88,poolFrontTop-poolGlassBottom,.025,-4.06,(poolFrontTop+poolGlassBottom)/2,2.13);
+  glass(3.88,poolBackTop-poolGlassBottom,.025,-4.06,(poolBackTop+poolGlassBottom)/2,-2.13);
+  const poolBackPostHeight=poolBackTop-.29+.055;
+  for(const [x,z,h] of [[-6,-2.14,poolBackPostHeight],[-6,2.14,3.01],[-2.12,2.14,3.01],[1.87,2.14,3.05],[6.02,2.14,3.92]]) {
     box(.2,h,.2,x,.24+h/2,z);
     box(.032,h-.16,.032,x-.059,.24+h/2,z+.112,frameEdgeMat);
     box(.28,.11,.28,x,.29+h,z,darkMat);

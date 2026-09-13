@@ -5,8 +5,8 @@ local methods = {}
 local defaults = {
     debounce_ms = 500,
     switch_delay_ms = 1000,
-    drain_timeout_ms = 120000,
-    fill_timeout_ms = 120000
+    drain_timeout_ms = 300000,
+    fill_timeout_ms = 180000
 }
 
 local function integer(value, minimum, maximum)

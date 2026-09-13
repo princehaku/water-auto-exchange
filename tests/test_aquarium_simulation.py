@@ -381,6 +381,88 @@ class SimulationTests(unittest.TestCase):
         self.assertEqual(sim['fill_on_since'], 1001)
         self.assertEqual(sim['level'], 43)
 
+    def test_uncalibrated_unknown_active_report_requires_all_off_before_new_timers(self):
+        self.report(state='EXCHANGING', fill='1', drain='1')
+        self.assertEqual(self.simulation()['fill_on_since'], 1000)
+        self.assertEqual(self.simulation()['drain_on_since'], 1000)
+        self.now += 3
+        self.report(state='FAULT', outputs_known='0')
+        self.assertTrue(self.simulation()['uncertain'])
+        self.now += 1
+        self.report(state='EXCHANGING', fill='1', drain='1')
+        sim = self.simulation()
+        self.assertTrue(sim['uncertain'])
+        self.assertIsNone(sim['fill_on_since'])
+        self.assertIsNone(sim['drain_on_since'])
+        self.report(state='DRAINING', drain='1')
+        self.assertTrue(self.simulation()['uncertain'])
+        self.assertIsNone(self.simulation()['drain_on_since'])
+        self.report()
+        self.assertFalse(self.simulation()['uncertain'])
+        self.now += 2
+        self.report(state='EXCHANGING', fill='1', drain='1')
+        sim = self.simulation()
+        self.assertFalse(sim['uncertain'])
+        self.assertEqual(sim['fill_on_since'], 1006)
+        self.assertEqual(sim['drain_on_since'], 1006)
+        self.assertIsNone(sim['level'])
+
+    def test_uncalibrated_disconnect_and_stale_reports_cannot_restart_active_timers(self):
+        for interruption in ('disconnect', 'snapshot_gap', 'report_gap'):
+            with self.subTest(interruption=interruption):
+                store = Store(':memory:', lambda: self.now)
+                self.addCleanup(store.db.close)
+                session = store.ws_open(STATUS)
+                active = dict(STATUS, state='EXCHANGING', fill='1', drain='1')
+                store.ws_touch(session, active)
+                if interruption == 'disconnect':
+                    store.ws_close(session)
+                    self.now += 1
+                    session = store.ws_open(active)
+                else:
+                    self.now += 13
+                    if interruption == 'snapshot_gap':
+                        store.ws_touch(session)
+                        self.assertTrue(store.snapshot()['simulation']['uncertain'])
+                    store.ws_touch(session, active)
+                sim = store.snapshot()['simulation']
+                self.assertTrue(sim['uncertain'])
+                self.assertIsNone(sim['fill_on_since'])
+                self.assertIsNone(sim['drain_on_since'])
+                store.ws_touch(session, STATUS)
+                self.assertFalse(store.snapshot()['simulation']['uncertain'])
+                self.now += 1
+                store.ws_touch(session, active)
+                sim = store.snapshot()['simulation']
+                self.assertEqual(sim['fill_on_since'], self.now)
+                self.assertEqual(sim['drain_on_since'], self.now)
+                self.assertIsNone(sim['level'])
+
+    def test_uncalibrated_active_restart_requires_all_off_before_new_timer(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / 'water.db')
+            first = Store(path, lambda: self.now)
+            first.poll(GATEWAY, STATUS)
+            first.poll(GATEWAY, dict(STATUS, state='FILLING', fill='1'))
+            first.db.close()
+            self.now += 5
+            second = Store(path, lambda: self.now)
+            try:
+                second.poll(GATEWAY, dict(STATUS, state='FILLING', fill='1'))
+                sim = second.snapshot()['simulation']
+                self.assertTrue(sim['uncertain'])
+                self.assertIsNone(sim['fill_on_since'])
+                second.poll(GATEWAY, STATUS)
+                self.assertFalse(second.snapshot()['simulation']['uncertain'])
+                self.now += 1
+                second.poll(GATEWAY, dict(STATUS, state='FILLING', fill='1'))
+                sim = second.snapshot()['simulation']
+                self.assertEqual(sim['fill_on_since'], self.now)
+                self.assertFalse(sim['uncertain'])
+                self.assertIsNone(sim['level'])
+            finally:
+                second.db.close()
+
     def test_active_gap_requires_recalibration(self):
         self.calibrate()
         self.now = 1001

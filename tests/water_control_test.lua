@@ -642,16 +642,62 @@ test("partial reopen failure closes GPIO and does not write HIGH", function()
     equal(h.writes_since(0, 23, 1), 0)
 end)
 
-test("both board output timeouts execute LOW and close at 120 seconds", function()
+test("board fill and drain timeouts execute LOW then close at 180 and 300 seconds", function()
     for _, name in ipairs({"fill", "drain"}) do
         local h = board_fixture(); assert(h.controller.init()); h.poll(500)
+        local timeout = name == "fill" and 180000 or 300000
+        equal(h.config.timing[name .. "_timeout_ms"], timeout)
         assert(h.controller[name]())
-        h.poll(119999); equal(h.opened[h.config.outputs[name].gpio], true)
+        h.poll(timeout - 1); equal(h.opened[h.config.outputs[name].gpio], true)
+        -- A repeated ON at the deadline boundary must not buy more time.
+        assert(h.controller[name]())
+        local before = #h.events
         h.poll(1)
         local s = state(h, "FAULT")
         equal(s.reason, name .. "_timeout"); equal(s.outputs_known, true)
         equal(h.opened[23], false); equal(h.opened[5], false)
+        local gpio, low = h.config.outputs[name].gpio, false
+        for index = before + 1, #h.events do
+            local e = h.events[index]
+            if e.gpio == gpio and e.kind == "write" and e.value == 0 then low = true end
+            if e.gpio == gpio and e.kind == "close" then assert(low, "LOW must precede close") end
+        end
+        assert(low, "timeout must write LOW before releasing its output")
+        equal(h.controller[name](), false)
         h.poll(1000); equal(h.opened[23], false); equal(h.opened[5], false)
+        assert(h.controller.reset()); state(h, "IDLE")
+    end
+end)
+
+test("board independent deadlines survive both start orders and repeated ON", function()
+    for _, item in ipairs({
+        {first="fill", second="drain", delay=60000, deadline=180000, fault="fill_timeout"},
+        {first="drain", second="fill", delay=60000, deadline=240000, fault="fill_timeout"},
+        {first="drain", second="fill", delay=200000, deadline=300000, fault="drain_timeout"}
+    }) do
+        local h = board_fixture(); assert(h.controller.init()); h.poll(500)
+        assert(h.controller[item.first]()); h.poll(item.delay)
+        assert(h.controller[item.second]()); state(h, "EXCHANGING", true, true)
+        assert(h.controller[item.first]()); assert(h.controller[item.second]())
+        h.poll(item.deadline - item.delay - 1); state(h, "EXCHANGING", true, true)
+        assert(h.controller[item.first]()); assert(h.controller[item.second]())
+        local before = #h.events
+        h.poll(1)
+        equal(state(h, "FAULT").reason, item.fault)
+        both_off_attempted(h, before)
+        for _, gpio in ipairs({23, 5}) do
+            local low = false
+            for index = before + 1, #h.events do
+                local e = h.events[index]
+                if e.gpio == gpio and e.kind == "write" and e.value == 0 then low = true end
+                if e.gpio == gpio and e.kind == "close" then assert(low, "LOW must precede close") end
+            end
+            equal(h.opened[gpio], false)
+        end
+        equal(h.controller.fill(), false); equal(h.controller.drain(), false)
+        h.poll(1000); state(h, "FAULT")
+        assert(h.controller.reset()); state(h, "IDLE")
+        assert(h.controller[item.second]()); assert(h.controller.stop())
     end
 end)
 
@@ -696,7 +742,7 @@ test("concurrent board timeout and partial OFF failure attempt to shut both outp
         local h=board_fixture();assert(h.controller.init());h.poll(500)
         assert(h.controller.fill());h.poll(60000);assert(h.controller.drain())
         if failure=="timeout" then
-            h.poll(59999);state(h,"EXCHANGING",true,true)
+            h.poll(119999);state(h,"EXCHANGING",true,true)
             h.poll(1);equal(state(h,"FAULT").reason,"fill_timeout")
         else
             if failure=="close" then h.on_close=function(gpio) if gpio==23 then return false end end

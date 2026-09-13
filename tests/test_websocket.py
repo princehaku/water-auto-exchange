@@ -107,7 +107,13 @@ class WebSocketTests(unittest.TestCase):
         self.manual_roundtrip('0.7.7')
 
     def test_concurrent_outputs_and_independent_off_roundtrip(self):
-        status=dict(STATUS,version='0.8.0',control_mode='manual',need_fill='unknown')
+        self.concurrent_outputs_roundtrip('0.8.0')
+
+    def test_timeout_firmware_concurrent_outputs_and_independent_off_roundtrip(self):
+        self.concurrent_outputs_roundtrip('0.8.1')
+
+    def concurrent_outputs_roundtrip(self, version):
+        status=dict(STATUS,version=version,control_mode='manual',need_fill='unknown')
         c=self.connect(status=status)
         steps=[('DRAIN','DRAINING','0','1'),('FILL','EXCHANGING','1','1'),
                ('DRAIN_OFF','FILLING','1','0'),('FILL_OFF','IDLE','0','0')]
@@ -120,6 +126,22 @@ class WebSocketTests(unittest.TestCase):
             c.send(json.dumps(dict(type='ack',ack=dict(id=offer['id'],status='succeeded',result='OK '+command),status=status)))
             self.assertEqual(json.loads(c.recv())['type'],'received')
             self.assertEqual(self.store.snapshot()['device']['state'],state)
+
+    def test_timeout_firmware_automatic_roundtrip(self):
+        status = dict(STATUS, version='0.8.1', control_mode='automatic')
+        c = self.connect(status=status)
+        self.store.enqueue('START', '1'*32)
+        offer = json.loads(c.recv())
+        self.assertEqual(offer['command'], 'START')
+        c.send(json.dumps(dict(type='claim', id=offer['id'])))
+        self.assertEqual(json.loads(c.recv())['command'], 'START')
+        status.update(state='DRAINING', drain='1')
+        c.send(json.dumps(dict(type='ack', ack=dict(id=offer['id'], status='succeeded', result='OK START'), status=status)))
+        self.assertEqual(json.loads(c.recv())['type'], 'received')
+        self.assertEqual(self.store.snapshot()['device']['control_mode'], 'automatic')
+        for command in ('FILL', 'DRAIN', 'FILL_OFF', 'DRAIN_OFF'):
+            with self.assertRaises(Problem):
+                self.store.enqueue(command, '2'*32)
 
     def test_five_minute_traffic_report_and_idle_push(self):
         c = self.connect(status=dict(STATUS, version='0.7.7', control_mode='manual'))

@@ -40,6 +40,7 @@ def assert_one_screen(page):
     for selector in ('#header-connection', '#menu-device', '#menu-history', '#menu-calibration',
                      '#tank-canvas', '#level-value', '#fill-button', '#drain-button', '#stop',
                      '#fill-progress-text', '#drain-progress-text', '#orbit-hint',
+                     '#fill-countdown', '#drain-countdown',
                      '#volume-value', '#fill-rate', '#drain-rate', '#fill-volume',
                      '#drain-volume', '#net-flow', '#eta-label', '#eta-value', '#estimate-status'):
         box = page.locator(selector).bounding_box()
@@ -252,6 +253,174 @@ def expect_eta(page, seconds):
     assert abs(actual - math.ceil(seconds)) <= 2, (text, seconds)
 
 
+def sync_status(page):
+    with page.expect_response('**/api/status') as response:
+        page.evaluate("window.dispatchEvent(new Event('online'))")
+    assert response.value.ok, response.value.text()
+
+
+def expect_countdown(page, output, seconds):
+    selector = '#' + output + '-countdown'
+    if seconds is None:
+        expect(page.locator(selector)).to_have_text('—', timeout=6000)
+        return
+    page.wait_for_function("""({selector, seconds}) => {
+      const text = document.querySelector(selector)?.textContent.trim();
+      if (!/^\\d{2}:\\d{2}$/.test(text || '')) return false;
+      const [minutes, remaining] = text.split(':').map(Number);
+      return Math.abs(minutes * 60 + remaining - seconds) <= 2;
+    }""", arg=dict(selector=selector, seconds=seconds), timeout=6000)
+
+
+def assert_output_countdowns(page, store, report, output):
+    """Board-version limits and observed starts survive UI refreshes independently."""
+    command_requests = []
+
+    def track_commands(request):
+        if request.method == 'POST' and urlsplit(request.url).path.endswith('/api/commands'):
+            command_requests.append(request.url)
+
+    page.on('request', track_commands)
+    commands_before = store.snapshot()['commands']
+    try:
+        report(version='0.8.1', state='IDLE', fill='0', drain='0', ready='1',
+               outputs_known='1', reason='ready')
+        sync_status(page)
+        expect(page.locator('#version')).to_have_text('v0.8.1')
+        expect(page.locator('#fill-progress-text')).to_have_text(re.compile(r'/\s*180\s*秒$'))
+        expect(page.locator('#drain-progress-text')).to_have_text(re.compile(r'/\s*300\s*秒$'))
+        expect_countdown(page, 'fill', None)
+        expect_countdown(page, 'drain', None)
+        # Output protection does not require a calibrated capacity or water level.
+        assert not store.snapshot()['simulation']['calibrated']
+        report(state='EXCHANGING', fill='1', drain='1', reason='manual_exchanging')
+        starts = store.snapshot()['simulation']
+        report(elapsed=10)
+        sync_status(page)
+        expect_countdown(page, 'fill', 170)
+        expect_countdown(page, 'drain', 290)
+        expect_number(page, '#fill-progress-text', 10, tolerance=2)
+        expect_number(page, '#drain-progress-text', 10, tolerance=2)
+        for width, height, name in ((1440, 900, 'desktop'), (1366, 768, 'laptop'),
+                                    (390, 844, 'mobile'), (360, 640, 'mobile-small')):
+            page.set_viewport_size({'width': width, 'height': height})
+            assert_one_screen(page)
+            page.screenshot(path=str(output / ('aquarium-countdown-' + name + '.png')), full_page=True)
+        page.set_viewport_size({'width': 1440, 'height': 900})
+        page.reload()
+        expect(page.locator('#console')).to_be_visible()
+        expect_countdown(page, 'fill', 170)
+        expect_countdown(page, 'drain', 290)
+        for key in ('fill_on_since', 'drain_on_since'):
+            assert store.snapshot()['simulation'][key] == starts[key]
+
+        # Closing/reopening the inlet cannot restart the already-running drain.
+        report(elapsed=5, state='DRAINING', fill='0', reason='manual_draining')
+        sync_status(page)
+        expect_countdown(page, 'fill', None)
+        expect_countdown(page, 'drain', 285)
+        report(elapsed=0, state='EXCHANGING', fill='1', reason='manual_exchanging')
+        sync_status(page)
+        expect_countdown(page, 'fill', 180)
+        expect_countdown(page, 'drain', 285)
+        assert store.snapshot()['simulation']['drain_on_since'] == starts['drain_on_since']
+        fill_restarted = store.snapshot()['simulation']['fill_on_since']
+        report(elapsed=5, state='FILLING', drain='0', reason='manual_filling')
+        sync_status(page)
+        expect_countdown(page, 'fill', 175)
+        expect_countdown(page, 'drain', None)
+        assert store.snapshot()['simulation']['fill_on_since'] == fill_restarted
+        report(elapsed=0, state='EXCHANGING', drain='1', reason='manual_exchanging')
+        sync_status(page)
+        expect_countdown(page, 'fill', 175)
+        expect_countdown(page, 'drain', 300)
+
+        # Losing browser/API synchronization or IO knowledge must remove both
+        # clocks instead of displaying a confident count from a stale snapshot.
+        page.route('**/api/status', lambda route: route.abort())
+        page.evaluate("window.dispatchEvent(new Event('online'))")
+        expect(page.locator('#header-connection')).to_contain_text('状态未知', timeout=6000)
+        expect_countdown(page, 'fill', None)
+        expect_countdown(page, 'drain', None)
+        page.unroute('**/api/status')
+        sync_status(page)
+        expect_countdown(page, 'fill', 175)
+        expect_countdown(page, 'drain', 300)
+        report(outputs_known='0')
+        sync_status(page)
+        expect_countdown(page, 'fill', None)
+        expect_countdown(page, 'drain', None)
+        assert store.snapshot()['simulation']['uncertain']
+        report(outputs_known='1')
+        sync_status(page)
+        # Unknown IO may have been ON throughout. A new known ON cannot claim
+        # that firmware restarted either protection timer at the latest report.
+        expect_countdown(page, 'fill', None)
+        expect_countdown(page, 'drain', None)
+        assert store.snapshot()['simulation']['uncertain']
+        report(state='IDLE', fill='0', drain='0', reason='stopped')
+        sync_status(page)
+        assert not store.snapshot()['simulation']['uncertain']
+        expect_countdown(page, 'fill', None)
+        expect_countdown(page, 'drain', None)
+        report(elapsed=0, state='EXCHANGING', fill='1', drain='1', reason='manual_exchanging')
+        sync_status(page)
+        expect_countdown(page, 'fill', 180)
+        expect_countdown(page, 'drain', 300)
+        # A still-running 0.8.0 board retains its actual 120-second limits.
+        report(version='0.8.0', state='IDLE', fill='0', drain='0', reason='ready')
+        report(elapsed=0, state='EXCHANGING', fill='1', drain='1', reason='manual_exchanging')
+        report(elapsed=10)
+        sync_status(page)
+        expect(page.locator('#version')).to_have_text('v0.8.0')
+        for name in ('fill', 'drain'):
+            expect_countdown(page, name, 110)
+            expect(page.locator('#' + name + '-progress-text')).to_have_text(re.compile(r'/\s*120\s*秒$'))
+
+        # Simulated telemetry deliberately keeps outputs ON beyond both limits:
+        # the browser can show zero, but firmware—not a web timer—stops hardware.
+        report(version='0.8.1', state='IDLE', fill='0', drain='0', reason='ready')
+        report(elapsed=0, state='EXCHANGING', fill='1', drain='1', reason='manual_exchanging')
+        for _ in range(18):
+            report(elapsed=10)
+        sync_status(page)
+        expect(page.locator('#fill-countdown')).to_have_text('00:00')
+        expect_countdown(page, 'drain', 120)
+        expect(page.locator('#fill-button')).to_have_attribute('aria-checked', 'true')
+        assert not command_requests, command_requests
+        for _ in range(12):
+            report(elapsed=10)
+        sync_status(page)
+        for name in ('fill', 'drain'):
+            expect(page.locator('#' + name + '-countdown')).to_have_text('00:00')
+            expect(page.locator('#' + name + '-button')).to_have_attribute('aria-checked', 'true')
+        assert not command_requests, command_requests
+        assert store.snapshot()['commands'] == commands_before
+        store.gateway = None
+        store.connection_event(False, 'peer_disconnected')
+        sync_status(page)
+        expect(page.locator('#header-connection')).to_contain_text('设备异常')
+        expect_countdown(page, 'fill', None)
+        expect_countdown(page, 'drain', None)
+        report()
+        sync_status(page)
+        expect(page.locator('#header-connection')).to_contain_text('设备正常')
+        expect_countdown(page, 'fill', None)
+        expect_countdown(page, 'drain', None)
+        assert store.snapshot()['simulation']['uncertain']
+        report(state='IDLE', fill='0', drain='0', reason='stopped')
+        report(elapsed=0, state='EXCHANGING', fill='1', drain='1', reason='manual_exchanging')
+        sync_status(page)
+        expect_countdown(page, 'fill', 180)
+        expect_countdown(page, 'drain', 300)
+    finally:
+        page.remove_listener('request', track_commands)
+        page.unroute('**/api/status')
+        report(version='0.8.0', state='IDLE', fill='0', drain='0', ready='1',
+               outputs_known='1', reason='ready')
+        sync_status(page)
+
+
 def assert_water_estimates(page, store, report, output):
     """Exercise liters through real local HTTP, using only simulated device reports."""
     # Capacity is deliberately optional: an existing time-only calibration remains
@@ -367,6 +536,8 @@ def assert_water_estimates(page, store, report, output):
     # later report. The old quantities remain explicitly uncertain, even online.
     report(elapsed=13)
     expect(page.locator('#estimate-status')).to_contain_text('不确定', timeout=6000)
+    expect_countdown(page, 'fill', None)
+    expect_countdown(page, 'drain', None)
     assert store.snapshot()['simulation']['uncertain']
     expect_amounts(27.9, 1.2, 12.6, 10.5, 12.6)
     expect(page.locator('#net-flow')).to_contain_text('—')
@@ -392,7 +563,7 @@ def assert_water_estimates(page, store, report, output):
     assert_one_screen(page)
 
 
-def main(layout_only=False, estimates_only=False):
+def main(layout_only=False, estimates_only=False, countdowns_only=False):
     # A controlled clock keeps simulated device connectivity stable during UI work.
     now = [time.time()]
     store = Store(':memory:', lambda: now[0])
@@ -502,6 +673,15 @@ def main(layout_only=False, estimates_only=False):
                 return
 
             page.set_viewport_size({'width': 1440, 'height': 900})
+            if not estimates_only:
+                assert_output_countdowns(page, store, report, output)
+            if countdowns_only:
+                assert not errors, errors
+                browser.close()
+                print('PASS independent output countdowns: firmware 0.8.1 180/300 seconds, '
+                      'legacy 0.8.0 120 seconds, reload persistence, independent output restarts, '
+                      'uncalibrated levels, API/IO/offline unknowns, zero without web commands and four viewports')
+                return
             open_dialog(page, 'calibration')
             page.locator('#fill-seconds').fill('100')
             page.locator('#drain-seconds').fill('50')
@@ -521,6 +701,9 @@ def main(layout_only=False, estimates_only=False):
                 return
 
             # Rejection and pending receipts must never optimistically toggle outputs.
+            report(version='0.8.1')
+            sync_status(page)
+            expect(page.locator('#version')).to_have_text('v0.8.1')
             item = submitted(page, '#fill-button', 'FILL')
             expect(page.locator('#fill-button')).to_have_attribute('aria-checked', 'false')
             expect(page.locator('#drain-button')).to_be_disabled()
@@ -680,6 +863,7 @@ def main(layout_only=False, estimates_only=False):
                   'one-screen controls, mouse/touch/keyboard orbit, modal scrolling/close, automatic polling/receipts, '
                   'concurrent outputs, legacy guards, fault/offline indicator, visible dialog feedback, '
                   'optional capacity, liters/rates/run and calibration totals, net flow/ETA, '
+                  'versioned independent protection countdowns, reload persistence, no web timer commands, '
                   'independent run reset, uncertainty/recalibration, API recovery, logout race')
     finally:
         server.shutdown()
@@ -689,4 +873,5 @@ def main(layout_only=False, estimates_only=False):
 
 
 if __name__ == '__main__':
-    main(layout_only='--layout-only' in sys.argv, estimates_only='--estimates-only' in sys.argv)
+    main(layout_only='--layout-only' in sys.argv, estimates_only='--estimates-only' in sys.argv,
+         countdowns_only='--countdowns-only' in sys.argv)

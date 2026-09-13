@@ -45,6 +45,22 @@ test("configuration validates bounds, rejects nonintegers and snapshots values",
     assert(c:start(100))
 end)
 
+test("default manual deadlines limit fill to 180 seconds and drain to 300 seconds", function()
+    for _, name in ipairs({"fill", "drain"}) do
+        local c = water.new({mode="manual"})
+        c:update(0, nil, false); c:update(500, nil, false)
+        local timeout = name == "fill" and 180000 or 300000
+        assert(c["start_" .. name](c, 500))
+        c:update(500 + timeout - 1, nil, false)
+        equal(c:status()[name], true)
+        assert(c["start_" .. name](c, 500 + timeout - 1))
+        c:update(500 + timeout, nil, false)
+        equal(state(c, "FAULT").reason, name .. "_timeout")
+        equal(c["start_" .. name](c, 500 + timeout), false)
+        assert(c:reset(500 + timeout)); state(c, "IDLE")
+    end
+end)
+
 test("START waits for actual stable boolean observations, not elapsed command time", function()
     local c = fixture()
     local ok, reason = c:start(0)

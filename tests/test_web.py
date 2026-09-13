@@ -74,7 +74,7 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(self.command('DRAIN',4)['command'],'DRAIN')
 
     def test_manual_mode_is_explicit_and_legacy_cannot_bypass_level_checks(self):
-        for version in ('0.7.0','0.7.1','0.7.2','0.7.3', '0.7.4', '0.7.5', '0.7.6', '0.7.7', '0.8.0'):
+        for version in ('0.7.0','0.7.1','0.7.2','0.7.3', '0.7.4', '0.7.5', '0.7.6', '0.7.7', '0.8.0', '0.8.1'):
             for mode in (None,'typo',True):
                 with self.assertRaises(Problem):
                     self.online(version=version,control_mode=mode)
@@ -101,7 +101,13 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(self.command('FILL', 2)['command'], 'FILL')
 
     def test_concurrent_manual_commands_and_separate_off(self):
-        status = dict(STATUS, version='0.8.0', control_mode='manual', need_fill='unknown')
+        self.concurrent_manual_roundtrip('0.8.0')
+
+    def test_timeout_firmware_concurrent_manual_commands_and_separate_off(self):
+        self.concurrent_manual_roundtrip('0.8.1')
+
+    def concurrent_manual_roundtrip(self, version):
+        status = dict(STATUS, version=version, control_mode='manual', need_fill='unknown')
         self.store.poll(GATEWAY, status)
         steps = [('FILL', 'FILLING', '1', '0'), ('DRAIN', 'EXCHANGING', '1', '1'),
                  ('FILL_OFF', 'DRAINING', '0', '1'), ('FILL', 'EXCHANGING', '1', '1'),
@@ -124,7 +130,7 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(self.online(version='0.8.0', control_mode='manual')['command']['command'], 'STOP')
 
     def test_concurrent_capability_cannot_be_used_by_legacy_or_automatic_mode(self):
-        for version, mode in [('0.7.7','manual'), ('0.8.0','automatic')]:
+        for version, mode in [('0.7.7','manual'), ('0.8.0','automatic'), ('0.8.1','automatic')]:
             status=dict(STATUS,version=version,control_mode=mode)
             self.store.poll(GATEWAY,status)
             for command in ('FILL_OFF','DRAIN_OFF'):
@@ -134,6 +140,32 @@ class StoreTests(unittest.TestCase):
         base=dict(STATUS,version='0.8.0',control_mode='manual')
         for patch in [dict(state='EXCHANGING'),dict(state='FILLING',fill='1',drain='1')]:
             with self.assertRaises(Problem): validate_status(dict(base,**patch))
+
+    def test_timeout_firmware_automatic_mode_keeps_level_and_active_state_guards(self):
+        status = dict(STATUS, version='0.8.1', control_mode='automatic')
+        self.store.poll(GATEWAY, status)
+        with self.assertRaises(Problem) as error:
+            self.command('FILL')
+        self.assertEqual(error.exception.message, 'level_not_ready')
+        item = self.command('START')
+        self.assertEqual(self.store.poll(GATEWAY, status)['command']['command'], 'START')
+        status.update(state='DRAINING', drain='1')
+        self.store.poll(GATEWAY, status, dict(id=item['id'], status='succeeded', result='OK START'))
+        for command in ('FILL', 'DRAIN'):
+            with self.assertRaises(Problem) as error:
+                self.command(command, 2)
+            self.assertEqual(error.exception.message, 'device_not_ready')
+        self.assertEqual(self.command('STOP', 3)['command'], 'STOP')
+
+    def test_timeout_firmware_rejects_invalid_parallel_state(self):
+        base = dict(STATUS, version='0.8.1', control_mode='manual')
+        for patch in (dict(state='EXCHANGING'), dict(state='FILLING', fill='1', drain='1')):
+            with self.assertRaises(Problem) as error:
+                validate_status(dict(base, **patch))
+            self.assertEqual(error.exception.message, 'invalid_state')
+        with self.assertRaises(Problem) as error:
+            validate_status(dict(base, version='0.8.10'))
+        self.assertEqual(error.exception.message, 'firmware_mismatch')
 
     def test_concurrent_session_has_the_active_ten_second_deadline(self):
         status=dict(STATUS,version='0.8.0',control_mode='manual',state='EXCHANGING',fill='1',drain='1')
@@ -368,6 +400,23 @@ class FakeController:
 
 
 class GatewayTests(unittest.TestCase):
+    def test_timeout_firmware_parse_and_manual_commands(self):
+        status = dict(STATUS, version='0.8.1', control_mode='manual', need_fill='unknown')
+        line = 'OK STATUS ' + ' '.join(k+'='+v for k, v in status.items())
+        self.assertEqual(gateway.parse_status(line), status)
+        for command in ('FILL', 'DRAIN', 'FILL_OFF', 'DRAIN_OFF', 'STOP'):
+            c = FakeController()
+            c.status = lambda: dict(status)
+            self.assertEqual(gateway.execute(c, dict(id='x', command=command), 8000, 0)['status'], 'succeeded')
+            self.assertEqual(c.calls, [command])
+
+    def test_timeout_firmware_automatic_mode_rejects_independent_off_before_serial_write(self):
+        for command in ('FILL_OFF', 'DRAIN_OFF'):
+            c = FakeController()
+            c.status = lambda: dict(STATUS, version='0.8.1', control_mode='automatic')
+            self.assertEqual(gateway.execute(c, dict(id='x', command=command), 8000, 0)['result'], 'firmware_upgrade_required')
+            self.assertEqual(c.calls, [])
+
     def test_separate_off_requires_capable_firmware_before_serial_write(self):
         for command in ('FILL_OFF','DRAIN_OFF'):
             c=FakeController()

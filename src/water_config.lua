@@ -30,7 +30,7 @@ return {
         debounce_ms = 500,
         switch_delay_ms = 1000,
         -- Commission these limits using the actual volume and pump/valve flow.
-        drain_timeout_ms = 120000,
-        fill_timeout_ms = 120000
+        drain_timeout_ms = 300000,
+        fill_timeout_ms = 180000
     }
 }

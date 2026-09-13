@@ -25,7 +25,7 @@ class Problem(Exception):
 def validate_status(value):
     if not isinstance(value, dict):
         raise Problem(400, 'invalid_status')
-    if value.get('project') != 'water_auto_exchange' or value.get('version') not in ('0.3.0', '0.4.0', '0.5.0', '0.5.1', '0.5.2', '0.5.3', '0.6.0', '0.7.0', '0.7.1', '0.7.2', '0.7.3', '0.7.4', '0.7.5', '0.7.6', '0.7.7', '0.8.0'):
+    if value.get('project') != 'water_auto_exchange' or value.get('version') not in ('0.3.0', '0.4.0', '0.5.0', '0.5.1', '0.5.2', '0.5.3', '0.6.0', '0.7.0', '0.7.1', '0.7.2', '0.7.3', '0.7.4', '0.7.5', '0.7.6', '0.7.7', '0.8.0', '0.8.1'):
         raise Problem(409, 'firmware_mismatch')
     if value.get('state') not in ('UNCONFIGURED', 'IDLE', 'DONE', 'FAULT') + ACTIVE:
         raise Problem(400, 'invalid_state')
@@ -41,11 +41,11 @@ def validate_status(value):
             raise Problem(400, 'invalid_flag')
     if result['need_fill'] not in ('0', '1', 'unknown') or not result['cycle'].isdigit():
         raise Problem(400, 'invalid_level_or_cycle')
-    if result['version'] in ('0.7.0', '0.7.1', '0.7.2', '0.7.3', '0.7.4', '0.7.5', '0.7.6', '0.7.7', '0.8.0'):
+    if result['version'] in ('0.7.0', '0.7.1', '0.7.2', '0.7.3', '0.7.4', '0.7.5', '0.7.6', '0.7.7', '0.8.0', '0.8.1'):
         if value.get('control_mode') not in ('manual', 'automatic'):
             raise Problem(400, 'invalid_control_mode')
         result['control_mode'] = value['control_mode']
-    concurrent = result['version'] == '0.8.0' and result.get('control_mode') == 'manual'
+    concurrent = result['version'] in ('0.8.0', '0.8.1') and result.get('control_mode') == 'manual'
     if result['state'] == 'EXCHANGING' and not concurrent:
         raise Problem(400, 'invalid_state')
     if result['outputs_known'] == '1':
@@ -148,13 +148,13 @@ class Store:
         previous_at = sim['observed_at']
         known = status['outputs_known'] == '1'
         # An unknown endpoint cannot confirm how long the previous output ran.
-        if not known and sim['level'] is not None:
+        if not known and (sim['level'] is not None or sim['fill_on'] or sim['drain_on']):
             sim['uncertain'] = True
-        if sim['observed_known'] and previous_at is not None and sim['level'] is not None and not sim['uncertain']:
+        if sim['observed_known'] and previous_at is not None and not sim['uncertain']:
             elapsed = max(0, now - previous_at)
             if elapsed > 12 and (sim['fill_on'] or sim['drain_on']):
                 sim['uncertain'] = True
-            elif elapsed:
+            elif elapsed and sim['level'] is not None:
                 delta = (int(sim['fill_on']) * 100 / sim['fill_seconds']
                          - int(sim['drain_on']) * 100 / sim['drain_seconds']) * elapsed
                 sim['level'] = min(100, max(0, sim['level'] + delta))
@@ -165,6 +165,11 @@ class Store:
                             liters = sim['capacity_liters'] * elapsed / sim[key + '_seconds']
                             sim[key + '_run_liters'] += liters
                             sim[key + '_total_liters'] += liters
+        # Without a calibrated water history, confirmed all-OFF is enough to
+        # establish a fresh timer baseline. A calibrated estimate stays frozen
+        # until the user supplies a new observed water level.
+        if sim['level'] is None and known and status['fill'] == status['drain'] == '0':
+            sim['uncertain'] = False
         for key in ('fill', 'drain'):
             on = known and status[key] == '1'
             # Repeated ON, unknown reports and reconnects must not erase the
@@ -173,9 +178,9 @@ class Store:
                 sim[key + '_run_liters'] = 0.0 if sim['capacity_liters'] is not None else None
             if known:
                 sim[key + '_last_known_on'] = on
-            if on and (not sim['observed_known'] or not sim[key + '_on']):
+            if on and not sim['uncertain'] and (not sim['observed_known'] or not sim[key + '_on']):
                 sim[key + '_since'] = now
-            elif not on:
+            elif not on or sim['uncertain']:
                 sim[key + '_since'] = None
             sim[key + '_on'] = on
         sim['observed_known'], sim['observed_at'] = known, now
@@ -337,10 +342,10 @@ class Store:
             if not self.online():
                 raise Problem(409, 'device_offline')
             s = self.status
-            concurrent = s['version'] == '0.8.0' and s.get('control_mode') == 'manual'
+            concurrent = s['version'] in ('0.8.0', '0.8.1') and s.get('control_mode') == 'manual'
             if command in ('FILL_OFF', 'DRAIN_OFF') and not concurrent:
                 raise Problem(409, 'firmware_upgrade_required')
-            if command == 'DRAIN' and s['version'] not in ('0.6.0', '0.7.0', '0.7.1', '0.7.2', '0.7.3', '0.7.4', '0.7.5', '0.7.6', '0.7.7', '0.8.0'):
+            if command == 'DRAIN' and s['version'] not in ('0.6.0', '0.7.0', '0.7.1', '0.7.2', '0.7.3', '0.7.4', '0.7.5', '0.7.6', '0.7.7', '0.8.0', '0.8.1'):
                 raise Problem(409, 'firmware_upgrade_required')
             if command == 'START' and s.get('control_mode') == 'manual':
                 raise Problem(409, 'automatic_mode_required')

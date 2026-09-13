@@ -6,7 +6,7 @@ const resultNames={queued:'等待设备领取',delivered:'等待设备回执',su
 const stateNames={UNCONFIGURED:'等待配置',IDLE:'待机',DRAINING:'正在排水',SETTLING:'切换间隔',FILLING:'正在补水',EXCHANGING:'补水与排水同时进行',DONE:'本轮已完成',FAULT:'故障锁定'};
 const reasonNames={ready:'已就绪，可以操作',manual_filling:'补水正在运行',manual_draining:'冲水正在运行',manual_exchanging:'两路正在同时运行',stopped:'输出已停止',fill_timeout:'补水超时',drain_timeout:'排水超时',overflow:'超高水位触发',reset:'故障已复位',mapping_not_confirmed:'输出映射尚未确认',wiring_not_confirmed:'接线尚未确认'};
 const connectionReasons={connected:'设备已连接',connection_closed:'连接已关闭',peer_disconnected:'设备已断开',peer_closed:'设备主动断开',heartbeat_timeout:'设备通信超时',server_restarted:'服务已重启',protocol_or_internal_error:'连接异常',never_connected:'等待首次连接',auth_timeout:'认证超时',stale_session:'旧会话已结束',session_replaced:'新会话已接管'};
-const errors={login_required:'请先登录。',invalid_key:'管理密钥不正确。',try_later:'尝试过于频繁，请稍后再试。',device_offline:'设备已离线，命令未提交。',device_not_ready:'设备尚未就绪。',command_pending:'上一条命令尚在等待回执。',firmware_upgrade_required:'需要 0.8.0 手动模式才能独立关闭输出。',simulation_requires_idle:'校准时设备须在线，且补水、排水均已关闭。',invalid_simulation:'请填写 0–100% 的当前水位，以及 1–86400 秒的补水、排水用时。'};
+const errors={login_required:'请先登录。',invalid_key:'管理密钥不正确。',try_later:'尝试过于频繁，请稍后再试。',device_offline:'设备已离线，命令未提交。',device_not_ready:'设备尚未就绪。',command_pending:'上一条命令尚在等待回执。',firmware_upgrade_required:'需要 0.8.0 手动模式才能独立关闭输出。',simulation_requires_idle:'校准时设备须在线，且补水、排水均已关闭。',invalid_simulation:'当前水位须为 0–100%，补排水用时为 1–86400 秒；容量可不填，填写时须为 0.1–100000 L。'};
 const supportedManual=['0.7.0','0.7.1','0.7.2','0.7.3','0.7.4','0.7.5','0.7.6','0.7.7','0.8.0'];
 const refreshInterval=2000;
 let scene=null,snapshot=null,lastSnapshot=null,signedIn=false,lastSuccess=0,refreshRequest=null,authEpoch=0,busy=false,submittedId=null,formLoaded=false,refreshEnabled=true;
@@ -15,6 +15,9 @@ try{scene=createAquarium($('tank-canvas'));}catch(error){$('scene-fallback').hid
 
 function timeLabel(seconds){return Number.isFinite(seconds)?new Date(seconds*1000).toLocaleString('zh-CN',{hour12:false}):'尚无记录';}
 function durationLabel(seconds){if(!Number.isFinite(seconds))return '—';const s=Math.max(0,Math.floor(seconds));if(s<60)return s+' 秒';if(s<3600)return Math.floor(s/60)+' 分 '+s%60+' 秒';if(s<86400)return Math.floor(s/3600)+' 时 '+Math.floor(s%3600/60)+' 分';return Math.floor(s/86400)+' 天 '+Math.floor(s%86400/3600)+' 时';}
+function waterLabel(value){return Number.isFinite(value)?value.toLocaleString('zh-CN',{minimumFractionDigits:1,maximumFractionDigits:1})+' L':'— L';}
+function rateLabel(value,signed=false){if(!Number.isFinite(value))return '— L/min';const number=value!==0&&Math.abs(value)<.01?value.toPrecision(2):value.toLocaleString('zh-CN',{minimumFractionDigits:signed?1:0,maximumFractionDigits:2});return (signed&&value>0?'+':'')+number+' L/min';}
+function etaLabel(seconds){if(!Number.isFinite(seconds))return '—';const s=Math.max(0,Math.ceil(seconds)),parts=[Math.floor(s/60)%60,s%60];if(s>=3600)parts.unshift(Math.floor(s/3600));return parts.map(part=>String(part).padStart(2,'0')).join(':');}
 function bytesLabel(value){if(!Number.isFinite(value))return '尚未上报';const units=['B','KiB','MiB','GiB'];let unit=0;while(value>=1024&&unit<units.length-1){value/=1024;unit++;}return value.toFixed(unit?1:0)+' '+units[unit];}
 function serverNow(data){return data?.server_time+(Date.now()-lastSuccess)/1000;}
 const retryNotice='状态同步中断，正在自动重试。';
@@ -87,6 +90,27 @@ function renderProgress(data){
     $(output+'-progress').style.width=seconds===null?'0%':Math.min(100,seconds/120*100)+'%';
   }
 }
+function renderWaterEstimate(data,serviceOk=true){
+  const sim=data?.simulation||{},device=data?.device;
+  const calibrated=sim.calibrated===true,hasCapacity=Number.isFinite(sim.capacity_liters);
+  const synced=serviceOk&&Date.now()-lastSuccess<=10000;
+  const trusted=synced&&data?.online&&device?.outputs_known==='1'&&calibrated&&!sim.uncertain;
+  $('volume-value').textContent=hasCapacity?waterLabel(sim.volume_liters)+' / '+sim.capacity_liters.toLocaleString('zh-CN')+' L':'— L / 容量未设置';
+  for(const output of ['fill','drain']){
+    const rate=sim[output+'_rate_lpm'];
+    $(output+'-rate').textContent=rateLabel(rate);
+    $(output+'-volume').textContent=waterLabel(sim[output+'_run_liters']);
+    $(output+'-total').textContent=waterLabel(sim[output+'_total_liters']);
+  }
+  const net=trusted&&Number.isFinite(sim.net_lpm)?sim.net_lpm:null;
+  $('net-flow').textContent=rateLabel(net,true);
+  $('net-flow').dataset.direction=net===null||net===0?'steady':net>0?'fill':'drain';
+  const full=trusted&&Number.isFinite(sim.eta_full_seconds),empty=trusted&&Number.isFinite(sim.eta_empty_seconds);
+  $('eta-label').textContent=full?'预计满水':empty?'预计排空':'预计满 / 空';
+  $('eta-value').textContent=etaLabel(full?sim.eta_full_seconds:empty?sim.eta_empty_seconds:null);
+  $('estimate-status').textContent=!synced?'同步中断 · 预估暂停':!calibrated?'按现场水位校准后开始预估':sim.uncertain?'估算不确定 · 请重新校准':!data.online?'设备离线 · 预估暂停':device?.outputs_known!=='1'?'输出未知 · 预估暂停':!hasCapacity?'填写容量后可显示升数':device.fill==='0'&&device.drain==='0'?'待机 · 水量估算已保留':full||empty?'按当前开关估算 · 不会自动停泵':'进出平衡 · 水位预计保持';
+  $('calibration-updated').textContent=!calibrated?'尚未校准':Number.isFinite(sim.calibrated_at)?'上次校准 · '+timeLabel(sim.calibrated_at):'校准时间未记录';
+}
 function renderLevel(data){
   const sim=data.simulation||{},device=data.device,calibrated=sim.calibrated===true;
   const level=calibrated?Math.max(0,Math.min(100,Number(sim.level)||0)):65;
@@ -99,7 +123,8 @@ function renderLevel(data){
   $('scene-status').textContent=!calibrated?'场景示意':sim.uncertain?'估算不确定':data.online?'模拟同步中':'模拟已暂停';
   $('model-note').textContent=!calibrated?'没有水位传感器。填写历史满缸与空缸用时，并按现场已知水位校准，才能开始估算。':sim.uncertain?'工作期间通信中断或服务重启，实际停止时刻无法确认。请到现场核实并重新校准；旧估算不会继续推进。':'水位由补水、排水开启时长及校准速率推算，双路同时开启时按净变化计算。这里不是实测水位，也不决定设备的关断。';
   $('save-calibration').disabled=!(data.online&&device?.outputs_known==='1'&&device.fill==='0'&&device.drain==='0');
-  if(!formLoaded){if(calibrated){$('fill-seconds').value=String(sim.fill_seconds);$('drain-seconds').value=String(sim.drain_seconds);$('anchor-level').value=String(Math.round(sim.level));}formLoaded=true;}
+  if(!formLoaded){if(calibrated){$('fill-seconds').value=String(sim.fill_seconds);$('drain-seconds').value=String(sim.drain_seconds);$('anchor-level').value=String(Math.round(sim.level));$('capacity-liters').value=Number.isFinite(sim.capacity_liters)?String(sim.capacity_liters):'';}formLoaded=true;}
+  renderWaterEstimate(data);
 }
 function addCells(parent,values){const row=document.createElement('tr');for(const value of values){const cell=document.createElement('td');cell.textContent=value;row.append(cell);}parent.append(row);}
 function renderHistory(data){
@@ -145,11 +170,11 @@ async function refresh(){
   }catch(error){
     if(epoch!==authEpoch)return;
     if(error.status===401){showLogin();return;}
-    if(signedIn){snapshot=null;setConnection(lastSnapshot,false);renderControls();scene?.setFlow?.({fill:false,drain:false,circulation:true});$('save-calibration').disabled=true;$('sync-status').textContent='同步中断 · 自动重试';$('scene-status').textContent='服务连接中断';}
+    if(signedIn){snapshot=null;setConnection(lastSnapshot,false);renderControls();renderWaterEstimate(lastSnapshot,false);scene?.setFlow?.({fill:false,drain:false,circulation:true});$('save-calibration').disabled=true;$('sync-status').textContent='同步中断 · 自动重试';$('scene-status').textContent='服务连接中断';$('level-detail').textContent='同步中断 · 保留上次估算';}
     setMessage(retryNotice);
   }finally{clearTimeout(timeout);if(refreshRequest===request)refreshRequest=null;}
 }
-function updateClock(){if(!signedIn||!lastSnapshot)return;setConnection(lastSnapshot,snapshot!==null&&Date.now()-lastSuccess<=10000);if(snapshot){renderProgress(snapshot);renderControls();}}
+function updateClock(){if(!signedIn||!lastSnapshot)return;setConnection(lastSnapshot,snapshot!==null&&Date.now()-lastSuccess<=10000);renderWaterEstimate(lastSnapshot,snapshot!==null);if(snapshot){renderProgress(snapshot);renderControls();}}
 
 $('login-form').addEventListener('submit',async event=>{event.preventDefault();const button=event.target.querySelector('button');button.disabled=true;try{await api('login',{key:$('key').value});cancelRefresh();refreshEnabled=true;$('key').value='';setMessage('');await refresh();}catch(error){setMessage(error.message);}finally{button.disabled=false;}});
 $('logout').addEventListener('click',async()=>{try{await api('logout',{});showLogin();setMessage('已退出。');}catch(error){setMessage(error.message);}});
@@ -167,7 +192,7 @@ for(const button of document.querySelectorAll('[data-command]'))button.addEventL
 for(const button of document.querySelectorAll('[data-anchor]'))button.addEventListener('click',()=>{$('anchor-level').value=button.dataset.anchor;});
 $('calibration-form').addEventListener('submit',async event=>{
   event.preventDefault();const button=$('save-calibration');button.disabled=true;
-  try{await api('simulation',{level:Number($('anchor-level').value),fill_seconds:Number($('fill-seconds').value),drain_seconds:Number($('drain-seconds').value)});setMessage('模拟水位已校准。请以现场实际水位为准。');await refresh();}
+  try{await api('simulation',{level:Number($('anchor-level').value),fill_seconds:Number($('fill-seconds').value),drain_seconds:Number($('drain-seconds').value),capacity_liters:$('capacity-liters').value.trim()===''?null:Number($('capacity-liters').value)});$('message').textContent='';$('calibration-message').textContent='模拟水位已校准，本次与累计水量已清零。请以现场实际水位为准。';await refresh();}
   catch(error){setMessage(error.message);}finally{const device=snapshot?.device;button.disabled=!(snapshot?.online&&Date.now()-lastSuccess<=10000&&device?.outputs_known==='1'&&device.fill==='0'&&device.drain==='0');}
 });
 for(const button of document.querySelectorAll('[data-panel]'))button.addEventListener('click',()=>openPanel(button.dataset.panel));

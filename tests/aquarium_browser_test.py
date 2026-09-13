@@ -1,4 +1,6 @@
 """Real local HTTP + Edge integration for the compact 3D console; no physical IO."""
+import math
+import re
 import sys
 import threading
 import time
@@ -37,7 +39,9 @@ def assert_one_screen(page):
     assert max(metrics['rootHeight'], metrics['bodyHeight']) <= metrics['height'] + 1, metrics
     for selector in ('#header-connection', '#menu-device', '#menu-history', '#menu-calibration',
                      '#tank-canvas', '#level-value', '#fill-button', '#drain-button', '#stop',
-                     '#fill-progress-text', '#drain-progress-text', '#orbit-hint'):
+                     '#fill-progress-text', '#drain-progress-text', '#orbit-hint',
+                     '#volume-value', '#fill-rate', '#drain-rate', '#fill-volume',
+                     '#drain-volume', '#net-flow', '#eta-label', '#eta-value', '#estimate-status'):
         box = page.locator(selector).bounding_box()
         assert box and box['width'] > 0 and box['height'] > 0, (selector, box)
         assert box['x'] >= -1 and box['x'] + box['width'] <= metrics['width'] + 1, (selector, box)
@@ -48,6 +52,9 @@ def assert_one_screen(page):
     overlap_width = min(title['x'] + title['width'], hint['x'] + hint['width']) - max(title['x'], hint['x'])
     overlap_height = min(title['y'] + title['height'], hint['y'] + hint['height']) - max(title['y'], hint['y'])
     assert overlap_width <= 1 or overlap_height <= 1, ('scene title overlaps gesture hint', title, hint)
+    if metrics['width'] <= 700 and metrics['height'] >= 640:
+        scene = page.locator('#tank-canvas').bounding_box()
+        assert scene['height'] >= 110, ('Water metrics must leave a usable phone scene', scene)
     expect(page.locator('[data-view]')).to_have_count(0)
 
 
@@ -228,7 +235,164 @@ def assert_dialog_bounds(page, name, require_scroll=False):
         assert scrollable, 'Long history must scroll inside the dialog'
 
 
-def main(layout_only=False):
+def expect_number(page, selector, value, tolerance=.11):
+    """Assert the rendered quantity without coupling to unit placement or rounding."""
+    page.wait_for_function("""({selector, value, tolerance}) => {
+      const text = document.querySelector(selector)?.textContent.replaceAll('−', '-');
+      const match = text?.match(/[+-]?\\d+(?:\\.\\d+)?/);
+      return match && Math.abs(Number(match[0]) - value) <= tolerance;
+    }""", arg=dict(selector=selector, value=value, tolerance=tolerance), timeout=6000)
+
+
+def expect_eta(page, seconds):
+    text = page.locator('#eta-value').inner_text().strip()
+    assert re.fullmatch(r'\d{2,}:\d{2}(?::\d{2})?', text), text
+    parts = [int(part) for part in text.split(':')]
+    actual = sum(part * 60 ** index for index, part in enumerate(reversed(parts)))
+    assert abs(actual - math.ceil(seconds)) <= 2, (text, seconds)
+
+
+def assert_water_estimates(page, store, report, output):
+    """Exercise liters through real local HTTP, using only simulated device reports."""
+    # Capacity is deliberately optional: an existing time-only calibration remains
+    # useful for percentages without inventing a volume or a configured flow rate.
+    assert store.snapshot()['simulation']['capacity_liters'] is None
+    expect(page.locator('#volume-value')).to_contain_text('容量未设置')
+    expect(page.locator('#fill-volume')).to_have_text('— L')
+    expect(page.locator('#drain-volume')).to_have_text('— L')
+
+    def calibrate(level, capacity='60'):
+        open_dialog(page, 'calibration')
+        page.locator('#capacity-liters').fill(capacity)
+        page.locator('#fill-seconds').fill('100')
+        page.locator('#drain-seconds').fill('50')
+        page.locator('#anchor-level').fill(str(level))
+        with page.expect_response('**/api/simulation') as response:
+            page.locator('#save-calibration').click()
+        assert response.value.ok, response.value.text()
+        expect(page.locator('#level-value')).to_have_text(str(level) + '%')
+        close_dialog(page, 'calibration')
+        expect(page.locator('#message')).to_be_empty()
+        assert page.locator('#stop').evaluate("""button => {
+          const box = button.getBoundingClientRect();
+          return document.elementFromPoint(box.x + box.width / 2, box.y + box.height / 2)
+            ?.closest('#stop') === button;
+        }"""), 'Calibration feedback must not cover the stop control after closing its dialog'
+
+    def expect_amounts(volume, fill_run, drain_run, fill_total, drain_total):
+        expected = dict(volume_liters=volume, fill_run_liters=fill_run,
+                        drain_run_liters=drain_run, fill_total_liters=fill_total,
+                        drain_total_liters=drain_total)
+        simulation = store.snapshot()['simulation']
+        for key, value in expected.items():
+            assert abs(simulation[key] - value) < .00001, (key, simulation[key], value)
+        expect_number(page, '#volume-value', volume)
+        expect_number(page, '#fill-volume', fill_run)
+        expect_number(page, '#drain-volume', drain_run)
+        expect_number(page, '#fill-total', fill_total)
+        expect_number(page, '#drain-total', drain_total)
+
+    calibrate(50)
+    expect_amounts(30, 0, 0, 0, 0)
+    expect_number(page, '#fill-rate', 36)
+    expect_number(page, '#drain-rate', 72)
+    expect_number(page, '#net-flow', 0)
+    expect(page.locator('#eta-value')).to_have_text('—')
+    open_dialog(page, 'calibration')
+    expect(page.locator('#calibration-updated')).not_to_have_text('—')
+    expect(page.locator('#fill-total')).to_be_visible()
+    expect(page.locator('#drain-total')).to_be_visible()
+    close_dialog(page, 'calibration')
+
+    report(state='FILLING', fill='1', reason='manual_filling')
+    report(elapsed=10)
+    expect_amounts(36, 6, 0, 6, 0)
+    expect_number(page, '#net-flow', 36)
+    expect(page.locator('#eta-label')).to_contain_text('满')
+    expect_eta(page, 40)
+
+    # Only continuous, fresh reports account for delivery. A second open output
+    # changes net flow while keeping the already-running inlet's own total.
+    report(state='EXCHANGING', drain='1', reason='manual_exchanging')
+    report(elapsed=5)
+    expect_amounts(33.15, 9.15, 6, 9.15, 6)
+    expect_number(page, '#net-flow', -36)
+    expect(page.locator('#eta-label')).to_contain_text('空')
+    expect_eta(page, 55.25)
+    for width, height, name in ((1440, 900, 'desktop'), (1366, 768, 'laptop'),
+                                (390, 844, 'mobile'), (360, 640, 'mobile-small')):
+        page.set_viewport_size({'width': width, 'height': height})
+        assert_one_screen(page)
+        page.screenshot(path=str(output / ('aquarium-estimates-' + name + '.png')), full_page=True)
+        if width == 360:
+            open_dialog(page, 'calibration')
+            assert_dialog_bounds(page, 'calibration')
+            page.locator('#drain-total').scroll_into_view_if_needed()
+            expect(page.locator('#drain-total')).to_be_visible()
+            page.screenshot(path=str(output / 'aquarium-estimates-mobile-calibration.png'), full_page=True)
+            close_dialog(page, 'calibration')
+    page.set_viewport_size({'width': 1440, 'height': 900})
+
+    report(state='DRAINING', fill='0', reason='manual_draining')
+    report(elapsed=5)
+    expect_amounts(27, 9.3, 12.3, 9.3, 12.3)
+    expect_number(page, '#net-flow', -72)
+    expect_eta(page, 22.5)
+    report(state='IDLE', drain='0', reason='stopped')
+    expect_amounts(26.7, 9.3, 12.6, 9.3, 12.6)
+    expect_number(page, '#net-flow', 0)
+    expect(page.locator('#eta-value')).to_have_text('—')
+    page.reload()
+    expect(page.locator('#console')).to_be_visible()
+    expect_amounts(26.7, 9.3, 12.6, 9.3, 12.6)
+
+    # A new inlet run starts at zero; its calibration total survives that reset.
+    report(state='FILLING', fill='1', reason='manual_filling')
+    report(elapsed=2)
+    expect_amounts(27.9, 1.2, 12.6, 10.5, 12.6)
+    expect_number(page, '#net-flow', 36)
+    expect_eta(page, 53.5)
+    page.route('**/api/status', lambda route: route.abort())
+    expect(page.locator('#estimate-status')).to_contain_text('同步中断', timeout=6000)
+    expect(page.locator('#net-flow')).to_contain_text('—')
+    expect(page.locator('#eta-value')).to_have_text('—')
+    expect_number(page, '#fill-volume', 1.2)
+    expect_number(page, '#fill-total', 10.5)
+    page.unroute('**/api/status')
+    expect(page.locator('#header-connection')).to_contain_text('设备正常', timeout=6000)
+    expect_amounts(27.9, 1.2, 12.6, 10.5, 12.6)
+    expect_number(page, '#net-flow', 36)
+
+    # A gap beyond fresh telemetry's allowance cannot be reconstructed from the
+    # later report. The old quantities remain explicitly uncertain, even online.
+    report(elapsed=13)
+    expect(page.locator('#estimate-status')).to_contain_text('不确定', timeout=6000)
+    assert store.snapshot()['simulation']['uncertain']
+    expect_amounts(27.9, 1.2, 12.6, 10.5, 12.6)
+    expect(page.locator('#net-flow')).to_contain_text('—')
+    expect(page.locator('#eta-value')).to_have_text('—')
+    report(state='IDLE', fill='0', reason='stopped')
+    expect(page.locator('#fill-button')).to_have_attribute('aria-checked', 'false', timeout=6000)
+    expect(page.locator('#estimate-status')).to_contain_text('不确定')
+    expect_amounts(27.9, 1.2, 12.6, 10.5, 12.6)
+
+    calibrate(100)
+    expect_amounts(60, 0, 0, 0, 0)
+    assert not store.snapshot()['simulation']['uncertain']
+    expect(page.locator('#estimate-status')).not_to_contain_text('不确定')
+    # Full/empty are volume bounds, not an excuse to discard a still-open
+    # valve's delivered-water estimate. This also matches the reference card.
+    report(state='FILLING', fill='1', reason='manual_filling')
+    report(elapsed=10)
+    expect_amounts(60, 6, 0, 6, 0)
+    expect_eta(page, 0)
+    report(state='IDLE', fill='0', reason='stopped')
+    calibrate(100)
+    expect_amounts(60, 0, 0, 0, 0)
+    assert_one_screen(page)
+
+
+def main(layout_only=False, estimates_only=False):
     # A controlled clock keeps simulated device connectivity stable during UI work.
     now = [time.time()]
     store = Store(':memory:', lambda: now[0])
@@ -248,8 +412,8 @@ def main(layout_only=False):
     store.poll(gateway, status)
     command_count = 0
 
-    def report(**changes):
-        now[0] += .25
+    def report(elapsed=.25, **changes):
+        now[0] += elapsed
         status.update(changes)
         store.poll(gateway, status)
 
@@ -346,6 +510,15 @@ def main(layout_only=False):
             expect(page.locator('#level-value')).to_have_text('100%')
             close_dialog(page, 'calibration')
             assert_one_screen(page)
+
+            assert_water_estimates(page, store, report, output)
+            if estimates_only:
+                assert not errors, errors
+                browser.close()
+                print('PASS water estimate browser: optional capacity, calibrated rates, current/run/total liters, '
+                      'concurrent net flow and ETA, independent run reset, service interruption, stale telemetry, '
+                      'recalibration, four viewports and phone calibration dialog')
+                return
 
             # Rejection and pending receipts must never optimistically toggle outputs.
             item = submitted(page, '#fill-button', 'FILL')
@@ -506,7 +679,8 @@ def main(layout_only=False):
             print('PASS compact 3D browser: both entry URLs, desktop 1440/1366, phone 390/360, '
                   'one-screen controls, mouse/touch/keyboard orbit, modal scrolling/close, automatic polling/receipts, '
                   'concurrent outputs, legacy guards, fault/offline indicator, visible dialog feedback, '
-                  'API recovery, logout race')
+                  'optional capacity, liters/rates/run and calibration totals, net flow/ETA, '
+                  'independent run reset, uncertainty/recalibration, API recovery, logout race')
     finally:
         server.shutdown()
         server.server_close()
@@ -515,4 +689,4 @@ def main(layout_only=False):
 
 
 if __name__ == '__main__':
-    main(layout_only='--layout-only' in sys.argv)
+    main(layout_only='--layout-only' in sys.argv, estimates_only='--estimates-only' in sys.argv)

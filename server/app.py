@@ -95,6 +95,15 @@ class Store:
             level=None, fill_seconds=None, drain_seconds=None, updated_at=None,
             uncertain=False, observed_at=None, observed_known=False,
             fill_on=False, drain_on=False, fill_since=None, drain_since=None)
+        # Older installations have percentage calibration but no capacity or
+        # volume history. Do not invent liters for their existing estimate.
+        self.simulation.setdefault('capacity_liters', None)
+        self.simulation.setdefault('calibrated_at', None)
+        for key in ('fill', 'drain'):
+            self.simulation.setdefault(key + '_last_known_on',
+                                       self.simulation[key + '_on'] if self.simulation['observed_known'] else None)
+            self.simulation.setdefault(key + '_run_liters', None)
+            self.simulation.setdefault(key + '_total_liters', None)
         # An output that was active before a server restart has an unknown stop time.
         if self.simulation['fill_on'] or self.simulation['drain_on']:
             self.simulation['uncertain'] = True
@@ -137,6 +146,10 @@ class Store:
         """Integrate only spans supported by consecutive, fresh device reports."""
         sim, now = self.simulation, self.clock()
         previous_at = sim['observed_at']
+        known = status['outputs_known'] == '1'
+        # An unknown endpoint cannot confirm how long the previous output ran.
+        if not known and sim['level'] is not None:
+            sim['uncertain'] = True
         if sim['observed_known'] and previous_at is not None and sim['level'] is not None and not sim['uncertain']:
             elapsed = max(0, now - previous_at)
             if elapsed > 12 and (sim['fill_on'] or sim['drain_on']):
@@ -146,11 +159,20 @@ class Store:
                          - int(sim['drain_on']) * 100 / sim['drain_seconds']) * elapsed
                 sim['level'] = min(100, max(0, sim['level'] + delta))
                 sim['updated_at'] = now
-        known = status['outputs_known'] == '1'
-        if not known and (sim['fill_on'] or sim['drain_on']):
-            sim['uncertain'] = True
+                if sim['capacity_liters'] is not None:
+                    for key in ('fill', 'drain'):
+                        if sim[key + '_on']:
+                            liters = sim['capacity_liters'] * elapsed / sim[key + '_seconds']
+                            sim[key + '_run_liters'] += liters
+                            sim[key + '_total_liters'] += liters
         for key in ('fill', 'drain'):
             on = known and status[key] == '1'
+            # Repeated ON, unknown reports and reconnects must not erase the
+            # last run. Only a confirmed OFF followed by ON starts a new one.
+            if on and sim[key + '_last_known_on'] is False:
+                sim[key + '_run_liters'] = 0.0 if sim['capacity_liters'] is not None else None
+            if known:
+                sim[key + '_last_known_on'] = on
             if on and (not sim['observed_known'] or not sim[key + '_on']):
                 sim[key + '_since'] = now
             elif not on:
@@ -168,23 +190,57 @@ class Store:
         level, fill_seconds, drain_seconds = numbers
         if not (0 <= level <= 100 and 1 <= fill_seconds <= 86400 and 1 <= drain_seconds <= 86400):
             raise Problem(400, 'invalid_simulation')
+        capacity = value.get('capacity_liters')
+        if capacity is not None and (type(capacity) not in (int, float) or not math.isfinite(capacity)
+                                     or not 0.1 <= capacity <= 100000):
+            raise Problem(400, 'invalid_simulation')
         with self.lock:
             if not self.online() or not self.status or self.status['outputs_known'] != '1' or self.status['fill'] != '0' or self.status['drain'] != '0':
                 raise Problem(409, 'simulation_requires_idle')
+            if 'capacity_liters' not in value:
+                capacity = self.simulation['capacity_liters']
             self.simulation.update(level=float(level), fill_seconds=float(fill_seconds),
                                    drain_seconds=float(drain_seconds), updated_at=self.clock(),
                                    uncertain=False, observed_at=self.clock(), observed_known=True,
-                                   fill_on=False, drain_on=False, fill_since=None, drain_since=None)
+                                   fill_on=False, drain_on=False, fill_since=None, drain_since=None,
+                                   capacity_liters=float(capacity) if capacity is not None else None,
+                                   calibrated_at=self.clock())
+            for key in ('fill', 'drain'):
+                self.simulation[key + '_last_known_on'] = False
+                self.simulation[key + '_run_liters'] = 0.0 if capacity is not None else None
+                self.simulation[key + '_total_liters'] = 0.0 if capacity is not None else None
             self.save_simulation()
             return self.simulation_snapshot()
 
     def simulation_snapshot(self):
         sim = self.simulation
+        online = self.online()
+        active = sim['fill_on'] or sim['drain_on']
+        if active and sim['observed_at'] is not None and self.clock() - sim['observed_at'] > 12:
+            sim['uncertain'] = True
+            sim['observed_known'] = False
+            sim['observed_at'] = None
+            sim['fill_since'] = sim['drain_since'] = None
+            self.save_simulation()
+        calibrated = sim['level'] is not None
+        capacity = sim['capacity_liters']
+        has_volume = calibrated and capacity is not None
+        trusted = calibrated and online and sim['observed_known'] and not sim['uncertain']
+        net_percent = (int(sim['fill_on']) * 100 / sim['fill_seconds']
+                       - int(sim['drain_on']) * 100 / sim['drain_seconds']) if trusted else None
         return dict(calibrated=sim['level'] is not None, level=sim['level'],
                     fill_seconds=sim['fill_seconds'], drain_seconds=sim['drain_seconds'],
-                    updated_at=sim['updated_at'], uncertain=sim['uncertain'],
+                    updated_at=sim['updated_at'], calibrated_at=sim['calibrated_at'], uncertain=sim['uncertain'],
                     observed_at=sim['observed_at'], fill_on_since=sim['fill_since'],
-                    drain_on_since=sim['drain_since'])
+                    drain_on_since=sim['drain_since'], capacity_liters=capacity,
+                    volume_liters=capacity * sim['level'] / 100 if has_volume else None,
+                    fill_rate_lpm=capacity * 60 / sim['fill_seconds'] if has_volume else None,
+                    drain_rate_lpm=capacity * 60 / sim['drain_seconds'] if has_volume else None,
+                    net_lpm=capacity * net_percent * 0.6 if has_volume and trusted else None,
+                    fill_run_liters=sim['fill_run_liters'], drain_run_liters=sim['drain_run_liters'],
+                    fill_total_liters=sim['fill_total_liters'], drain_total_liters=sim['drain_total_liters'],
+                    eta_full_seconds=(100 - sim['level']) / net_percent if trusted and net_percent > 0 else None,
+                    eta_empty_seconds=sim['level'] / -net_percent if trusted and net_percent < 0 else None)
 
     def traffic_report(self, session, value):
         with self.lock:

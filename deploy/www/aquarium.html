@@ -9,7 +9,7 @@
   <script type="module" src="./aquarium.js"></script>
 </head>
 <body>
-  <header class="topbar">
+  <header id="app-header" class="topbar" hidden>
     <a class="brand" href="./" aria-label="水序龟缸首页"><span class="brand-icon" aria-hidden="true">◈</span><span>水序 <small>龟缸水路</small></span></a>
     <nav class="top-menu" aria-label="控制台菜单">
       <button id="menu-device" data-panel="device-dialog" aria-haspopup="dialog" aria-controls="device-dialog" aria-expanded="false" disabled>设备状态</button>
@@ -19,7 +19,15 @@
     <button id="header-connection" class="connection-pill unknown" data-panel="device-dialog" aria-haspopup="dialog" aria-controls="device-dialog" aria-expanded="false" disabled>正在连接</button>
   </header>
   <main>
-    <section id="login-panel" class="login-panel" aria-labelledby="login-title">
+    <section id="startup-splash" class="startup-splash" aria-labelledby="startup-brand" aria-busy="true">
+      <div class="startup-mark" aria-hidden="true">◈</div>
+      <h1 id="startup-brand">水序</h1><p class="startup-caption">让每一次换水，都从容有序。</p>
+      <div class="startup-dots" aria-hidden="true"><i></i><i></i><i></i></div>
+      <p id="startup-message" class="startup-message" role="status" aria-live="polite">正在连接你的龟缸…</p>
+      <button id="startup-retry" class="text-button" type="button" hidden>重试连接 ↗</button>
+      <noscript><p class="startup-message">请开启 JavaScript 后重新加载页面。</p></noscript>
+    </section>
+    <section id="login-panel" class="login-panel" aria-labelledby="login-title" hidden>
       <div class="eyebrow">WELCOME BACK</div><h1 id="login-title">连接你的龟缸</h1><p>登录后查看三维鱼缸，手动控制补水与冲水。</p>
       <form id="login-form"><label for="key">管理密钥</label><div class="login-row"><input id="key" type="password" autocomplete="current-password" required placeholder="输入管理密钥"><button type="submit">进入控制台 ↗</button></div></form>
     </section>

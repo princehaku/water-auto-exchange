@@ -9,7 +9,7 @@ const connectionReasons={connected:'设备已连接',connection_closed:'连接�
 const errors={login_required:'请先登录。',invalid_key:'管理密钥不正确。',try_later:'尝试过于频繁，请稍后再试。',device_offline:'设备已离线，命令未提交。',device_not_ready:'设备尚未就绪。',command_pending:'上一条命令尚在等待回执。',control_timeout_pending:'已达到软上限，正在确认输出关闭。',firmware_upgrade_required:'需要 0.8.0 / 0.8.1 / 0.8.2 手动模式才能独立关闭输出。',simulation_requires_idle:'校准时设备须在线，且补水、排水均已关闭。',invalid_simulation:'当前水位须为 0–100%，补排水用时为 1–86400 秒；容量可不填，填写时须为 0.1–100000 L。'};
 const supportedManual=['0.7.0','0.7.1','0.7.2','0.7.3','0.7.4','0.7.5','0.7.6','0.7.7','0.8.0','0.8.1','0.8.2'];
 const refreshInterval=2000;
-let scene=null,snapshot=null,lastSnapshot=null,signedIn=false,lastSuccess=0,refreshRequest=null,authEpoch=0,busy=false,jobBusy=false,submittedId=null,observedExchangeId=null,formLoaded=false,refreshEnabled=true;
+let scene=null,snapshot=null,lastSnapshot=null,signedIn=false,lastSuccess=0,refreshRequest=null,authEpoch=0,busy=false,jobBusy=false,submittedId=null,observedExchangeId=null,formLoaded=false,refreshEnabled=true,startupPending=!!$('startup-splash');
 const outputBusy={fill:false,drain:false};
 Object.assign(errors,{invalid_output_run:'作业参数不正确，请刷新后重试。',output_run_active:'已有补排作业正在执行，请先结束对应作业。',output_run_requires_web:'完整用时作业需要 0.8.2 手动模式。',output_run_requires_idle:'本路须关闭并确认就绪后才能开始作业。',output_run_requires_calibration:'请先在校准中保存本路完整用时。',stale_output_run:'本路作业已变化，请等待同步后再操作。',request_id_conflict:'请求标识已使用，请刷新后重试。'});
 Object.assign(errors,{invalid_level_target:'目标水位须为 0–100%。',invalid_level_job:'任务参数不正确，请刷新后重试。',level_job_active:'已有水位任务正在执行，请先停止。',level_job_changed:'任务已变化，请等待同步后再操作。',level_job_requires_idle:'启动前设备须在线、就绪，且两路均已关闭。',level_job_requires_calibration:'水位估算尚未校准或已不确定，请按现场水位重新校准。',level_job_requires_web:'当前设备暂不支持目标水位任务。',level_target_reached:'当前估算已经达到目标水位。'});
@@ -39,7 +39,9 @@ async function api(path,body,signal=AbortSignal.timeout(6000)){
   return data;
 }
 function cancelRefresh(){authEpoch++;refreshRequest?.abort();refreshRequest=null;}
-function showLogin(){cancelRefresh();refreshEnabled=false;signedIn=false;snapshot=null;lastSnapshot=null;submittedId=null;observedExchangeId=null;lastSuccess=0;formLoaded=false;jobBusy=false;outputBusy.fill=outputBusy.drain=false;closePanels();updateMenus();$('console').hidden=true;$('login-panel').hidden=false;$('logout').hidden=true;$('header-connection').textContent='未登录';$('header-connection').className='connection-pill';$('header-connection').removeAttribute('title');$('header-connection').setAttribute('aria-label','未登录');$('hero-status').textContent='登录后查看设备';$('hero-seen').textContent='';}
+function finishStartup(){startupPending=false;const splash=$('startup-splash');if(splash){splash.hidden=true;splash.setAttribute('aria-busy','false');$('app-header').hidden=false;}}
+function showStartup(){if(!$('startup-splash'))return;startupPending=true;$('startup-splash').hidden=false;$('startup-splash').setAttribute('aria-busy','true');$('startup-message').textContent='正在连接你的龟缸…';$('startup-retry').hidden=true;$('app-header').hidden=true;$('login-panel').hidden=true;$('console').hidden=true;}
+function showLogin(){cancelRefresh();refreshEnabled=false;signedIn=false;snapshot=null;lastSnapshot=null;submittedId=null;observedExchangeId=null;lastSuccess=0;formLoaded=false;jobBusy=false;outputBusy.fill=outputBusy.drain=false;closePanels();updateMenus();$('console').hidden=true;$('login-panel').hidden=false;$('logout').hidden=true;$('header-connection').textContent='未登录';$('header-connection').className='connection-pill';$('header-connection').removeAttribute('title');$('header-connection').setAttribute('aria-label','未登录');$('hero-status').textContent='登录后查看设备';$('hero-seen').textContent='';finishStartup();}
 function setConnection(data,serviceOk=true){
   const connection=$('header-connection');
   const online=serviceOk&&data?.online===true,device=data?.device;
@@ -332,17 +334,19 @@ async function refresh(){
     if(epoch!==authEpoch)return;
     signedIn=true;lastSuccess=Date.now();updateMenus();$('login-panel').hidden=true;$('console').hidden=false;$('logout').hidden=false;
     render(data);$('sync-status').textContent='已同步 '+new Date(lastSuccess).toLocaleTimeString('zh-CN',{hour12:false});
-    clearRetryNotice();
+    clearRetryNotice();finishStartup();
   }catch(error){
     if(epoch!==authEpoch)return;
     if(error.status===401){showLogin();return;}
+    if(startupPending){$('startup-message').textContent='连接暂时中断，正在自动重试…';$('startup-splash').setAttribute('aria-busy','false');$('startup-retry').hidden=false;return;}
     if(signedIn){snapshot=null;setConnection(lastSnapshot,false);renderControls();renderProgress(lastSnapshot,false);renderWaterEstimate(lastSnapshot,false);scene?.setFlow?.({fill:false,drain:false,circulation:true});$('save-calibration').disabled=true;$('sync-status').textContent='同步中断 · 自动重试';$('scene-status').textContent='服务连接中断';$('level-detail').textContent='同步中断 · 保留上次估算';}
     setMessage(retryNotice);
   }finally{clearTimeout(timeout);if(refreshRequest===request)refreshRequest=null;}
 }
 function updateClock(){if(!signedIn||!lastSnapshot||document.hidden)return;setConnection(lastSnapshot,snapshot!==null&&Date.now()-lastSuccess<=10000);renderWaterEstimate(lastSnapshot,snapshot!==null);renderProgress(lastSnapshot,snapshot!==null);if(snapshot)renderControls();}
 
-$('login-form').addEventListener('submit',async event=>{event.preventDefault();const button=event.target.querySelector('button');button.disabled=true;try{await api('login',{key:$('key').value});cancelRefresh();refreshEnabled=true;$('key').value='';setMessage('');await refresh();}catch(error){setMessage(error.message);}finally{button.disabled=false;}});
+$('startup-retry')?.addEventListener('click',()=>{if(refreshRequest)return;showStartup();refresh();});
+$('login-form').addEventListener('submit',async event=>{event.preventDefault();const button=event.target.querySelector('button');button.disabled=true;try{await api('login',{key:$('key').value});cancelRefresh();refreshEnabled=true;$('key').value='';setMessage('');showStartup();await refresh();}catch(error){setMessage(error.message);}finally{button.disabled=false;}});
 $('logout').addEventListener('click',async()=>{try{await api('logout',{});showLogin();setMessage('已退出。');}catch(error){setMessage(error.message);}});
 async function confirmReset(){const dialog=$('confirm');dialog.returnValue='cancel';dialog.showModal();return new Promise(resolve=>dialog.addEventListener('close',()=>resolve(dialog.returnValue==='ok'),{once:true}));}
 async function submitOutputRun(output){

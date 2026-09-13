@@ -1864,9 +1864,12 @@ def main(layout_only=False, estimates_only=False, countdowns_only=False, soft_li
             # The first status request on a restored login also retries automatically.
             page.route('**/api/status', lambda route: route.abort())
             page.reload()
-            expect(page.locator('#message')).to_contain_text('正在自动重试')
+            expect(page.locator('#startup-splash')).to_be_visible()
+            expect(page.locator('#login-panel')).to_be_hidden()
+            expect(page.locator('#startup-message')).to_contain_text('正在自动重试')
             page.unroute('**/api/status')
             expect(page.locator('#console')).to_be_visible(timeout=6000)
+            expect(page.locator('#startup-splash')).to_be_hidden()
             expect(page.locator('#header-connection')).to_contain_text('设备正常')
             expect(page.locator('#message')).to_be_empty()
 

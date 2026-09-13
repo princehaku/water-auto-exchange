@@ -234,7 +234,7 @@ export function createAquarium(canvas) {
   for(let i=0;i<11;i++)box(.034,.035,.84,-.57+i*.112,.06,0,frameEdgeMat,rampGroup);
 
   // The bright green perimeter irrigation tube has static, unused spray nozzles.
-  const perimeter=tube([[-5.98,2.78,-1.77],[-5.57,2.42,-1.93],[-4.62,2.15,-1.91],[-3.28,2.46,-1.96],[-2.04,2.8,-1.98],[.45,2.72,-1.98],[2.85,2.79,-1.98],[5.58,2.73,-1.96],[5.78,2.65,-1.7],[5.79,2.48,.2],[5.73,2.27,1.85]],.061);
+  const perimeter=tube([[-5.72,2.78,-1.65],[-5.57,2.42,-1.93],[-4.62,2.15,-1.91],[-3.28,2.46,-1.96],[-2.04,2.8,-1.98],[.45,2.72,-1.98],[2.85,2.79,-1.98],[5.58,2.73,-1.96],[5.78,2.65,-1.7],[5.79,2.48,.2],[5.73,2.27,1.85]],.061);
   for(const [x,y,z] of [[-4.52,2.17,-1.91],[-.2,2.73,-1.98],[3.18,2.78,-1.98],[5.78,2.49,.14]]) {
     const connector=new THREE.Group();connector.position.set(x,y,z);if(x>5)connector.rotation.y=Math.PI/2;habitat.add(connector);
     rod([-.17,0,0],[.17,0,0],.115,connectorMat,connector);
@@ -250,13 +250,75 @@ export function createAquarium(canvas) {
   }
   // The return hose is a visual route only; its pump is not connected to the controls.
   tube([[3.57,1.16,-.87],[3.66,1.5,-1.15],[3.82,2.1,-1.99],[3.8,3.58,-2.0],[3.5,3.93,-2.05],[3.12,3.83,-2.25]],.046,greenMat,30);
-  // Separate controlled routes: white intake drains upward; green hose fills beside it.
+  // The rear LuatOS enclosure is a visual housing for the existing three water routes.
+  // All controlled hoses rise over the complete glass rim before reaching its outer face.
+  const controller=new THREE.Group();controller.name='luatos-controller';habitat.add(controller);
+  const enclosureMat=material(0xb9c5c1,{roughness:.52,metalness:.16});
+  const enclosureDark=material(0x263c3c,{roughness:.64});
+  const metalMat=material(0xa3b0a9,{roughness:.4,metalness:.7});
+  const controllerX=-.4,controllerY=2.52,controllerZ=-2.65;
+  for(const x of [-1.28,.48])for(const y of [1.92,3.12]) {
+    box(.2,.27,.07,x,y,-2.31,enclosureDark,controller);
+    rod([x,y,-2.335],[x,y,-2.42],.058,metalMat,controller);
+  }
+  box(2.26,1.62,.56,controllerX,controllerY,controllerZ,enclosureMat,controller);
+  box(2.12,1.48,.042,controllerX,controllerY,-2.948,enclosureDark,controller);
+  box(2.04,.035,.028,controllerX,3.22,-2.981,greenMat,controller);
+  for(const x of [-1.4,.6])for(const y of [1.86,3.18]) {
+    rod([x,y,-2.975],[x,y,-2.992],.031,metalMat,controller);
+    box(.035,.006,.004,x,y,-2.996,darkMat,controller);
+  }
+  const labelCanvas=document.createElement('canvas');labelCanvas.width=1024;labelCanvas.height=640;
+  const labelContext=labelCanvas.getContext('2d');
+  labelContext.fillStyle='#223b3c';labelContext.fillRect(0,0,1024,640);
+  labelContext.fillStyle='#edf5ef';labelContext.font='600 100px "Segoe UI",sans-serif';labelContext.fillText('LuatOS',54,128);
+  labelContext.fillStyle='#a9c2b9';labelContext.font='30px "Microsoft YaHei",sans-serif';labelContext.fillText('水族自动装置',60,185);
+  labelContext.strokeStyle='#59736c';labelContext.lineWidth=3;
+  for(const [y,color] of [[280,'#5ace9f'],[382,'#e6e6d4'],[484,'#a3b671']]) {
+    labelContext.beginPath();labelContext.moveTo(64,y);labelContext.lineTo(500,y);labelContext.lineTo(560,y-28);labelContext.lineTo(682,y-28);labelContext.stroke();
+    labelContext.fillStyle=color;labelContext.beginPath();labelContext.arc(64,y,7,0,Math.PI*2);labelContext.fill();
+  }
+  labelContext.textAlign='right';
+  for(const [text,y,color] of [['补水',154,'#69d5a6'],['排水',352,'#efedda'],['喷花',546,'#bdcb92']]) {
+    labelContext.fillStyle=color;labelContext.font='500 51px "Microsoft YaHei",sans-serif';labelContext.fillText(text,971,y);
+  }
+  labelContext.fillStyle='#a3b49e';labelContext.font='25px "Microsoft YaHei",sans-serif';labelContext.fillText('预留',970,588);
+  const labelMap=new THREE.CanvasTexture(labelCanvas);labelMap.colorSpace=THREE.SRGBColorSpace;
+  labelMap.anisotropy=Math.min(4,renderer.capabilities.getMaxAnisotropy());textures.push(labelMap);
+  const label=new THREE.Mesh(new THREE.PlaneGeometry(2.00,1.28),new THREE.MeshBasicMaterial({map:labelMap,toneMapped:false}));
+  label.rotation.y=Math.PI;label.position.set(controllerX,controllerY,-2.975);label.name='luatos-label';controller.add(label);
+  const routePorts=[{name:'fill',y:2.98,z:-2.60,color:greenMat},{name:'drain',y:2.52,z:-2.78,color:enclosureMat},{name:'irrigation',y:2.06,z:-2.98,color:orangeMat}];
+  for(const port of routePorts) {
+    const socket=new THREE.Group();socket.name=port.name+'-port';controller.add(socket);
+    rod([-1.5,port.y,-2.75],[-1.79,port.y,-2.75],.116,connectorMat,socket);
+    rod([-1.76,port.y,-2.75],[-1.84,port.y,-2.75],.088,port.color,socket);
+    rod([-1.84,port.y,-2.75],[-1.91,port.y,-2.75],.067,connectorMat,socket);
+    for(const x of [-1.61,-1.69]) {const collar=new THREE.Mesh(new THREE.TorusGeometry(.12,.012,5,14),metalMat);collar.rotation.y=Math.PI/2;collar.position.set(x,port.y,-2.75);socket.add(collar);}
+    // The clamp standoffs attach to the rear post, outside the wall and glazing.
+    box(.16,.2,.065,-2.2,port.y,-2.29,enclosureDark);
+    rod([-2.2,port.y,-2.322],[-2.2,port.y,port.z+.07],.027,metalMat);
+    const clip=new THREE.Mesh(new THREE.TorusGeometry(.079,.014,6,16),metalMat);clip.rotation.y=Math.PI/2;clip.position.set(-2.2,port.y,port.z);habitat.add(clip);
+  }
   const drainHoseMat=material(0xeeeede,{transparent:true,opacity:.76,roughness:.4});
-  const drainPipe=tube([[-5.2,.43,-.55],[-5.42,.51,-1.34],[-5.55,1.72,-1.84],[-5.53,2.7,-2.1]],.045,drainHoseMat,28);
+  const drainPipe=tube([[-5.2,.43,-.55],[-5.42,.51,-1.34],[-5.55,1.72,-1.77],[-5.55,3.65,-1.77],[-5.55,4.12,-1.92],[-5.55,4.17,-2.35],[-5.55,3.83,-2.74],[-5.4,2.86,-2.78],[-4.85,2.52,-2.78],[-3.3,2.52,-2.78],[-2.2,2.52,-2.78],[-1.91,2.52,-2.75]],.045,drainHoseMat,92);
   drainPipe.mesh.name='drain-pipe';
   const fillOutlet=new THREE.Vector3(-5.02,1.28,-1.48);
-  const fillPipe=tube([[-5.12,2.72,-1.86],[-5.1,2.08,-1.83],[-5.06,1.56,-1.57],fillOutlet.toArray()],.052,greenMat,28);
+  const fillPipe=tube([[-1.91,2.98,-2.75],[-2.2,2.98,-2.60],[-2.7,2.98,-2.60],[-4.55,2.98,-2.60],[-4.95,3.27,-2.60],[-5.04,3.88,-2.55],[-5.04,4.14,-2.32],[-5.04,4.12,-1.96],[-5.04,3.86,-1.67],[-5.02,2.75,-1.7],[-5.06,1.56,-1.57],fillOutlet.toArray()],.052,greenMat,92);
   fillPipe.mesh.name='fill-pipe';
+  const irrigationMat=material(0x479767,{roughness:.53});
+  const irrigationPipe=tube([[-1.91,2.06,-2.75],[-2.2,2.06,-2.98],[-3.1,2.06,-2.98],[-4.1,2.1,-2.98],[-4.53,2.62,-2.98],[-4.53,3.62,-2.93],[-4.53,4.1,-2.44],[-4.53,4.13,-1.97],[-4.53,3.79,-1.67],[-4.83,3.15,-1.48],[-5.38,2.83,-1.48],[-5.72,2.78,-1.65]],.052,irrigationMat,92);
+  irrigationPipe.mesh.name='irrigation-supply-pipe';
+  // Three distinct rim saddles hold the bends above the glass; no pane is perforated.
+  for(const pipe of [fillPipe,drainPipe,irrigationPipe]) {
+    let crossing=pipe.curve.getPoint(0),tangent=new THREE.Vector3(0,0,1),distance=Infinity;
+    for(let i=0;i<=500;i++){const t=i/500,p=pipe.curve.getPoint(t);if(p.y>3.9&&Math.abs(p.z+2.14)<distance){crossing=p;tangent=pipe.curve.getTangent(t);distance=Math.abs(p.z+2.14);}}
+    const x=crossing.x;
+    box(.17,.065,.42,x,3.875,-2.14,enclosureDark);
+    for(const z of [-1.965,-2.315])box(.17,.19,.052,x,3.77,z,enclosureDark);
+    rod([x,3.9,-2.14],[crossing.x,crossing.y-.065,crossing.z],.025,metalMat);
+    const guide=new THREE.Mesh(new THREE.TorusGeometry(.073,.013,6,16),metalMat);
+    guide.quaternion.setFromUnitVectors(new THREE.Vector3(0,0,1),tangent.normalize());guide.position.copy(crossing);habitat.add(guide);
+  }
   const filterMat=material(0x464f45);
   box(.72,.23,.42,-5.14,.47,-.62,filterMat);
   for(let i=0;i<8;i++)box(.026,.008,.37,-5.44+i*.085,.592,-.62,frameEdgeMat);
@@ -352,7 +414,7 @@ export function createAquarium(canvas) {
     const up=new THREE.Vector3().crossVectors(direction,right);
     const vertical=Math.tan(THREE.MathUtils.degToRad(camera.fov/2)),horizontal=vertical*camera.aspect;
     let distance=0;
-    for(const x of [-6.25,6.25])for(const y of [-.12,4.06])for(const z of [-2.35,2.33]) {
+    for(const x of [-6.25,6.25])for(const y of [-.12,4.4])for(const z of [-3.12,2.33]) {
       const p=new THREE.Vector3(x,y,z).sub(target);
       distance=Math.max(distance,p.dot(direction)+Math.abs(p.dot(right))/horizontal,p.dot(direction)+Math.abs(p.dot(up))/vertical);
     }

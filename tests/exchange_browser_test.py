@@ -120,6 +120,16 @@ def main():
     def click_exchange(page, cancel=False):
         with page.expect_response('**/api/level-job/cancel' if cancel else '**/api/level-job') as response:
             page.locator('#exchange-button').click()
+            if not cancel:
+                expect(page.locator('#exchange-confirm')).to_be_visible()
+                page.locator('#confirm-exchange-start').click()
+        assert response.value.ok, response.value.text()
+        sync_status(page)
+        return response.value.json()
+
+    def click_manual(page, direction):
+        with page.expect_response('**/api/output-run') as response:
+            page.locator('#' + direction + '-button').click()
         assert response.value.ok, response.value.text()
         sync_status(page)
         return response.value.json()
@@ -156,6 +166,25 @@ def main():
             expect(page.locator('#exchange-button')).to_be_enabled()
             layouts(page, 'idle')
 
+            # Opening, cancelling and Escape never start a task; time includes all 2s pauses.
+            for width, height, name in ((1440, 900, 'desktop'), (390, 844, 'mobile'), (360, 640, 'small')):
+                page.set_viewport_size(dict(width=width, height=height))
+                page.locator('#exchange-button').click()
+                expect(page.locator('#exchange-confirm-total')).to_have_text('约 8 分 58 秒')
+                assert job() is None
+                box = page.locator('#exchange-confirm').bounding_box()
+                assert box and box['x'] >= 0 and box['y'] >= 0 and box['x'] + box['width'] <= width and box['y'] + box['height'] <= height
+                button = page.locator('#confirm-exchange-start').bounding_box()
+                assert button['y'] + button['height'] <= height
+                page.screenshot(path=str(output / ('confirmation-' + name + '.png')), full_page=True)
+                if name == 'mobile':
+                    page.keyboard.press('Escape')
+                else:
+                    page.locator('[data-close="exchange-confirm"]').last.click()
+                expect(page.locator('#exchange-confirm')).to_be_hidden()
+                assert job() is None
+            page.set_viewport_size(dict(width=1440, height=900))
+
             first = click_exchange(page)
             assert first['mode'] == 'exchange' and first['direction'] == 'drain'
             assert math.isclose(first['total_seconds'], 520)
@@ -166,6 +195,13 @@ def main():
             expect(page.locator('#fill-button')).to_be_disabled()
             expect(page.locator('#menu-level-job')).to_be_disabled()
             expect(page.locator('#exchange-button')).to_contain_text('停止换水')
+            expect(page.locator('#job-summary')).to_be_visible()
+            expect(page.locator('#job-summary')).to_contain_text('正在换水')
+            expect(page.locator('#scene-status')).to_contain_text('正在换水 · 冲水中')
+            expect(page.locator('#drain-countdown')).to_have_text('05:20')
+            expect(page.locator('#drain-progress-text')).to_have_text('0 / 320 秒')
+            expect(page.locator('#fill-countdown')).to_have_text('03:20')
+            expect(page.locator('#fill-countdown-label')).to_have_text('补水待执行')
             layouts(page, 'draining')
             for width, height in ((1440, 900), (390, 844), (360, 640)):
                 page.set_viewport_size(dict(width=width, height=height))
@@ -173,10 +209,11 @@ def main():
                 assert_dialog_bounds(page, 'level-job')
                 expect(page.locator('#cancel-level-job')).to_be_enabled()
                 close_dialog(page, 'level-job')
-            advance(290)
+            advance(60)
             receipt('DRAIN_OFF')
             sync_status(page)
             assert job()['phase'] == 'waiting' and job()['stage'] == 'drain'
+            expect(page.locator('#drain-countdown')).to_have_text('04:20')
             expect(page.locator('#drain-button')).to_have_attribute('aria-checked', 'false')
             open_dialog(page, 'calibration')
             expect(page.locator('#save-calibration')).to_be_disabled()
@@ -185,7 +222,12 @@ def main():
             receipt('DRAIN')
             # Close the browser page: server alone must finish draining and start filling.
             page.close()
-            advance(30)
+            for _ in range(4):
+                advance(60)
+                receipt('DRAIN_OFF')
+                advance(2)
+                receipt('DRAIN')
+            advance(20)
             off = claim('DRAIN_OFF')
             assert job()['phase'] == 'stopping' and job()['stage'] == 'drain'
             advance(1)
@@ -204,12 +246,17 @@ def main():
             assert job()['stage'] == 'fill' and job()['id'] == first['id']
             expect(page.locator('#fill-button')).to_have_attribute('aria-checked', 'true')
             expect(page.locator('#drain-button')).to_have_attribute('aria-checked', 'false')
+            expect(page.locator('#job-summary')).to_contain_text('正在换水')
+            expect(page.locator('#scene-status')).to_contain_text('正在换水 · 补水中')
+            expect(page.locator('#fill-countdown')).to_have_text('03:20')
+            expect(page.locator('#drain-countdown')).to_have_text('00:00')
             layouts(page, 'filling')
-            advance(170)
-            receipt('FILL_OFF')
-            advance(2)
-            receipt('FILL')
-            advance(30)
+            for _ in range(3):
+                advance(60)
+                receipt('FILL_OFF')
+                advance(2)
+                receipt('FILL')
+            advance(20)
             receipt('FILL_OFF')
             sync_status(page)
             assert job()['status'] == 'completed', job()
@@ -218,9 +265,7 @@ def main():
             expect(page.locator('#exchange-button')).to_contain_text('一键换水')
             expect(page.locator('#command-feedback')).to_contain_text('一键换水已完成')
             layouts(page, 'completed')
-            assert [item[0] for item in trace] == [
-                'DRAIN', 'DRAIN_OFF', 'DRAIN', 'DRAIN_OFF',
-                'FILL', 'FILL_OFF', 'FILL', 'FILL_OFF'], trace
+            assert [item[0] for item in trace] == ['DRAIN', 'DRAIN_OFF'] * 6 + ['FILL', 'FILL_OFF'] * 4, trace
 
             # The transition pause remains cancellable; it must never queue a fill afterwards.
             calibrate(page, 1)
@@ -249,6 +294,36 @@ def main():
             advance(3)
             sync_status(page)
             assert job()['status'] == 'cancelled'
+
+            # Manual outputs also stop at the calibrated boundary before their duration cap.
+            calibrate(page, 99)
+            expect(page.locator('#fill-countdown')).to_have_text('00:02')
+            manual_fill = click_manual(page, 'fill')
+            assert manual_fill['boundary_protection'] and math.isclose(manual_fill['expected_remaining_seconds'], 2)
+            receipt('FILL')
+            advance(2)
+            receipt('FILL_OFF')
+            sync_status(page)
+            finished = store.snapshot()['output_runs']['fill']
+            assert finished['status'] == 'completed' and finished['reason'] == 'target_reached'
+            expect(page.locator('#fill-button')).to_be_disabled()
+            expect(page.locator('#fill-detail')).to_contain_text('已满水')
+            expect(page.locator('#drain-button')).to_be_enabled()
+
+            calibrate(page, 1)
+            expect(page.locator('#drain-countdown')).to_have_text('00:04')
+            manual_drain = click_manual(page, 'drain')
+            assert manual_drain['boundary_protection'] and math.isclose(manual_drain['expected_remaining_seconds'], 4)
+            receipt('DRAIN')
+            advance(4)
+            receipt('DRAIN_OFF')
+            sync_status(page)
+            finished = store.snapshot()['output_runs']['drain']
+            assert finished['status'] == 'completed' and finished['reason'] == 'target_reached'
+            expect(page.locator('#drain-button')).to_be_disabled()
+            expect(page.locator('#drain-detail')).to_contain_text('已空水')
+            expect(page.locator('#fill-button')).to_be_enabled()
+            assert page.locator('#control-timeout-note').count() == 0
             assert not errors, errors
             browser.close()
     finally:
@@ -261,9 +336,11 @@ def main():
         store.db.close()
     assert not heartbeat_errors, heartbeat_errors
     print('PASS one-click exchange: real local HTTP/WS 0.8.2, 80 -> 0 -> 100%, '
-          '290+30 drain / 170+30 fill, no fill before confirmed drain OFF and 2s pause, '
+          '60s rounds with shortened final round, no fill before confirmed drain OFF and 2s pause, '
           'closed-page continuation, stage and valve UI, transition and fill cancellation, '
-          '0% direct fill, 12 desktop/mobile screenshots, no page errors or physical IO')
+          '0% direct fill, confirmation and cancellation, full duration with pauses, '
+          'manual 99->100 and 1->0 stop early, boundary buttons disabled, '
+          '15 desktop/mobile screenshots, no page errors or physical IO')
 
 
 if __name__ == '__main__':

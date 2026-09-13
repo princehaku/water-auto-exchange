@@ -52,9 +52,9 @@ class LevelJobTests(unittest.TestCase):
         self.ack(command_id, fill='0', drain='0', state='IDLE', reason='stopped')
         return command_id
 
-    def test_thousand_seconds_in_four_rounds_keeps_total_volume(self):
+    def test_thousand_seconds_in_seventeen_rounds_keeps_total_volume(self):
         self.store.start_level_job(dict(target_level=100 - 100 / 3))
-        for number, duration in enumerate((290, 290, 290, 130), 1):
+        for number, duration in enumerate((60,) * 16 + (40,), 1):
             self.on()
             original_observed = self.store.simulation['observed_at']
             self.pulse(duration)
@@ -63,7 +63,7 @@ class LevelJobTests(unittest.TestCase):
             self.assertEqual(job['round'], number)
             self.assertEqual(self.store.simulation['observed_at'], original_observed)
             self.off()
-            if number < 4:
+            if number < 17:
                 self.assertEqual(self.store.level_job['phase'], 'waiting')
                 self.assertIsNone(self.store.ws_offer(self.session))
                 self.pulse(1.9)
@@ -78,14 +78,14 @@ class LevelJobTests(unittest.TestCase):
         self.assertIsNone(self.store.control_timeout)
         self.assertFalse(self.store.db.execute("SELECT 1 FROM commands WHERE command IN ('RESET','DRAIN_TIMEOUT')").fetchone())
 
-    def test_fill_uses_170_second_round_and_short_last_round(self):
+    def test_fill_uses_sixty_second_round_and_short_last_round(self):
         self.store.configure_simulation(dict(level=0, fill_seconds=1000, drain_seconds=3000))
         self.store.start_level_job(dict(target_level=20))
-        for duration in (170, 30):
+        for number, duration in enumerate((60, 60, 60, 20), 1):
             self.on('fill')
             self.pulse(duration)
             self.off('fill')
-            if duration == 170:
+            if number < 4:
                 self.pulse(2)
         self.assertEqual(self.store.level_job['status'], 'completed')
         self.assertAlmostEqual(self.store.level_job['elapsed_seconds'], 200)
@@ -93,24 +93,24 @@ class LevelJobTests(unittest.TestCase):
     def test_off_status_before_ack_stops_volume_clock_but_does_not_continue(self):
         self.store.start_level_job(dict(target_level=50))
         self.on()
-        self.pulse(290)
+        self.pulse(60)
         off_id = self.offer('DRAIN_OFF')
         self.status.update(drain='0', state='IDLE')
         self.store.ws_touch(self.session, self.status)
         self.pulse(3)
         job = self.store.snapshot()['level_job']
         self.assertEqual(job['phase'], 'stopping')
-        self.assertAlmostEqual(job['elapsed_seconds'], 290)
-        self.assertAlmostEqual(job['estimated_liters'], 5.8)
+        self.assertAlmostEqual(job['elapsed_seconds'], 60)
+        self.assertAlmostEqual(job['estimated_liters'], 1.2)
         self.assertIsNone(self.store.ws_offer(self.session))
         self.ack(off_id)
         self.assertEqual(self.store.level_job['phase'], 'waiting')
-        self.assertAlmostEqual(self.store.level_job['elapsed_seconds'], 290)
+        self.assertAlmostEqual(self.store.level_job['elapsed_seconds'], 60)
 
     def test_off_rejection_and_late_receipt_never_start_next_round(self):
         self.store.start_level_job(dict(target_level=50))
         self.on()
-        self.pulse(290)
+        self.pulse(60)
         off_id = self.offer('DRAIN_OFF')
         with self.assertRaises(Problem):
             self.store.ws_touch(self.session, self.status, dict(id=off_id, status='rejected', result='failed'))
@@ -124,7 +124,7 @@ class LevelJobTests(unittest.TestCase):
     def test_missing_off_receipt_closes_after_five_seconds_even_if_output_looks_off(self):
         self.store.start_level_job(dict(target_level=50))
         self.on()
-        self.pulse(290)
+        self.pulse(60)
         self.offer('DRAIN_OFF')
         self.status.update(drain='0', state='IDLE')
         self.store.ws_touch(self.session, self.status)
@@ -161,7 +161,7 @@ class LevelJobTests(unittest.TestCase):
             self.store.start_level_job(dict(target_level=40))
         self.assertEqual(caught.exception.message, 'level_job_active')
         self.on()
-        self.pulse(290)
+        self.pulse(60)
         self.off()
         self.store.configure_simulation(dict(level=90, fill_seconds=1000, drain_seconds=3000))
         self.assertEqual(self.store.level_job['reason'], 'calibration_changed')
@@ -194,6 +194,7 @@ class LevelJobTests(unittest.TestCase):
                     self.assertEqual(self.store.level_job['phase'], 'starting')
 
     def test_calibration_rejects_pending_manual_start_without_side_effects(self):
+        self.store.configure_simulation(dict(level=50, fill_seconds=1000, drain_seconds=3000))
         for command in ('FILL', 'DRAIN'):
             with self.subTest(command=command):
                 command_id = ('a' if command == 'FILL' else 'b') * 32
@@ -223,7 +224,7 @@ class LevelJobTests(unittest.TestCase):
                 self.store.ws_touch(self.session, STATUS)
                 self.store.start_level_job(dict(target_level=50))
                 self.on()
-                self.pulse(290)
+                self.pulse(60)
                 self.off()
                 self.store.ws_touch(self.session, dict(STATUS, **changes))
                 self.assertEqual(self.store.level_job['status'], 'failed')

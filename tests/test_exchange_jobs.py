@@ -75,12 +75,12 @@ class ExchangeJobTests(unittest.TestCase):
     def assert_no_fill_command(self):
         self.assertFalse(self.store.db.execute("SELECT 1 FROM commands WHERE command='FILL'").fetchone())
 
-    def test_four_round_exchange_counts_total_progress_and_volume_across_both_stages(self):
+    def test_eleven_round_exchange_counts_total_progress_and_volume_across_both_stages(self):
         job = self.start()
         self.assertEqual((job['mode'], job['stage'], job['target_level']), ('exchange', 'drain', 0))
-        self.assertEqual((job['total_seconds'], job['remaining_seconds'], job['estimated_rounds']), (600, 600, 4))
+        self.assertEqual((job['total_seconds'], job['remaining_seconds'], job['estimated_rounds']), (600, 600, 11))
         observed_progress = []
-        for number, (direction, duration) in enumerate((('drain', 290), ('drain', 110), ('fill', 170), ('fill', 30)), 1):
+        for number, (direction, duration) in enumerate((('drain', 60),) * 6 + (('drain', 40),) + (('fill', 60),) * 3 + (('fill', 20),), 1):
             self.on(direction)
             self.pulse(duration)
             self.assertEqual(self.store.level_job['phase'], 'stopping')
@@ -88,13 +88,13 @@ class ExchangeJobTests(unittest.TestCase):
             job = self.store.snapshot()['level_job']
             self.assertEqual(job['round'], number)
             observed_progress.append(job['progress'])
-            if number == 2:
+            if number == 7:
                 self.assertEqual(job['reason'], 'between_stages')
                 self.assertAlmostEqual(job['current_level'], 0)
                 self.assertAlmostEqual(job['remaining_seconds'], 200)
                 self.assertAlmostEqual(job['elapsed_seconds'], 400)
                 self.assertAlmostEqual(job['estimated_liters'], 30)
-            if number < 4:
+            if number < 11:
                 self.assertEqual(job['phase'], 'waiting')
                 self.assertIsNone(self.store.ws_offer(self.session))
                 self.pulse(1.9)
@@ -142,13 +142,14 @@ class ExchangeJobTests(unittest.TestCase):
         self.assertEqual(self.store.level_job['stage'], 'fill')
 
     def test_previous_round_off_receipt_cannot_release_stage_barrier(self):
+        self.configure(fill=60, drain=200)
         self.start()
         self.on('drain')
-        self.pulse(290)
+        self.pulse(60)
         previous_off = self.off('drain')
         self.pulse(2)
         self.on('drain')
-        self.pulse(110)
+        self.pulse(40)
         self.offer('DRAIN_OFF')
         self.ack(previous_off, drain='0', state='IDLE')
         self.assertEqual(self.store.level_job['phase'], 'stopping')
@@ -277,6 +278,52 @@ class ExchangeJobTests(unittest.TestCase):
         self.pulse(3)
         self.assertEqual(self.store.level_job['status'], 'failed')
         self.assert_no_fill_command()
+
+    def test_fault_reset_then_recalibration_starts_new_exchange_from_saved_current_level(self):
+        self.configure(level=100, fill=60, drain=400)
+        interrupted = self.start()
+        self.assertEqual(interrupted['total_seconds'], 460)
+        self.on('drain')
+        self.pulse(40)
+        self.store.ws_close(self.session)
+        self.assertTrue(self.store.simulation['uncertain'])
+        self.assertEqual(self.store.level_job['reason'], 'device_disconnected')
+        self.status = dict(STATUS, state='FAULT', reason='remote_timeout')
+        self.session = self.store.ws_open(self.status)
+        self.sequence = 0
+        self.store.enqueue('RESET', 'c' * 32)
+        self.ack(self.offer('RESET'), state='IDLE', reason='reset')
+        # RESET acknowledges the controller fault; only an explicit water-level
+        # calibration can establish a new trusted estimate after a lost lease.
+        with self.assertRaises(Problem) as caught:
+            self.start('b' * 32)
+        self.assertEqual(caught.exception.message, 'level_job_requires_calibration')
+        self.configure(level=22, fill=60, drain=400)
+        recovered = self.start('b' * 32)
+        self.assertEqual((recovered['start_level'], recovered['total_seconds']), (22, 148))
+        self.assertEqual(recovered['remaining_seconds'], 148)
+        self.assertEqual(recovered['elapsed_seconds'], 0)
+        self.assertEqual(recovered['progress'], 0)
+        self.assertEqual(self.start()['status'], 'failed')
+        self.assertEqual(self.store.level_job['id'], recovered['id'])
+        self.on('drain')
+        self.pulse(60)
+        self.off('drain')
+        self.pulse(2)
+        self.on('drain')
+        self.pulse(28)
+        self.off('drain')
+        self.assertEqual(self.store.level_job['reason'], 'between_stages')
+        self.assertAlmostEqual(self.store.level_job['remaining_seconds'], 60)
+        self.pulse(2)
+        self.on('fill')
+        self.pulse(60)
+        self.off('fill')
+        job = self.store.level_job
+        self.assertEqual(job['status'], 'completed')
+        self.assertAlmostEqual(job['elapsed_seconds'], 148)
+        self.assertAlmostEqual(job['current_level'], 100)
+        self.assertFalse(self.store.simulation['uncertain'])
 
     def test_calibration_and_other_jobs_are_blocked_during_stage_wait(self):
         self.short_drain_finished()

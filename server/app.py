@@ -13,9 +13,9 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 
 if __package__:
-    from .output_runs import OutputRuns
+    from .output_runs import OutputRuns, ROUND_SECONDS
 else:
-    from output_runs import OutputRuns
+    from output_runs import OutputRuns, ROUND_SECONDS
 
 ACTIVE = ('DRAINING', 'SETTLING', 'FILLING', 'EXCHANGING')
 COMMANDS = ('START', 'FILL', 'DRAIN', 'FILL_OFF', 'DRAIN_OFF', 'STOP', 'RESET')
@@ -115,6 +115,7 @@ class Store:
             self.save_level_job(True)
         self.web_limits = False
         self.control_runs = dict(fill=None, drain=None)
+        self.boundary_stops = dict(fill=None, drain=None)
         self.control_timeout = None
         self.control_uncertain = True
         self.connection_state, self.connection_since, self.connection_reason = 'offline', None, 'never_connected'
@@ -226,6 +227,37 @@ class Store:
     def job_running(self):
         return self.level_job is not None and self.level_job['status'] == 'running'
 
+    def output_estimate_trusted(self):
+        sim = self.simulation
+        return (type(sim['level']) in (int, float) and math.isfinite(sim['level'])
+                and not sim['uncertain'] and sim['observed_known']
+                and all(type(sim[key + '_seconds']) in (int, float) and math.isfinite(sim[key + '_seconds'])
+                        and sim[key + '_seconds'] > 0 for key in ('fill', 'drain')))
+
+    def output_boundary_reached(self, direction):
+        if not self.output_estimate_trusted():
+            return False
+        return self.simulation['level'] >= 100 - 0.000001 if direction == 'fill' else self.simulation['level'] <= 0.000001
+
+    def check_output_start(self, direction):
+        if not self.output_estimate_trusted():
+            raise Problem(409, 'output_requires_calibration')
+        if self.output_boundary_reached(direction):
+            raise Problem(409, direction + '_target_reached')
+
+    def output_boundary_eta(self, direction):
+        if not self.output_estimate_trusted():
+            return None
+        if self.output_boundary_reached(direction):
+            return 0.0
+        sim = self.simulation
+        other = 'drain' if direction == 'fill' else 'fill'
+        # Assume this route is enabled, including its next confirmed round;
+        # the other route contributes only while its output is actually ON.
+        rate = 100 / sim[direction + '_seconds'] - (100 / sim[other + '_seconds'] if sim[other + '_on'] else 0)
+        difference = 100 - sim['level'] if direction == 'fill' else sim['level']
+        return difference / rate if rate > 0.000000001 else None
+
     def job_refresh(self):
         job, runtime = self.level_job, self._job_runtime
         if not job:
@@ -308,7 +340,7 @@ class Store:
             status = self.status or {}
             if not self.web_limits or self.ws_gateway is None:
                 raise Problem(409, 'level_job_requires_web')
-            if not self.online() or status.get('outputs_known') != '1' or status.get('fill') != '0' or status.get('drain') != '0' or status.get('state') not in ('IDLE', 'DONE') or status.get('ready') != '1' or status.get('overflow') != '0' or self.control_timeout or self.control_uncertain or any(self.control_runs.values()):
+            if not self.online() or status.get('outputs_known') != '1' or status.get('fill') != '0' or status.get('drain') != '0' or status.get('state') not in ('IDLE', 'DONE') or status.get('ready') != '1' or status.get('overflow') != '0' or self.control_timeout or self.control_uncertain or any(self.control_runs.values()) or any(self.boundary_stops.values()):
                 raise Problem(409, 'level_job_requires_idle')
             if self.simulation['level'] is None or self.simulation['uncertain']:
                 raise Problem(409, 'level_job_requires_calibration')
@@ -321,11 +353,11 @@ class Store:
                 raise Problem(409, 'level_target_reached')
             direction = 'fill' if difference > 0 else 'drain'
             seconds = abs(difference) * self.simulation[direction + '_seconds'] / 100
-            limit = 170 if direction == 'fill' else 290
+            limit = ROUND_SECONDS
             rounds = math.ceil(seconds / limit)
             if mode == 'exchange' and direction == 'drain':
                 seconds += self.simulation['fill_seconds']
-                rounds += math.ceil(self.simulation['fill_seconds'] / 170)
+                rounds += math.ceil(self.simulation['fill_seconds'] / ROUND_SECONDS)
             self.level_job = dict(id=request_id or secrets.token_hex(16), mode=mode, stage=direction,
                                   status='running', phase='starting', direction=direction,
                                   target_level=float(target), start_level=self.simulation['level'], current_level=self.simulation['level'],
@@ -460,7 +492,7 @@ class Store:
                     self.job_finish('completed', 'target_reached')
                 else:
                     if runtime.pop('next_stage', None) == 'fill':
-                        job.update(stage='fill', direction='fill', target_level=100.0, round_limit_seconds=170)
+                        job.update(stage='fill', direction='fill', target_level=100.0, round_limit_seconds=ROUND_SECONDS)
                     self.job_start_round()
             self.job_refresh()
         finally:
@@ -480,6 +512,7 @@ class Store:
             now = self.clock()
             self.control_runs[key] = dict(since=now, deadline=now + seconds,
                                           until=self.control_clock() + seconds,
+                                          confirmation_until=self.control_clock() + 8,
                                           command_id=command_id, observed_on=False,
                                           grant_sequence=self.ws_grants[command_id]['sequence'])
 
@@ -534,6 +567,54 @@ class Store:
                     self.control_runs[key] = None
         self.control_uncertain = False
 
+    def observe_boundary_stops(self, status, ack=None):
+        for direction, stop in self.boundary_stops.items():
+            if not stop or not ack:
+                continue
+            grant = self.ws_grants.get(ack.get('id'))
+            row = self.db.execute('SELECT command FROM commands WHERE id=?', (ack.get('id'),)).fetchone()
+            current_stop = (ack.get('id') == stop['id'] or (grant and row and grant['sequence'] > stop['grant_sequence']
+                            and row['command'] in ('STOP', direction.upper() + '_OFF')))
+            if not current_stop:
+                continue
+            if ack.get('status') != 'succeeded':
+                self.control_abort('boundary_stop_rejected')
+            if status['outputs_known'] == '1' and status[direction] == '0':
+                if ack.get('id') != stop['id']:
+                    self.db.execute("UPDATE commands SET status='cancelled', result='superseded_by_confirmed_stop', finished=? WHERE id=? AND status IN ('queued','delivered')", (self.clock(), stop['id']))
+                    self.db.commit()
+                self.boundary_stops[direction] = None
+
+    def tick_boundary_stops(self):
+        if not self.web_limits or self.ws_gateway is None:
+            return
+        now = self.control_clock()
+        for direction in ('fill', 'drain'):
+            stop = self.boundary_stops[direction]
+            if stop:
+                if now >= stop['until']:
+                    self.control_abort('boundary_stop_unconfirmed')
+                continue
+            if self.job_running() or self.output_runner.running(direction):
+                continue
+            # Include a reserved ON that has not reported its output yet.
+            run = self.control_runs[direction]
+            if run is None and not self.simulation[direction + '_on']:
+                continue
+            unconfirmed = run is not None and not run['observed_on'] and now >= run['confirmation_until']
+            if unconfirmed:
+                self.freeze_estimate()
+            reason = 'start_unconfirmed' if unconfirmed else ('estimate_uncertain' if not self.output_estimate_trusted() else ('target_reached' if self.output_boundary_reached(direction) else None))
+            if reason:
+                pending = self.db.execute("SELECT id FROM commands WHERE command=? AND status IN ('queued','delivered')", (direction.upper(),)).fetchall()
+                for row in pending:
+                    # Retain granted control authority until OFF confirmation,
+                    # while removing its missing ACK from the dispatch barrier.
+                    state = 'uncertain' if row['id'] in self.ws_grants else 'cancelled'
+                    self.db.execute("UPDATE commands SET status=?, result='output_boundary_stop', finished=? WHERE id=?", (state, self.clock(), row['id']))
+                command_id = self.job_command(direction.upper() + '_OFF', ttl=5)
+                self.boundary_stops[direction] = dict(id=command_id, until=now + 5, reason=reason, grant_sequence=self.ws_grant_sequence)
+
     def control_tick(self, session=None):
         """Called by the WS owner every 100 ms, even with no browser/pings."""
         with self.lock:
@@ -542,6 +623,7 @@ class Store:
             try:
                 self.output_runner.tick()
                 self.job_tick()
+                self.tick_boundary_stops()
             except Problem:
                 if session is not None:
                     raise
@@ -638,7 +720,7 @@ class Store:
         with self.lock:
             self.expire()
             pending_on = self.db.execute("SELECT 1 FROM commands WHERE status IN ('queued','delivered') AND command IN ('FILL','DRAIN','START')").fetchone()
-            control_pending = self.control_timeout or any(self.control_runs.values()) or (self.web_limits and self.control_uncertain)
+            control_pending = self.control_timeout or any(self.control_runs.values()) or any(self.boundary_stops.values()) or (self.web_limits and self.control_uncertain)
             job_pending = self.output_runner.running() or (self.job_running() and (self.level_job['phase'] != 'waiting' or self.level_job.get('mode') == 'exchange'))
             if not self.online() or not self.status or self.status['outputs_known'] != '1' or self.status['fill'] != '0' or self.status['drain'] != '0' or pending_on or control_pending or job_pending:
                 raise Problem(409, 'simulation_requires_idle')
@@ -798,6 +880,10 @@ class Store:
             exchange_cancel = self.job_running() and self.level_job.get('mode') == 'exchange'
             if exchange_cancel and command not in ('STOP', 'FILL_OFF', 'DRAIN_OFF'):
                 raise Problem(409, 'level_job_active')
+            if self.web_limits and command in ('FILL', 'DRAIN'):
+                self.check_output_start(command.lower())
+                if self.boundary_stops[command.lower()]:
+                    raise Problem(409, 'output_stop_pending')
             if self.control_timeout and command not in ('STOP', 'FILL_OFF', 'DRAIN_OFF'):
                 raise Problem(409, 'control_timeout_pending')
             concurrent = s['version'] in ('0.8.0', '0.8.1', '0.8.2') and s.get('control_mode') == 'manual'
@@ -862,6 +948,7 @@ class Store:
             self.ws_ping_sequence = 0
             self.ws_activity_tick = None
             self.control_runs = dict(fill=None, drain=None)
+            self.boundary_stops = dict(fill=None, drain=None)
             self.control_timeout = None
             self.expire()
             if ack is not None:
@@ -909,6 +996,7 @@ class Store:
             self.ws_activity_tick = self.control_clock()
             self.web_limits = soft
             self.control_runs = dict(fill=None, drain=None)
+            self.boundary_stops = dict(fill=None, drain=None)
             self.control_timeout = None
             self.control_uncertain = False
             self.db.execute("UPDATE commands SET status='uncertain', result='device_reconnected' WHERE status IN ('queued','delivered')")
@@ -984,6 +1072,7 @@ class Store:
             if status is not None:
                 self.job_observe(status, ack)
                 self.output_runner.observe(status, ack)
+                self.observe_boundary_stops(status, ack)
             if status is not None or fresh_ack or effective_ping:
                 self.ws_activity_tick = self.control_clock()
             self.seen = self.gateway_seen = self.clock()
@@ -1019,6 +1108,13 @@ class Store:
             row = self.db.execute("SELECT * FROM commands WHERE id=? AND status='delivered'", (command_id,)).fetchone()
             if not row:
                 return dict(type='expired', id=command_id)
+            if self.web_limits and row['command'] in ('FILL', 'DRAIN') and command_id not in self.ws_grants:
+                try:
+                    self.check_output_start(row['command'].lower())
+                except Problem as exc:
+                    self.db.execute("UPDATE commands SET status='cancelled', result=?, finished=? WHERE id=?", (exc.message, self.clock(), command_id))
+                    self.db.commit()
+                    return dict(type='expired', id=command_id)
             if command_id not in self.ws_grants:
                 self.ws_grant_sequence += 1
                 self.ws_grants[command_id] = dict(sequence=self.ws_grant_sequence, acked=False)

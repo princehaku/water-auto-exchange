@@ -2,6 +2,8 @@
 import json
 import math
 
+ROUND_SECONDS = 60
+
 
 class OutputRuns:
     def __init__(self, store, problem):
@@ -46,6 +48,9 @@ class OutputRuns:
                        elapsed_seconds=runtime.get('completed_seconds', 0) + current,
                        updated_at=self.store.clock())
             run['remaining_seconds'] = max(0, run['total_seconds'] - run['elapsed_seconds'])
+            run['current_level'] = self.store.simulation['level']
+            run['target_remaining_seconds'] = self.store.output_boundary_eta(direction)
+            run['expected_remaining_seconds'] = min(run['remaining_seconds'], run['target_remaining_seconds']) if run['target_remaining_seconds'] is not None else run['remaining_seconds']
             run['progress'] = min(100, 100 * run['elapsed_seconds'] / run['total_seconds'])
             run['estimated_liters'] = run['capacity_liters'] * run['elapsed_seconds'] / run['calibration_seconds'] if run['capacity_liters'] is not None else None
             run['round_remaining_seconds'] = max(0, runtime['stop_at'] - now) if run['phase'] == 'active' else None
@@ -108,14 +113,18 @@ class OutputRuns:
             other_state = 'DRAINING' if direction == 'fill' else 'FILLING'
             if not store.online() or status.get('outputs_known') != '1' or status.get(direction) != '0' or status.get('state') not in ('IDLE', 'DONE', other_state) or status.get('ready') != '1' or status.get('overflow') != '0' or store.control_uncertain or store.control_timeout or store.control_runs[direction]:
                 raise self.problem(409, 'output_run_requires_idle')
+            if store.boundary_stops[direction]:
+                raise self.problem(409, 'output_stop_pending')
             own_commands = (direction.upper(), direction.upper() + '_OFF', 'START', 'STOP', 'RESET')
             if store.db.execute("SELECT 1 FROM commands WHERE status IN ('queued','delivered') AND command IN (?,?,?,?,?)", own_commands).fetchone():
                 raise self.problem(409, 'command_pending')
             duration = store.simulation[direction + '_seconds']
             if type(duration) not in (int, float) or not math.isfinite(duration) or not 1 <= duration <= 86400:
                 raise self.problem(409, 'output_run_requires_calibration')
-            limit = 170 if direction == 'fill' else 290
+            store.check_output_start(direction)
+            limit = ROUND_SECONDS
             run = dict(id=request_id, mode='calibrated_duration', direction=direction, status='running', phase='starting',
+                       boundary_protection=True, target_level=100 if direction == 'fill' else 0, start_level=store.simulation['level'],
                        calibration_seconds=duration, total_seconds=duration, elapsed_seconds=0, remaining_seconds=duration,
                        round=0, round_elapsed_seconds=0, round_remaining_seconds=None, round_limit_seconds=limit,
                        estimated_rounds=math.ceil(duration / limit), capacity_liters=store.simulation['capacity_liters'],
@@ -151,6 +160,19 @@ class OutputRuns:
         run.update(phase='stopping', reason=reason or 'round_stopping')
         runtime['off_id'] = command_id or self.store.job_command(direction.upper() + '_OFF', ttl=5)
         runtime['stop_until'] = min(runtime['stop_until'], self.store.control_clock() + 5) if stopping else self.store.control_clock() + 5
+        self.save(run, True)
+
+    def stop_at_boundary(self, direction, reason):
+        run, runtime = self.runs[direction], self.runtime[direction]
+        # Keep a reached boundary latched while the opposite route moves the
+        # water level away again during this route's OFF acknowledgement.
+        runtime.setdefault('terminal_reason', reason)
+        on_id = runtime.get('on_id')
+        if on_id and on_id not in self.store.ws_grants:
+            self.store.db.execute("UPDATE commands SET status='cancelled', result='output_run_ended', finished=? WHERE id=? AND status IN ('queued','delivered')", (self.store.clock(), on_id))
+        if run['phase'] != 'stopping':
+            self.request_stop(direction)
+        run['reason'] = runtime['terminal_reason']
         self.save(run, True)
 
     def cancel(self, value):
@@ -204,8 +226,13 @@ class OutputRuns:
                 runtime['on_tick'] = None
                 if runtime.get('cancel_reason'):
                     self.finish(direction, 'cancelled', runtime['cancel_reason'])
+                elif runtime.get('terminal_reason'):
+                    reason = runtime['terminal_reason']
+                    self.finish(direction, 'failed' if reason == 'estimate_uncertain' else 'completed', reason)
+                elif self.store.output_boundary_reached(direction):
+                    self.finish(direction, 'completed', 'target_reached')
                 elif run['remaining_seconds'] <= 0.00001:
-                    self.finish(direction, 'completed', 'duration_completed')
+                    self.finish(direction, 'completed', 'duration_limit')
                 else:
                     run.update(phase='waiting', reason='between_rounds')
                     runtime['wait_until'] = self.store.control_clock() + 2
@@ -230,6 +257,15 @@ class OutputRuns:
                 if runtime['session'] != store.ws_gateway:
                     self.finish(direction, 'failed', 'device_disconnected')
                     continue
+                if not runtime.get('terminal_reason'):
+                    if not store.output_estimate_trusted():
+                        self.stop_at_boundary(direction, 'estimate_uncertain')
+                    elif store.output_boundary_reached(direction):
+                        self.stop_at_boundary(direction, 'target_reached')
+                    elif run['phase'] == 'active':
+                        self.refresh(direction)
+                        if run['remaining_seconds'] <= 0.00001:
+                            self.stop_at_boundary(direction, 'duration_limit')
                 if run['phase'] == 'starting' and now >= runtime['start_until']:
                     self.finish(direction, 'failed', 'start_timeout')
                     store.control_abort('output_run_start_timeout')

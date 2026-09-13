@@ -1,4 +1,4 @@
-"""Calibrated-duration jobs are finite, independently stoppable and replay-safe."""
+"""Boundary-aware output jobs retain finite limits and independent shutdown."""
 import copy
 import json
 import tempfile
@@ -74,47 +74,134 @@ class OutputRunTests(unittest.TestCase):
         self.start('drain', 2)
         self.process()
         self.assertEqual(self.status['state'], 'EXCHANGING')
-        self.pulse(202)
+        self.pulse(206)
         runs = self.store.output_runner.snapshot()
         self.assertEqual(runs['fill']['status'], 'completed')
         self.assertEqual(runs['fill']['elapsed_seconds'], 200)
         self.assertEqual(runs['fill']['estimated_liters'], 60)
         self.assertEqual(runs['drain']['status'], 'running')
         self.assertEqual(self.status['drain'], '1')
-        self.pulse(200)
+        self.pulse(206)
         runs = self.store.output_runner.snapshot()
         self.assertEqual(runs['drain']['status'], 'completed')
         self.assertEqual(runs['drain']['elapsed_seconds'], 400)
-        self.assertEqual(runs['drain']['round'], 2)
+        self.assertEqual(runs['drain']['round'], 7)
         self.assertEqual(runs['drain']['estimated_liters'], 60)
-        self.assertEqual([name for _, name in self.commands].count('FILL_OFF'), 2)
-        self.assertEqual([name for _, name in self.commands].count('DRAIN_OFF'), 2)
+        self.assertEqual([name for _, name in self.commands].count('FILL_OFF'), 4)
+        self.assertEqual([name for _, name in self.commands].count('DRAIN_OFF'), 7)
         self.assertNotIn('STOP', [name for _, name in self.commands])
         self.assertEqual(self.store.simulation['level'], 40)
 
-    def test_current_full_or_empty_level_does_not_shorten_calibrated_duration(self):
+    def test_current_full_or_empty_level_rejects_new_run(self):
         for number, direction, level in ((1, 'fill', 100), (2, 'drain', 0)):
             with self.subTest(direction=direction):
                 self.calibrate(fill=10, drain=10, level=level)
-                self.start(direction, number)
-                self.process()
-                self.pulse(10)
-                run = self.store.output_runner.snapshot()[direction]
-                self.assertEqual(run['status'], 'completed')
-                self.assertEqual(run['elapsed_seconds'], 10)
-                self.assertEqual(run['estimated_liters'], 60)
+                with self.assertRaises(Problem) as caught:
+                    self.start(direction, number)
+                self.assertEqual(caught.exception.message, direction + '_target_reached')
+                self.assertIsNone(self.store.ws_offer(self.session))
                 self.assertEqual(self.store.simulation['level'], level)
 
-    def test_three_rounds_for_each_direction_and_short_final_round(self):
+    def test_partial_level_stops_at_boundary_before_calibrated_safety_limit(self):
+        for number, direction, level, seconds in ((1, 'fill', 70, 18), (2, 'drain', 30, 18)):
+            with self.subTest(direction=direction):
+                self.calibrate(fill=60, drain=60, level=level)
+                initial = self.start(direction, number)
+                self.assertTrue(initial['boundary_protection'])
+                self.assertEqual(initial['start_level'], level)
+                self.assertEqual(initial['total_seconds'], 60)
+                self.assertAlmostEqual(initial['target_remaining_seconds'], seconds)
+                self.assertAlmostEqual(initial['expected_remaining_seconds'], seconds)
+                self.process()
+                self.pulse(seconds)
+                run = self.store.output_runner.snapshot()[direction]
+                self.assertEqual((run['status'], run['reason']), ('completed', 'target_reached'))
+                self.assertAlmostEqual(run['elapsed_seconds'], seconds)
+                self.assertEqual(self.status[direction], '0')
+                self.assertEqual(self.store.simulation['level'], 100 if direction == 'fill' else 0)
+                self.assertEqual(run['round_limit_seconds'], 60)
+
+    def test_boundary_stop_is_independent_and_latched_when_other_route_moves_level_away(self):
+        self.calibrate(fill=60, drain=120, level=90)
+        self.start('fill', 1)
+        self.start('drain', 2)
+        self.process()
+        runs = self.store.output_runner.snapshot()
+        self.assertAlmostEqual(runs['fill']['target_remaining_seconds'], 12)
+        self.assertIsNone(runs['drain']['target_remaining_seconds'])
+        self.pulse(12, process=False)
+        self.assertEqual(self.store.output_runner.runs['fill']['reason'], 'target_reached')
+        off = self.store.ws_offer(self.session)
+        self.assertEqual(off['command'], 'FILL_OFF')
+        self.store.ws_claim(self.session, off['id'])
+        # A separate reported OFF freezes this lane's duration while its peer
+        # keeps draining; the successful current OFF receipt remains required.
+        self.status.update(fill='0', state='DRAINING')
+        self.store.ws_touch(self.session, self.status)
+        self.pulse(2, process=False)
+        self.assertLess(self.store.simulation['level'], 100)
+        self.assertEqual(self.store.output_runner.runs['fill']['status'], 'running')
+        self.ack(off['id'], 'FILL_OFF')
+        self.assertEqual(self.store.output_runner.runs['fill']['reason'], 'target_reached')
+        self.assertEqual(self.store.output_runner.runs['fill']['status'], 'completed')
+        self.assertEqual(self.status['drain'], '1')
+        self.pulse(112)
+        self.assertEqual(self.store.output_runner.runs['drain']['reason'], 'duration_limit')
+        self.assertGreater(self.store.simulation['level'], 0)
+        self.assertEqual([name for _, name in self.commands].count('FILL'), 1)
+
+    def test_equal_opposing_flows_report_no_boundary_eta_and_stop_at_finite_limits(self):
+        self.calibrate(fill=10, drain=10, level=50)
+        self.start('fill', 1)
+        self.start('drain', 2)
+        self.process()
+        self.pulse(3)
+        for run in self.store.output_runner.snapshot().values():
+            self.assertIsNone(run['target_remaining_seconds'])
+            self.assertAlmostEqual(run['expected_remaining_seconds'], 7)
+        self.pulse(7)
+        self.assertAlmostEqual(self.store.simulation['level'], 50)
+        for run in self.store.output_runner.snapshot().values():
+            self.assertEqual((run['status'], run['reason']), ('completed', 'duration_limit'))
+
+    def test_initial_boundary_eta_does_not_end_run_early_after_opposite_route_opens(self):
+        self.calibrate(fill=60, drain=60, level=80)
+        run = self.start('fill', 1)
+        self.assertAlmostEqual(run['expected_remaining_seconds'], 12)
+        self.process()
+        self.start('drain', 2)
+        self.process()
+        self.pulse(12)
+        self.assertEqual(self.store.output_runner.runs['fill']['status'], 'running')
+        self.assertAlmostEqual(self.store.simulation['level'], 80)
+        self.assertIsNone(self.store.output_runner.snapshot()['fill']['target_remaining_seconds'])
+        self.pulse(48)
+        self.assertEqual(self.store.output_runner.runs['fill']['reason'], 'duration_limit')
+
+    def test_uncertainty_during_running_outputs_requires_both_independent_off_receipts(self):
+        self.start('fill', 1)
+        self.start('drain', 2)
+        self.process()
+        self.pulse(2)
+        self.store.freeze_estimate()
+        self.store.control_tick(self.session)
+        self.assertTrue(all(run['phase'] == 'stopping' for run in self.store.output_runner.runs.values()))
+        self.process()
+        self.assertEqual((self.status['fill'], self.status['drain']), ('0', '0'))
+        self.assertTrue(all((run['status'], run['reason']) == ('failed', 'estimate_uncertain') for run in self.store.output_runner.runs.values()))
+        self.pulse(3)
+        self.assertNotIn('RESET', [name for _, name in self.commands])
+
+    def test_sixty_second_rounds_for_each_direction_and_short_final_round(self):
         self.calibrate(fill=400, drain=650)
         self.start('fill', 1)
         self.start('drain', 2)
         self.process()
-        self.pulse(654)
+        self.pulse(670)
         runs = self.store.output_runner.snapshot()
         for key, duration in (('fill', 400), ('drain', 650)):
             self.assertEqual(runs[key]['status'], 'completed')
-            self.assertEqual(runs[key]['round'], 3)
+            self.assertEqual(runs[key]['round'], 7 if key == 'fill' else 11)
             self.assertEqual(runs[key]['elapsed_seconds'], duration)
             self.assertEqual(runs[key]['estimated_liters'], 60)
 
@@ -135,20 +222,22 @@ class OutputRunTests(unittest.TestCase):
         self.process()
         self.assertTrue(all(run['status'] == 'completed' for run in self.store.output_runner.snapshot().values()))
 
-    def test_uncertain_level_preserves_rate_calibration_and_does_not_freeze_duration(self):
+    def test_uncertain_level_requires_recalibration_before_new_run(self):
         self.store.freeze_estimate()
-        self.start('drain')
-        self.process()
-        self.pulse(402)
-        self.assertEqual(self.store.output_runner.snapshot()['drain']['status'], 'completed')
+        with self.assertRaises(Problem) as caught:
+            self.start('drain')
+        self.assertEqual(caught.exception.message, 'output_requires_calibration')
+        self.assertIsNone(self.store.ws_offer(self.session))
         self.assertEqual(self.store.simulation['level'], 40)
         self.assertTrue(self.store.simulation['uncertain'])
 
     def test_cancel_waiting_and_manual_off_only_stop_their_own_direction(self):
         fill = self.start('fill', 1)
+        self.process()
+        self.pulse(10)
         self.start('drain', 2)
         self.process()
-        self.pulse(170)
+        self.pulse(50)
         self.assertEqual(self.store.output_runner.runs['fill']['phase'], 'waiting')
         self.store.output_runner.cancel(dict(direction='fill', run_id=fill['id']))
         self.process()
@@ -191,7 +280,7 @@ class OutputRunTests(unittest.TestCase):
         self.start('fill', 1)
         self.start('drain', 2)
         self.process()
-        self.pulse(170, process=False)
+        self.pulse(60, process=False)
         offer = self.store.ws_offer(self.session)
         self.store.ws_claim(self.session, offer['id'])
         with self.assertRaises(Problem):
@@ -205,7 +294,7 @@ class OutputRunTests(unittest.TestCase):
         run = self.start('fill')
         self.start('drain', 2)
         self.process()
-        self.pulse(170, process=False)
+        self.pulse(60, process=False)
         offer = self.store.ws_offer(self.session)
         self.store.ws_claim(self.session, offer['id'])
         self.status.update(fill='0', state='DRAINING')
@@ -213,7 +302,7 @@ class OutputRunTests(unittest.TestCase):
         self.pulse(4, process=False)
         self.store.output_runner.cancel(dict(direction='fill', run_id=run['id']))
         self.assertEqual(self.store.output_runner.runtime['fill']['off_id'], offer['id'])
-        self.assertEqual(self.store.output_runner.snapshot()['fill']['elapsed_seconds'], 170)
+        self.assertEqual(self.store.output_runner.snapshot()['fill']['elapsed_seconds'], 60)
         with self.assertRaises(Problem):
             self.pulse(1, process=False)
         self.assertIsNone(self.store.ws_gateway)
@@ -231,11 +320,11 @@ class OutputRunTests(unittest.TestCase):
         self.assertEqual(self.store.output_runner.runtime['fill']['stop_at'], stop_at)
         self.assertEqual([name for _, name in self.commands].count('FILL'), 1)
 
-    def test_lost_new_pings_fail_even_when_old_water_estimate_was_uncertain(self):
-        self.store.freeze_estimate()
+    def test_lost_new_pings_fail_after_water_estimate_becomes_uncertain(self):
         self.start('fill')
         self.process()
         self.pulse(2)
+        self.store.freeze_estimate()
         activity = self.store.ws_activity_tick
         self.now += 4
         self.assertFalse(self.store.ws_ping(self.session, self.sequence))
@@ -252,6 +341,7 @@ class OutputRunTests(unittest.TestCase):
         self.pulse(1)
         self.assertEqual(self.start('fill')['status'], 'completed')
         self.assertIsNone(self.store.ws_offer(self.session))
+        self.calibrate(fill=1)
         self.start('fill', 2)
         self.assertEqual(self.start('fill')['id'], first['id'])
         self.assertEqual(self.store.output_runner.runs['fill']['id'], '{:032x}'.format(2))
@@ -274,19 +364,19 @@ class OutputRunTests(unittest.TestCase):
             self.assertEqual(self.store.output_runner.runs['fill']['status'], 'running')
         self.assertEqual(self.store.simulation, before)
 
-    def test_delayed_on_receipt_shortens_round_and_updates_round_estimate(self):
-        self.calibrate(fill=170)
+    def test_delayed_on_receipt_counts_only_confirmed_sixty_second_round(self):
+        self.calibrate(fill=60, level=0)
         self.start('fill')
         offer = self.store.ws_offer(self.session)
         self.store.ws_claim(self.session, offer['id'])
         self.pulse(1, process=False)
         self.ack(offer['id'], 'FILL')
-        self.assertEqual(self.store.output_runner.snapshot()['fill']['estimated_rounds'], 2)
-        self.pulse(172)
+        self.assertEqual(self.store.output_runner.snapshot()['fill']['estimated_rounds'], 1)
+        self.pulse(60)
         run = self.store.output_runner.snapshot()['fill']
         self.assertEqual(run['status'], 'completed')
-        self.assertEqual(run['round'], 2)
-        self.assertEqual(run['elapsed_seconds'], 170)
+        self.assertEqual(run['round'], 1)
+        self.assertEqual(run['elapsed_seconds'], 60)
 
     def test_bad_api_fields_return_problem_without_any_queued_commands(self):
         for direction in ([], {}, None, 'other'):

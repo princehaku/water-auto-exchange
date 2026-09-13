@@ -1,4 +1,4 @@
-"""Server-owned deadlines: no browser, calibration or ON telemetry required."""
+"""Server-owned deadlines and calibrated boundary stops retain receipt order."""
 import copy
 import sys
 import tempfile
@@ -23,6 +23,9 @@ class ControlLimitTests(unittest.TestCase):
         self.session = self.store.ws_open(self.initial)
         self.status = dict(self.initial)
         self.number = 0
+        self.sequence = 0
+        # Keep the old soft-limit scenarios well away from a water boundary.
+        self.store.configure_simulation(dict(level=50, fill_seconds=86400, drain_seconds=86400))
 
     def tearDown(self):
         self.store.db.close()
@@ -56,17 +59,53 @@ class ControlLimitTests(unittest.TestCase):
         # Device heartbeats keep the session alive. There is no browser poll.
         while self.mono < target:
             self.advance(min(1, target - self.mono))
-            self.store.ws_touch(self.session)
+            self.sequence += 1
+            self.store.ws_ping(self.session, self.sequence)
 
-    def test_authorization_without_ack_or_on_status_still_expires(self):
-        self.grant('FILL')
+    def test_unconfirmed_on_stops_at_eight_seconds_and_requires_fresh_off_receipt(self):
+        on_id = self.grant('FILL')
         self.advance(1)
         self.store.ws_touch(self.session, self.initial)  # old in-flight OFF report
         self.assertEqual(self.store.control_runs['fill']['since'], 1000)
-        self.until(1180)
+        self.until(1007.9)
+        self.assertIsNone(self.store.ws_offer(self.session))
+        self.until(1008)
         offer = self.store.ws_offer(self.session)
-        self.assertEqual(offer['command'], 'STOP')
-        self.assertEqual(self.store.control_limits_snapshot()['timeout_pending'], 'fill')
+        self.assertEqual(offer['command'], 'FILL_OFF')
+        self.assertEqual(self.store.boundary_stops['fill']['reason'], 'start_unconfirmed')
+        self.assertEqual(self.store.boundary_stops['fill']['until'], 1013)
+        self.assertTrue(self.store.simulation['uncertain'])
+        self.store.ws_claim(self.session, offer['id'])
+        self.assertFalse(self.store.ws_touch(self.session, dict(self.initial, fill='1', state='FILLING'),
+                                             dict(id=on_id, status='succeeded', result='late ON')))
+        self.assertIsNotNone(self.store.boundary_stops['fill'])
+        self.assertIsNotNone(self.store.control_runs['fill'])
+        self.ack(offer['id'], fill='0', state='IDLE')
+        self.assertIsNone(self.store.boundary_stops['fill'])
+        self.assertIsNone(self.store.control_runs['fill'])
+        self.assertIsNone(self.store.control_timeout)
+
+    def test_duplicate_claim_does_not_extend_unconfirmed_on_deadline(self):
+        on_id = self.grant('FILL')
+        self.until(1007)
+        self.assertEqual(self.store.ws_claim(self.session, on_id)['type'], 'execute')
+        self.assertEqual(self.store.control_runs['fill']['confirmation_until'], 1008)
+        self.until(1008)
+        self.assertEqual(self.store.ws_offer(self.session)['command'], 'FILL_OFF')
+        self.assertEqual(self.store.boundary_stops['fill']['until'], 1013)
+
+    def test_unconfirmed_on_stop_waits_only_five_seconds_for_off_receipt(self):
+        self.grant('DRAIN')
+        self.until(1008)
+        offer = self.store.ws_offer(self.session)
+        self.assertEqual(offer['command'], 'DRAIN_OFF')
+        self.store.ws_claim(self.session, offer['id'])
+        self.store.ws_touch(self.session, self.initial)
+        self.assertIsNotNone(self.store.boundary_stops['drain'])
+        with self.assertRaises(Problem) as caught:
+            self.until(1013)
+        self.assertEqual(caught.exception.message, 'boundary_stop_unconfirmed')
+        self.assertIsNone(self.store.ws_gateway)
 
     def test_rejected_start_with_confirmed_off_clears_grant(self):
         command_id = self.grant('FILL')
@@ -107,14 +146,26 @@ class ControlLimitTests(unittest.TestCase):
         self.until(1300)
         self.assertEqual(self.store.ws_offer(self.session)['command'], 'STOP')
 
-    def test_water_calibration_uncertainty_does_not_pause_control(self):
+    def test_uncertain_estimate_requires_off_confirmation_and_recalibration(self):
         self.store.configure_simulation(dict(level=50, fill_seconds=200, drain_seconds=200))
         self.start()
         self.until(1013)
+        self.store.simulation['uncertain'] = True
+        self.store.control_tick(self.session)
         self.assertTrue(self.store.snapshot()['simulation']['uncertain'])
         self.assertFalse(self.store.snapshot()['control_limits']['uncertain'])
-        self.until(1180)
-        self.assertEqual(self.store.ws_offer(self.session)['command'], 'STOP')
+        stop = self.store.boundary_stops['fill']
+        self.assertEqual(stop['reason'], 'estimate_uncertain')
+        self.assertEqual(self.store.status['fill'], '1')
+        offer = self.store.ws_offer(self.session)
+        self.assertEqual(offer['command'], 'FILL_OFF')
+        self.store.ws_claim(self.session, offer['id'])
+        self.ack(offer['id'], fill='0', state='IDLE')
+        self.assertIsNone(self.store.boundary_stops['fill'])
+        self.assertIsNone(self.store.control_runs['fill'])
+        with self.assertRaises(Problem) as caught:
+            self.store.enqueue('FILL', 'f' * 32)
+        self.assertEqual(caught.exception.message, 'output_requires_calibration')
 
     def test_timeout_revokes_delivered_open_grants_and_cannot_be_publicly_queued(self):
         self.start()
@@ -187,12 +238,12 @@ class ControlLimitTests(unittest.TestCase):
 
     def test_wall_clock_rollback_does_not_extend_control_deadline(self):
         self.start()
-        self.advance(30)
+        self.until(1030)
         self.wall -= 3600
         limits = self.store.snapshot()['control_limits']
         self.assertEqual(limits['fill_deadline'] - self.wall, 150)
         self.assertEqual(self.wall - limits['fill_on_since'], 30)
-        self.mono += 150
+        self.until(1180)
         self.store.control_tick(self.session)
         self.assertEqual(self.store.ws_offer(self.session)['command'], 'STOP')
         self.assertEqual(self.store.control_limits_snapshot()['fill_deadline'], self.wall)
@@ -240,8 +291,8 @@ class ControlLimitTests(unittest.TestCase):
         self.assertEqual(self.store.status, previous_status)
         self.assertEqual(self.store.simulation, previous_simulation)
         self.assertEqual(self.store.seen, old_seen)
-        self.until(1180)
-        self.assertEqual(self.store.ws_offer(self.session)['command'], 'STOP')
+        self.until(1180 if confirm_new_on else 1008)
+        self.assertEqual(self.store.ws_offer(self.session)['command'], 'STOP' if confirm_new_on else 'FILL_OFF')
 
     def test_replayed_successful_off_ack_cannot_erase_new_unconfirmed_grant(self):
         self.assert_old_off_ack_is_inert(False)
@@ -278,8 +329,10 @@ class ControlLimitTests(unittest.TestCase):
 
     def test_expired_ack_cannot_replace_telemetry_or_erase_pending_deadline(self):
         command_id = self.grant('FILL')
-        previous_simulation = copy.deepcopy(self.store.simulation)
         self.advance(9)
+        self.store.control_tick(self.session)
+        self.assertTrue(self.store.simulation['uncertain'])
+        previous_simulation = copy.deepcopy(self.store.simulation)
         self.assertFalse(self.store.ws_touch(self.session, dict(self.initial, fill='1', state='FILLING'),
                                              dict(id=command_id, status='succeeded', result='OK FILL')))
         self.assertEqual(self.store.status, self.initial)
@@ -389,6 +442,146 @@ class ControlLimitTests(unittest.TestCase):
         self.store.ws_touch(self.session, self.initial,
                             dict(id=off_id, status='succeeded', result='OK FILL_OFF'))
         self.assertIsNotNone(self.store.control_timeout)
+
+    def test_raw_start_rejects_a_reached_boundary_without_queueing(self):
+        for level, command, reason in ((100, 'FILL', 'fill_target_reached'),
+                                       (0, 'DRAIN', 'drain_target_reached')):
+            with self.subTest(command=command):
+                self.store.configure_simulation(dict(level=level, fill_seconds=10, drain_seconds=20))
+                with self.assertRaises(Problem) as caught:
+                    self.store.enqueue(command, 'e' * 32)
+                self.assertEqual(caught.exception.message, reason)
+                self.assertIsNone(self.store.ws_offer(self.session))
+
+    def assert_net_boundary_stops_only_its_output(self, direction):
+        filling = direction == 'fill'
+        self.store.configure_simulation(dict(level=95 if filling else 5,
+                                             fill_seconds=10 if filling else 20,
+                                             drain_seconds=20 if filling else 10))
+        self.start('fill')
+        drain_id = self.grant('DRAIN')
+        self.ack(drain_id, drain='1', state='EXCHANGING')
+        other = 'drain' if filling else 'fill'
+        other_deadline = self.store.control_runs[other]['until']
+        self.until(1001)
+        self.assertAlmostEqual(self.store.simulation['level'], 100 if filling else 0)
+        guard = self.store.boundary_stops[direction]
+        self.assertEqual(guard['reason'], 'target_reached')
+        self.assertIsNone(self.store.boundary_stops[other])
+        offer = self.store.ws_offer(self.session)
+        self.assertEqual(offer['command'], direction.upper() + '_OFF')
+        self.store.ws_claim(self.session, offer['id'])
+        self.ack(offer['id'], **{direction: '0', 'state': 'DRAINING' if filling else 'FILLING'})
+        self.assertIsNone(self.store.boundary_stops[direction])
+        self.assertIsNone(self.store.control_runs[direction])
+        self.assertEqual(self.store.control_runs[other]['until'], other_deadline)
+        self.assertEqual(self.store.status[other], '1')
+        self.until(1002)
+        self.assertAlmostEqual(self.store.simulation['level'], 95 if filling else 5)
+        self.assertIsNone(self.store.ws_offer(self.session))
+        self.assertEqual(self.store.status[direction], '0')
+        self.assertFalse(self.store.db.execute("SELECT 1 FROM commands WHERE command IN ('STOP','RESET')").fetchone())
+
+    def test_net_upper_boundary_closes_fill_and_keeps_drain_running(self):
+        self.assert_net_boundary_stops_only_its_output('fill')
+
+    def test_net_lower_boundary_closes_drain_and_keeps_fill_running(self):
+        self.assert_net_boundary_stops_only_its_output('drain')
+
+    def test_old_off_receipt_cannot_confirm_new_boundary_stop(self):
+        self.store.configure_simulation(dict(level=95, fill_seconds=10, drain_seconds=20))
+        self.start()
+        old_off = self.grant('FILL_OFF')
+        self.ack(old_off, fill='0', state='IDLE')
+        self.start()
+        self.until(1000.5)
+        offer = self.store.ws_offer(self.session)
+        self.assertEqual(offer['command'], 'FILL_OFF')
+        self.store.ws_claim(self.session, offer['id'])
+        guard = copy.deepcopy(self.store.boundary_stops['fill'])
+        self.assertFalse(self.store.ws_touch(self.session, self.initial,
+                                             dict(id=old_off, status='succeeded', result='OK')))
+        self.assertEqual(self.store.boundary_stops['fill'], guard)
+        self.assertEqual(self.store.status['fill'], '1')
+        self.ack(offer['id'], fill='0', state='IDLE')
+        self.assertIsNone(self.store.boundary_stops['fill'])
+
+    def test_fresh_stop_can_confirm_boundary_guard_without_extending_deadline(self):
+        self.store.configure_simulation(dict(level=95, fill_seconds=10, drain_seconds=20))
+        self.start()
+        self.until(1000.5)
+        boundary_off = self.store.ws_offer(self.session)
+        self.assertEqual(boundary_off['command'], 'FILL_OFF')
+        self.store.ws_claim(self.session, boundary_off['id'])
+        deadline = self.store.boundary_stops['fill']['until']
+        self.until(1004.5)
+        stop_id = self.grant('STOP')
+        self.assertEqual(self.store.boundary_stops['fill']['until'], deadline)
+        self.ack(stop_id, fill='0', drain='0', state='IDLE')
+        self.assertIsNone(self.store.boundary_stops['fill'])
+        self.assertIsNone(self.store.control_runs['fill'])
+        self.store.configure_simulation(dict(level=95, fill_seconds=10, drain_seconds=20))
+        # The replaced OFF no longer blocks a new command; its eventual first
+        # receipt still cannot close the newly authorized output.
+        self.assertEqual(self.store.db.execute('SELECT status FROM commands WHERE id=?', (boundary_off['id'],)).fetchone()['status'], 'cancelled')
+        new_on = self.grant('FILL')
+        self.ack(new_on, fill='1', state='FILLING')
+        self.store.ws_touch(self.session, self.initial,
+                            dict(id=boundary_off['id'], status='succeeded', result='late OFF'))
+        self.assertEqual(self.store.status['fill'], '1')
+        self.assertEqual(self.store.control_runs['fill']['command_id'], new_on)
+
+    def test_claim_rechecks_boundary_and_uncertainty_before_granting(self):
+        for unknown in (False, True):
+            with self.subTest(uncertain=unknown):
+                self.store.configure_simulation(dict(level=95, fill_seconds=10, drain_seconds=20))
+                request_id = ('a' if unknown else 'b') * 32
+                self.store.enqueue('FILL', request_id)
+                self.assertEqual(self.store.ws_offer(self.session)['id'], request_id)
+                # A newer trusted estimate or loss of trust must be checked at
+                # authorization, even after an earlier request passed validation.
+                self.store.simulation['uncertain'] = unknown
+                if not unknown:
+                    self.store.simulation['level'] = 100
+                self.assertEqual(self.store.ws_claim(self.session, request_id)['type'], 'expired')
+                row = self.store.db.execute('SELECT status,result FROM commands WHERE id=?', (request_id,)).fetchone()
+                self.assertEqual(row['status'], 'cancelled')
+                self.assertEqual(row['result'], 'output_requires_calibration' if unknown else 'fill_target_reached')
+                self.assertNotIn(request_id, self.store.ws_grants)
+                self.assertIsNone(self.store.control_runs['fill'])
+
+    def test_unconfirmed_boundary_stop_expires_even_after_plain_off_report(self):
+        self.store.configure_simulation(dict(level=95, fill_seconds=10, drain_seconds=20))
+        self.start()
+        self.until(1000.5)
+        offer = self.store.ws_offer(self.session)
+        self.store.ws_claim(self.session, offer['id'])
+        self.status.update(fill='0', state='IDLE')
+        self.store.ws_touch(self.session, self.status)
+        self.assertIsNotNone(self.store.boundary_stops['fill'])
+        with self.assertRaises(Problem) as caught:
+            self.until(1005.5)
+        self.assertEqual(caught.exception.message, 'boundary_stop_unconfirmed')
+        self.assertIsNone(self.store.ws_gateway)
+        self.session = self.store.ws_open(self.initial)
+        self.assertIsNone(self.store.ws_offer(self.session))
+        self.assertEqual(self.store.boundary_stops, dict(fill=None, drain=None))
+
+    def test_restart_discards_pending_boundary_guard_and_does_not_reopen(self):
+        self.store.configure_simulation(dict(level=95, fill_seconds=10, drain_seconds=20))
+        self.start()
+        self.until(1000.5)
+        self.assertIsNotNone(self.store.boundary_stops['fill'])
+        self.store.db.close()
+        self.store = Store(self.path, lambda: self.wall, lambda: self.mono)
+        self.assertEqual(self.store.boundary_stops, dict(fill=None, drain=None))
+        self.assertTrue(self.store.simulation['uncertain'])
+        self.assertFalse(self.store.snapshot()['online'])
+        self.session = self.store.ws_open(self.initial)
+        self.assertIsNone(self.store.ws_offer(self.session))
+        with self.assertRaises(Problem) as caught:
+            self.store.enqueue('FILL', 'f' * 32)
+        self.assertEqual(caught.exception.message, 'output_requires_calibration')
 
 
 if __name__ == '__main__':

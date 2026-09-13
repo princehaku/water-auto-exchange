@@ -43,10 +43,12 @@ rollback() {
     nginx -t && systemctl reload nginx
     echo "Deployment failed; restored previous service. Backup: $backup" >&2
 }
-trap rollback ERR
 if [ ! -f "$root/config/water.env" ]; then
     install -m 600 /etc/water-console.env "$root/config/water.env"
 fi
+# A failed idle check must leave the current container untouched, without rollback.
+if [ -n "$old_image" ]; then python3 deploy/check-idle.py; fi
+trap rollback ERR
 # Stop the existing writer before copying SQLite and its WAL together.
 if [ "$old_active" = 1 ]; then systemctl stop water-console; fi
 if [ -n "$old_image" ]; then docker stop water-console; fi

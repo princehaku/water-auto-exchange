@@ -84,6 +84,8 @@ class WebSocketTests(unittest.TestCase):
         if auth:
             client.send(json.dumps(dict(type='auth', key='b'*32, status=status or STATUS)))
             self.assertEqual(json.loads(client.recv())['type'], 'ready')
+            if status and status.get('version') == '0.8.2' and status.get('control_mode') == 'manual':
+                self.store.configure_simulation(dict(level=50, fill_seconds=86400, drain_seconds=86400))
         return client
 
     def test_authenticated_roundtrip_and_ack(self):
@@ -157,35 +159,37 @@ class WebSocketTests(unittest.TestCase):
     def test_web_limits_firmware_concurrent_outputs_and_independent_off_roundtrip(self):
         self.concurrent_outputs_roundtrip('0.8.2')
 
-    def test_soft_deadline_owner_runs_without_browser_or_incoming_device_messages(self):
+    def test_unconfirmed_raw_open_stops_without_browser_or_incoming_device_messages(self):
         status = dict(STATUS, version='0.8.2', control_mode='manual', need_fill='unknown')
         client = self.connect(False)
         client.send(json.dumps(dict(type='auth', key='b' * 32, status=status)))
         ready = json.loads(client.recv())
         self.assertEqual(ready['soft_limits'], dict(version=1, fill_seconds=180, drain_seconds=300, watchdog_ms=5000))
+        self.store.configure_simulation(dict(level=50, fill_seconds=86400, drain_seconds=86400))
         self.store.enqueue('FILL', 'f' * 32)
         offer = json.loads(client.recv())
         client.send(json.dumps(dict(type='claim', id=offer['id'])))
         self.assertEqual(json.loads(client.recv())['command'], 'FILL')
         # Deliberately lose every ON status and ACK. The execute grant already
-        # reserved the deadline, and the socket owner ticks independently.
-        self.now += 180
+        # reserved the eight-second confirmation deadline; the socket owner
+        # ticks without browser activity or fresh device status.
+        self.now += 8
         timeout_offer = json.loads(client.recv())
-        self.assertEqual(timeout_offer['command'], 'STOP')
+        self.assertEqual(timeout_offer['command'], 'FILL_OFF')
         client.send(json.dumps(dict(type='claim', id=timeout_offer['id'])))
-        self.assertEqual(json.loads(client.recv())['command'], 'STOP')
-        # An old ordinary OFF status cannot stand in for the new STOP ACK.
+        self.assertEqual(json.loads(client.recv())['command'], 'FILL_OFF')
+        # An ordinary OFF status cannot stand in for the fresh OFF ACK.
         client.send(json.dumps(dict(type='status', status=dict(status, reason='stopped'))))
         self.assertEqual(json.loads(client.recv())['type'], 'received')
-        self.assertIsNotNone(self.store.control_timeout)
-        self.now += 1
+        self.assertIsNotNone(self.store.boundary_stops['fill'])
+        self.now += 5
         # No fault confirmation: close the socket instead of renewing pongs.
         try:
             client.send(json.dumps(dict(type='ping', seq=2)))
             self.assertEqual(client.recv(), '')
         except (ConnectionAbortedError, ConnectionResetError, websocket.WebSocketConnectionClosedException):
             pass  # Windows may abort the client's response to the close frame.
-        self.assertEqual(self.store.connection_reason, 'control_stop_unconfirmed')
+        self.assertEqual(self.store.connection_reason, 'boundary_stop_unconfirmed')
         self.assertIsNone(self.store.ws_gateway)
 
     def test_soft_limit_auth_cannot_continue_an_old_active_output(self):
@@ -224,7 +228,7 @@ class WebSocketTests(unittest.TestCase):
             client.send(json.dumps(dict(type='ack', ack=dict(id=offer['id'], status='succeeded', result='OK ' + command), status=status)))
             self.assertEqual(json.loads(client.recv())['type'], 'received')
 
-        for index, seconds in enumerate((290, 290, 290, 130)):
+        for index, seconds in enumerate((60,) * 16 + (40,)):
             execute('DRAIN', drain='1', state='DRAINING', reason='manual_draining')
             actual_observed_at = self.store.simulation['observed_at']
             for _ in range(seconds):
@@ -232,13 +236,13 @@ class WebSocketTests(unittest.TestCase):
                 ping()
             self.assertEqual(self.store.simulation['observed_at'], actual_observed_at)
             execute('DRAIN_OFF', drain='0', state='IDLE', reason='stopped')
-            if index < 3:
+            if index < 16:
                 self.assertEqual(self.store.level_job['phase'], 'waiting')
                 self.now += 2
                 ping()
         job = self.store.snapshot()['level_job']
         self.assertEqual(job['status'], 'completed')
-        self.assertEqual(job['round'], 4)
+        self.assertEqual(job['round'], 17)
         self.assertAlmostEqual(job['elapsed_seconds'], 1000)
         self.assertAlmostEqual(job['estimated_liters'], 20)
         self.assertAlmostEqual(job['current_level'], 100 - 100 / 3)
@@ -254,7 +258,11 @@ class WebSocketTests(unittest.TestCase):
         status.update(fill='1', state='FILLING')
         client.send(json.dumps(dict(type='ack', ack=dict(id='c' * 32, status='succeeded', result='OK FILL'), status=status)))
         self.assertEqual(json.loads(client.recv())['type'], 'received')
-        self.now += 180
+        for sequence in range(1, 180):
+            self.now += 1
+            client.send(json.dumps(dict(type='ping', seq=sequence)))
+            self.assertEqual(json.loads(client.recv()), dict(type='pong', seq=sequence))
+        self.now += 1
         offer = json.loads(client.recv())
         self.assertEqual(offer['command'], 'STOP')
         client.send(json.dumps(dict(type='claim', id=offer['id'])))
@@ -293,8 +301,9 @@ class WebSocketTests(unittest.TestCase):
         self.assertEqual(json.loads(client.recv())['type'], 'received')
         self.assertEqual(self.store.control_runs['fill']['command_id'], format(3, '032x'))
         self.assertEqual(self.store.simulation['observed_at'], observed)
-        self.now += 179
-        self.assertEqual(json.loads(client.recv())['command'], 'STOP')
+        self.now += 7
+        self.assertEqual(json.loads(client.recv())['command'], 'FILL_OFF')
+        self.assertEqual(self.store.boundary_stops['fill']['reason'], 'start_unconfirmed')
 
     def concurrent_outputs_roundtrip(self, version):
         status=dict(STATUS,version=version,control_mode='manual',need_fill='unknown')

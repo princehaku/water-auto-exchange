@@ -5,6 +5,7 @@ import re
 import sys
 import threading
 import time
+import uuid
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -608,7 +609,7 @@ def assert_web_soft_limits(page, store, clock, output):
     image_prefix = 'aquarium-web-limits-082'
     console_url = page.url
     # Leave a calibrated water estimate uncertain using an actual telemetry gap.
-    # The new control timer must remain usable without recalibrating that history.
+    # A new start must reject that history until the user recalibrates it.
     status = dict(store.status, version='0.8.1', control_mode='manual', state='IDLE',
                   fill='0', drain='0', ready='1', outputs_known='1', reason='ready')
     gateway = store.gateway or 'a' * 32
@@ -647,7 +648,7 @@ def assert_web_soft_limits(page, store, clock, output):
             assert response.value.ok, response.value.text()
         else:
             # Raw soft-limit protocol checks deliberately bypass the main
-            # switches, which now start a full calibrated-duration operation.
+            # switches, which now start a boundary-protected operation.
             post_control(page, expected_command)
         offer = store.ws_offer(session)
         assert offer and offer['command'] == expected_command, offer
@@ -661,23 +662,40 @@ def assert_web_soft_limits(page, store, clock, output):
         sync_status(page)
         expect(page.locator('#version')).to_have_text('v0.8.2')
         expect(page.locator('#device-timeout-note')).to_contain_text('5 秒')
-        expect(page.locator('#fill-button')).to_be_enabled()
+        expect(page.locator('#fill-button')).to_be_disabled()
+        expect(page.locator('#drain-button')).to_be_disabled()
         expect(page.locator('#estimate-status')).to_contain_text('不确定')
-        expect_countdown(page, 'fill', 100)
-        expect_countdown(page, 'drain', 200)
+        for direction in ('fill', 'drain'):
+            expect(page.locator('#' + direction + '-countdown')).to_have_text('待校准')
+            refused = post_from_page(page, 'commands', dict(command=direction.upper(), id=uuid.uuid4().hex))
+            assert refused['status'] == 409 and refused['body']['error'] == 'output_requires_calibration', refused
+        # Slow trusted rates keep this protocol test away from either boundary,
+        # so it can still exercise the independent 180/300-second safety limits.
+        store.configure_simulation(dict(level=50, fill_seconds=3000, drain_seconds=3000))
+        sync_status(page)
+        expect_countdown(page, 'fill', 1500)
+        expect_countdown(page, 'drain', 1500)
+
+        def expect_idle_countdown(direction):
+            sim = store.snapshot()['simulation']
+            other = 'drain' if direction == 'fill' else 'fill'
+            distance = 100 - sim['level'] if direction == 'fill' else sim['level']
+            seconds = 3000 if status[other] == '1' else distance * 30
+            expect_countdown(page, direction, seconds)
+
         apply_command('#fill-button', 'FILL', state='FILLING', fill='1', reason='manual_filling')
         advance(10)
         apply_command('#drain-button', 'DRAIN', state='EXCHANGING', drain='1', reason='manual_exchanging')
         starts = store.snapshot()['control_limits']
         assert starts['source'] == 'web' and not starts['uncertain'], starts
-        assert store.snapshot()['simulation']['uncertain']
-        assert store.snapshot()['simulation']['fill_on_since'] is None
+        assert not store.snapshot()['simulation']['uncertain']
+        assert store.snapshot()['simulation']['fill_on_since'] is not None
         expect_countdown(page, 'fill', 170)
         expect_countdown(page, 'drain', 300)
         advance(5)
         sync_status(page)
         apply_command('#fill-button', 'FILL_OFF', state='DRAINING', fill='0', reason='manual_draining')
-        expect_countdown(page, 'fill', 100)
+        expect_idle_countdown('fill')
         expect_countdown(page, 'drain', 295)
         apply_command('#fill-button', 'FILL', state='EXCHANGING', fill='1', reason='manual_exchanging')
         expect_countdown(page, 'fill', 180)
@@ -739,7 +757,7 @@ def assert_web_soft_limits(page, store, clock, output):
             sync_status(page)
             for name in ('fill', 'drain'):
                 expect(page.locator('#' + name + '-button')).to_have_attribute('aria-checked', 'false')
-                expect_countdown(page, name, 100 if name == 'fill' else 200)
+                expect_idle_countdown(name)
             expect(page.locator('#header-connection')).to_contain_text('设备正常')
             expect(page.locator('#device-state')).to_have_text('待机')
             expect(page.locator('#control-hint')).not_to_contain_text('故障锁定')
@@ -771,7 +789,7 @@ def assert_web_soft_limits(page, store, clock, output):
 
         timeout_receipt()
         # A drain-only run gets its complete five-minute policy, independently
-        # of the previous inlet timeout and the still-uncertain water estimate.
+        # of the previous inlet timeout, while trusted water stays above empty.
         apply_command('#drain-button', 'DRAIN', state='DRAINING', drain='1', reason='manual_draining')
         expect_countdown(page, 'drain', 300)
         manual_count = len(command_requests)
@@ -792,7 +810,7 @@ def assert_web_soft_limits(page, store, clock, output):
         new_limits = store.snapshot()['control_limits']
         assert new_limits['fill_on_since'] > restarted
         assert new_limits['fill_deadline'] - new_limits['fill_on_since'] == 180
-        expect_countdown(page, 'drain', 200)
+        expect_idle_countdown('drain')
         advance(1)
         sync_status(page)
         expect_countdown(page, 'fill', 179)
@@ -972,7 +990,7 @@ def assert_level_heartbeats(page, store, clock, server, output):
         calibrate(100)
         start_job(60)
         receipt('DRAIN')
-        advance(290)
+        advance(60)
         receipt('DRAIN_OFF')
         assert job()['phase'] == 'waiting', job()
 
@@ -1070,7 +1088,8 @@ def assert_level_heartbeats(page, store, clock, server, output):
         total_active = 0
         previous_off = None
         console_url = page.url
-        for round_number, seconds in enumerate((290, 290, 290, 130), 1):
+        rounds = [60] * 16 + [40]
+        for round_number, seconds in enumerate(rounds, 1):
             if round_number > 1:
                 receipt('DRAIN')
             started = clock[0]
@@ -1098,7 +1117,7 @@ def assert_level_heartbeats(page, store, clock, server, output):
             previous_off = clock[0]
             assert status['state'] == 'IDLE'
             expect(page.locator('#reset')).to_be_disabled()
-            if round_number < 4:
+            if round_number < len(rounds):
                 assert job()['phase'] == 'waiting', job()
                 waiting_level = store.snapshot()['simulation']['level']
                 ping()
@@ -1113,7 +1132,7 @@ def assert_level_heartbeats(page, store, clock, server, output):
         expect_level(100 - 1000 / 30, '66.7%')
         sim = store.snapshot()['simulation']
         assert math.isclose(sim['drain_total_liters'], 20, abs_tol=1e-6), sim
-        assert math.isclose(sim['drain_run_liters'], 2.6, abs_tol=1e-6), sim
+        assert math.isclose(sim['drain_run_liters'], .8, abs_tol=1e-6), sim
         assert math.isclose(sim['volume_liters'], 40, abs_tol=1e-6), sim
         assert math.isclose(job()['elapsed_seconds'], 1000, abs_tol=1e-6), job()
         assert math.isclose(job()['estimated_liters'], 20, abs_tol=1e-6), job()
@@ -1122,7 +1141,7 @@ def assert_level_heartbeats(page, store, clock, server, output):
         expect(page.locator('#job-elapsed')).to_have_text('16 分 40 秒')
         expect_number(page, '#job-volume', 20)
         close_dialog(page, 'level-job')
-        assert [command for command, _, _ in executed[trace_start:]] == ['DRAIN', 'DRAIN_OFF'] * 4
+        assert [command for command, _, _ in executed[trace_start:]] == ['DRAIN', 'DRAIN_OFF'] * len(rounds)
         assert_no_restart()
 
         # A new fill task demonstrates that successful rounds never require
@@ -1217,7 +1236,7 @@ def assert_level_heartbeats(page, store, clock, server, output):
 
 
 def assert_calibrated_runs(browser, output):
-    """Two calibrated operations over real local HTTP/WS, with physical ACKs."""
+    """Boundary stops and finite dual-route budgets over real local HTTP/WS."""
     clock = [time.time()]
     store = Store(':memory:', lambda: clock[0])
     server = Server(('127.0.0.1', 0), store, 'runs-admin-key-' * 3, 'runs-device-key-' * 3, '')
@@ -1336,6 +1355,21 @@ def assert_calibrated_runs(browser, output):
             ping()
         assert not heartbeat_errors, heartbeat_errors
 
+    def advance_runs(seconds):
+        # Acknowledge every ordinary round transition over the actual socket.
+        # The service orders concurrent route transitions fill first, then drain.
+        for _ in range(seconds):
+            ping()
+            for direction in ('fill', 'drain'):
+                current = run(direction)
+                if not current or current['status'] != 'running':
+                    continue
+                if current['phase'] == 'stopping':
+                    receipt(direction.upper() + '_OFF')
+                elif current['phase'] == 'starting':
+                    receipt(direction.upper())
+        assert not heartbeat_errors, heartbeat_errors
+
     def calibrate(level=40, fill_seconds=200, drain_seconds=400):
         sync_status(page)
         open_dialog(page, 'calibration')
@@ -1379,14 +1413,14 @@ def assert_calibrated_runs(browser, output):
         assert not store.snapshot()['simulation']['calibrated']
 
         calibrate(fill_seconds=60)
-        expect_countdown(page, 'fill', 60)
-        expect(page.locator('#fill-countdown-label')).to_have_text('完整用时')
-        expect(page.locator('#fill-progress-text')).to_have_text('0 / 60 秒')
+        expect_countdown(page, 'fill', 36)
+        expect(page.locator('#fill-countdown-label')).to_have_text('预计补满')
+        expect(page.locator('#fill-progress-text')).to_have_text('预计 36 秒')
         calibrate()
-        for direction, seconds in [('fill', 200), ('drain', 400)]:
+        for direction, seconds, label in [('fill', 120, '预计补满'), ('drain', 160, '预计排空')]:
             expect_countdown(page, direction, seconds)
-            expect(page.locator('#' + direction + '-countdown-label')).to_have_text('完整用时')
-            expect(page.locator('#' + direction + '-progress-text')).to_have_text('0 / %d 秒' % seconds)
+            expect(page.locator('#' + direction + '-countdown-label')).to_have_text(label)
+            expect(page.locator('#' + direction + '-progress-text')).to_have_text('预计 %d 秒' % seconds)
         switch('drain')
         drain_id = run('drain')['id']
         expect(page.locator('#drain-button')).to_have_attribute('aria-checked', 'false')
@@ -1426,56 +1460,88 @@ def assert_calibrated_runs(browser, output):
             page.screenshot(path=str(output / ('calibrated-runs-' + name + '.png')), full_page=True)
 
         page.goto('about:blank')
-        advance(160)
-        assert run('fill')['phase'] == 'stopping' and run('drain')['phase'] == 'active'
+        advance(50)
+        assert run('fill')['phase'] == run('drain')['phase'] == 'stopping'
         receipt('FILL_OFF')
-        assert status['drain'] == '1' and run('fill')['phase'] == 'waiting'
+        assert status['drain'] == '1' and run('drain')['phase'] == 'stopping'
+        receipt('DRAIN_OFF')
+        assert run('fill')['phase'] == run('drain')['phase'] == 'waiting'
+        page.goto(server.origin + '/water/')
+        expect(page.locator('#console')).to_be_visible()
+        for direction in ('fill', 'drain'):
+            expect(page.locator('#' + direction + '-button')).to_have_attribute('aria-checked', 'false')
+            expect(page.locator('#' + direction + '-detail')).to_contain_text('结束')
+        expect_number(page, '#fill-volume', 18)
+        expect_number(page, '#drain-volume', 9)
+        page.screenshot(path=str(output / 'calibrated-runs-waiting-mobile.png'), full_page=True)
         advance(1)
-        assert run('fill')['phase'] == 'waiting'
+        assert run('fill')['phase'] == run('drain')['phase'] == 'waiting'
         advance(1)
         receipt('FILL')
-        advance(30)
-        receipt('FILL_OFF')
+        receipt('DRAIN')
+        page.goto('about:blank')
+        advance_runs(144)
         assert run('fill')['status'] == 'completed' and run('fill')['elapsed_seconds'] == 200, run('fill')
+        assert run('fill')['reason'] == 'duration_limit'
         assert math.isclose(run('fill')['estimated_liters'], 60, abs_tol=1e-7)
         assert run('drain')['status'] == 'running' and status['drain'] == '1'
         page.goto(server.origin + '/water/')
         expect(page.locator('#console')).to_be_visible()
         expect(page.locator('#fill-button')).to_have_attribute('aria-checked', 'false')
         expect(page.locator('#drain-button')).to_have_attribute('aria-checked', 'true')
+        expect(page.locator('#fill-countdown')).to_have_text('上限已到')
         expect_number(page, '#fill-volume', 60)
-        expect_number(page, '#drain-volume', 30.3)
+        expect_number(page, '#drain-volume', 30)
         completed_duplicate = post_from_page(page, 'output-run', dict(direction='fill', id=fill_id))
         assert completed_duplicate['status'] == 202 and run('fill')['status'] == 'completed', completed_duplicate
-        advance(88)
-        receipt('DRAIN_OFF')
-        sync_status(page)
-        expect(page.locator('#drain-button')).to_have_attribute('aria-checked', 'false')
-        expect_countdown(page, 'drain', 110)
-        expect_number(page, '#drain-volume', 43.5)
-        expect(page.locator('#drain-detail')).to_contain_text('结束')
-        page.screenshot(path=str(output / 'calibrated-runs-waiting-mobile.png'), full_page=True)
-        advance(2)
-        receipt('DRAIN')
-        advance(110)
-        receipt('DRAIN_OFF')
+        advance_runs(206)
         assert run('drain')['status'] == 'completed' and run('drain')['elapsed_seconds'] == 400, run('drain')
+        assert run('drain')['reason'] == 'duration_limit'
         assert math.isclose(run('drain')['estimated_liters'], 60, abs_tol=1e-7)
         assert math.isclose(store.snapshot()['simulation']['level'], 40, abs_tol=1e-6)
-        assert clock[0] - started == 402
-        assert [event[0] for event in trace] == ['DRAIN', 'FILL', 'FILL_OFF', 'FILL', 'FILL_OFF', 'DRAIN_OFF', 'DRAIN', 'DRAIN_OFF'], trace
+        assert clock[0] - started == 412
+        for direction, durations in [('fill', [60, 60, 60, 20]), ('drain', [60] * 6 + [40])]:
+            transitions = [event for event in trace if event[0] in (direction.upper(), direction.upper() + '_OFF')]
+            assert [event[0] for event in transitions] == [direction.upper(), direction.upper() + '_OFF'] * len(durations)
+            for index, duration in enumerate(durations):
+                on, off = transitions[index * 2:index * 2 + 2]
+                assert off[1] - on[1] == duration, transitions
+                if index:
+                    assert on[1] - transitions[index * 2 - 1][1] == 2, transitions
+        assert all(event[0] in ('FILL', 'FILL_OFF', 'DRAIN', 'DRAIN_OFF') for event in trace), trace
         assert_stays_stopped('fill')
         assert_stays_stopped('drain')
 
-        # Empty estimated water is not the completion condition of a full-time
-        # operation; continue until its duration or an explicit per-output cancel.
+        # Estimated empty ends draining before its duration cap; actual ON stays
+        # visible until the independently acknowledged OFF confirms closure.
         sync_status(page)
         switch('drain')
         receipt('DRAIN')
-        advance(160)
+        advance_runs(124)
+        advance(40)
         assert store.snapshot()['simulation']['level'] <= 1e-6
-        assert run('drain')['status'] == 'running' and run('drain')['remaining_seconds'] == 240
-        advance(130)
+        assert run('drain')['phase'] == 'stopping' and run('drain')['remaining_seconds'] == 240
+        sync_status(page)
+        expect(page.locator('#drain-button')).to_have_attribute('aria-checked', 'true')
+        receipt('DRAIN_OFF')
+        assert run('drain')['status'] == 'completed' and run('drain')['reason'] == 'target_reached'
+        assert run('drain')['elapsed_seconds'] == 160
+        sync_status(page)
+        expect(page.locator('#drain-countdown')).to_have_text('到界已停')
+        expect(page.locator('#drain-button')).to_be_disabled()
+        expect(page.locator('#fill-button')).to_be_enabled()
+        for path, body in [('output-run', dict(direction='drain', id=uuid.uuid4().hex)),
+                           ('commands', dict(command='DRAIN', id=uuid.uuid4().hex))]:
+            refused = post_from_page(page, path, body)
+            assert refused['status'] == 409 and refused['body']['error'] == 'drain_target_reached', refused
+        assert_stays_stopped('drain')
+
+        # A per-route cancel during the confirmed OFF gap cannot stop the other
+        # route that the user starts independently in that gap.
+        calibrate()
+        switch('drain')
+        receipt('DRAIN')
+        advance(60)
         receipt('DRAIN_OFF')
         sync_status(page)
         assert run('drain')['phase'] == 'waiting'
@@ -1509,33 +1575,41 @@ def assert_calibrated_runs(browser, output):
         sync_status(page)
         assert store.snapshot()['simulation']['uncertain']
         expect(page.locator('#estimate-status')).to_contain_text('不确定')
-        expect(page.locator('#fill-button')).to_be_enabled()
+        for direction in ('fill', 'drain'):
+            expect(page.locator('#' + direction + '-button')).to_be_disabled()
+            refused = post_from_page(page, 'output-run', dict(direction=direction, id=uuid.uuid4().hex))
+            assert refused['status'] == 409 and refused['body']['error'] == 'output_requires_calibration', refused
+        assert store.snapshot()['simulation']['level'] == frozen_level
+        calibrate()
+        assert not store.snapshot()['simulation']['uncertain']
         switch('fill')
         receipt('FILL')
-        advance(170)
+        advance_runs(62)
+        advance(60)
+        assert run('fill')['phase'] == 'stopping' and status['fill'] == '1'
         receipt('FILL_OFF')
-        advance(2)
-        receipt('FILL')
-        advance(30)
-        receipt('FILL_OFF')
-        assert run('fill')['status'] == 'completed' and run('fill')['elapsed_seconds'] == 200
-        assert math.isclose(run('fill')['estimated_liters'], 60, abs_tol=1e-7)
-        assert store.snapshot()['simulation']['uncertain'] and store.snapshot()['simulation']['level'] == frozen_level
+        assert run('fill')['status'] == 'completed' and run('fill')['reason'] == 'target_reached'
+        assert run('fill')['elapsed_seconds'] == 120 and run('fill')['remaining_seconds'] == 80
+        assert math.isclose(run('fill')['estimated_liters'], 36, abs_tol=1e-7)
+        assert not store.snapshot()['simulation']['uncertain'] and store.snapshot()['simulation']['level'] == 100
         sync_status(page)
-        expect(page.locator('#estimate-status')).to_contain_text('不确定')
-        expect_number(page, '#fill-volume', 60)
+        expect(page.locator('#fill-countdown')).to_have_text('到界已停')
+        expect(page.locator('#fill-button')).to_be_disabled()
+        expect(page.locator('#drain-button')).to_be_enabled()
+        expect_number(page, '#fill-volume', 36)
+        refused = post_from_page(page, 'output-run', dict(direction='fill', id=uuid.uuid4().hex))
+        assert refused['status'] == 409 and refused['body']['error'] == 'fill_target_reached', refused
+        assert_stays_stopped('fill')
 
-        # Align two physical round deadlines: draining starts 120 seconds
-        # before filling, so both ordinary OFFs are due at elapsed 290.
+        # Align both 60-second round deadlines by starting at the same instant.
         # Each acknowledged OFF must preserve the other output's latest state.
         calibrate()
         switch('drain')
         receipt('DRAIN')
-        advance(120)
         sync_status(page)
         switch('fill')
         receipt('FILL')
-        advance(170)
+        advance(60)
         assert run('fill')['phase'] == run('drain')['phase'] == 'stopping'
         receipt('FILL_OFF')
         assert status['fill'] == '0' and status['drain'] == '1'
@@ -1547,6 +1621,23 @@ def assert_calibrated_runs(browser, output):
         sync_status(page)
         switch('drain', cancel=True)
         receipt('DRAIN_OFF')
+        assert_stays_stopped('fill')
+        assert_stays_stopped('drain')
+
+        # Equal simultaneous rates keep the estimated level fixed, but neither
+        # route can continue beyond its frozen per-run safety budget.
+        calibrate(level=50, fill_seconds=120, drain_seconds=120)
+        switch('drain')
+        receipt('DRAIN')
+        sync_status(page)
+        switch('fill')
+        receipt('FILL')
+        advance_runs(122)
+        for direction in ('fill', 'drain'):
+            assert run(direction)['status'] == 'completed' and run(direction)['reason'] == 'duration_limit'
+            assert run(direction)['elapsed_seconds'] == 120
+            assert run(direction)['round'] == 2 and status[direction] == '0'
+        assert math.isclose(store.snapshot()['simulation']['level'], 50, abs_tol=1e-6)
         assert_stays_stopped('fill')
         assert_stays_stopped('drain')
 
@@ -1563,10 +1654,11 @@ def assert_calibrated_runs(browser, output):
         assert store.snapshot()['level_job']['status'] == 'completed'
         assert not errors, errors
         print('PASS calibrated runs: real WS 0.8.2 bare pings, concurrent fill200/drain400, '
-              '170+30 and 290+110 with confirmed 2-second gaps, simultaneous OFF boundaries, independent completion/cancel, '
-              'physical aria and cross-round totals, full duration beyond estimated empty, '
+              '60-second rounds and shortened final rounds with confirmed 2-second gaps, simultaneous OFF boundaries, '
+              'independent completion/cancel, physical aria and cross-round totals, estimated 0/100 boundary stops and start guards, '
               'idempotent active/completed IDs, close/reload persistence, missing calibration/owned-task guards, '
-              'uncertain water remains uncertain while calibrated timed work completes, no reconnect restart, three viewports')
+              'uncertain starts refused until recalibration, net-zero dual runs stop at finite safety budgets, '
+              'no reconnect restart, three viewports')
     finally:
         close_device()
         context.close()
@@ -1654,7 +1746,7 @@ def main(layout_only=False, estimates_only=False, countdowns_only=False, soft_li
                 assert not errors, errors
                 browser.close()
                 print('PASS level targets: real WS 0.8.2 bare pings only after confirmed ON, '
-                      'unacknowledged grants cannot invent water flow, 1000 seconds in 290/290/290/130 rounds, '
+                      'unacknowledged grants cannot invent water flow, 1000 seconds in sixteen 60-second rounds and a final 40 seconds, '
                       'ordinary OFF ACKs with 2-second gaps, correct run/total liters and decimal updates, '
                       'STOP/cancel/manual/recalibration/disconnection interruptions, no automatic restart, '
                       'uncertainty survives reconnect until recalibration, desktop and two phone viewports')
@@ -1666,7 +1758,7 @@ def main(layout_only=False, estimates_only=False, countdowns_only=False, soft_li
                 assert not errors, errors
                 browser.close()
                 print('PASS Web 0.8.2 soft limits: authenticated WS claim/receipt, independent 180/300 seconds, '
-                      'uncertain water estimate with valid control timer, reload and closed-page persistence, '
+                      'uncertain starts refused until recalibration, trusted slow-rate safety timing, reload and closed-page persistence, '
                       'API outage hides clocks, server timeout pending without browser commands, '
                       'STOP confirmed IDLE and user-started new run without automatic RESET/ON, '
                       'other faults require RESET, desktop/phone layouts and logout race')
@@ -1898,7 +1990,7 @@ def main(layout_only=False, estimates_only=False, countdowns_only=False, soft_li
                   'optional capacity, liters/rates/run and calibration totals, net flow/ETA, '
                   'versioned independent protection countdowns, reload persistence, no web timer commands, '
                   '0.8.2 server STOP limits, normal timeout recovery and fault/reset receipts independent of water estimates, '
-                  '0.8.2 bare heartbeats, 1000-second target task with four acknowledged bounded rounds, '
+                  '0.8.2 bare heartbeats, 1000-second target task with seventeen acknowledged bounded rounds, '
                   'task stop/cancel/manual/calibration/disconnection handling and decimal level display, '
                   'independent run reset, uncertainty/recalibration, API recovery, logout race')
     finally:

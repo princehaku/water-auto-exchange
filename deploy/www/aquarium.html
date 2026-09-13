@@ -12,8 +12,8 @@
   <header id="app-header" class="topbar" hidden>
     <a class="brand" href="./" aria-label="水序龟缸首页"><span class="brand-icon" aria-hidden="true">◈</span><span>水序 <small>龟缸水路</small></span></a>
     <nav class="top-menu" aria-label="控制台菜单">
-      <button id="menu-device" data-panel="device-dialog" aria-haspopup="dialog" aria-controls="device-dialog" aria-expanded="false" disabled>设备状态</button>
-      <button id="menu-history" data-panel="history-dialog" aria-haspopup="dialog" aria-controls="history-dialog" aria-expanded="false" disabled>历史记录</button>
+      <button id="menu-device" data-panel="device-dialog" aria-label="设备状态" aria-haspopup="dialog" aria-controls="device-dialog" aria-expanded="false" disabled><span class="nav-label-full">设备状态</span><span class="nav-label-compact" aria-hidden="true">设备</span></button>
+      <button id="menu-history" data-panel="history-dialog" aria-label="历史记录" aria-haspopup="dialog" aria-controls="history-dialog" aria-expanded="false" disabled><span class="nav-label-full">历史记录</span><span class="nav-label-compact" aria-hidden="true">历史</span></button>
       <button id="menu-calibration" data-panel="calibration-dialog" aria-haspopup="dialog" aria-controls="calibration-dialog" aria-expanded="false" disabled>校准</button>
     </nav>
     <button id="header-connection" class="connection-pill unknown" data-panel="device-dialog" aria-haspopup="dialog" aria-controls="device-dialog" aria-expanded="false" disabled>正在连接</button>
@@ -45,14 +45,20 @@
         </section>
         <section class="control-card" aria-labelledby="control-title">
           <div class="card-top"><div><span class="eyebrow">MANUAL CONTROL</span><h2 id="control-title">水路控制</h2></div><span class="control-tag">手动开关</span></div>
+          <div class="automatic-controls" role="group" aria-labelledby="automatic-title">
+            <div class="control-mode-heading"><h3 id="automatic-title">自动挡</h3><span>日常换水 · 先冲水再补满</span></div>
+            <button id="job-summary" class="job-summary" data-panel="level-job-dialog" aria-haspopup="dialog" aria-controls="level-job-dialog" aria-expanded="false" hidden disabled>目标水位任务</button>
+            <div class="control-actions"><button id="exchange-button" class="target-button exchange-button" title="先冲水至估算 0%，再自动补水至 100%" disabled>一键换水</button><button id="menu-level-job" class="target-button" data-panel="level-job-dialog" aria-haspopup="dialog" aria-controls="level-job-dialog" aria-expanded="false" disabled>按目标水位 ↗</button></div>
+          </div>
+          <div class="manual-controls" role="group" aria-labelledby="manual-title">
+            <div class="control-mode-heading"><h3 id="manual-title">手动挡</h3><span>补水 / 冲水独立操作</span></div>
           <p id="control-hint" class="control-hint">设备在线且就绪后可操作。</p>
-          <button id="job-summary" class="job-summary" data-panel="level-job-dialog" aria-haspopup="dialog" aria-controls="level-job-dialog" aria-expanded="false" hidden disabled>目标水位任务</button>
           <div class="switch-list">
             <div class="output-control"><button id="fill-button" class="water-switch fill-switch" role="switch" aria-label="补水" aria-checked="false" aria-describedby="fill-detail" data-command="FILL" data-output="fill" disabled><span class="switch-icon" aria-hidden="true">↘</span><span class="switch-copy"><strong>补水</strong><small id="fill-detail">状态未知</small></span><span class="switch-control" aria-hidden="true"></span></button><div class="output-metrics"><span>配置流速 <b id="fill-rate">— L/min</b></span><span>本次补水 <b id="fill-volume">— L</b></span></div><div class="output-countdown"><span id="fill-countdown-label">预计剩余</span><strong id="fill-countdown">—</strong></div><div class="run-progress"><div><span id="fill-progress-label">补水运行</span><b id="fill-progress-text">— / — 秒</b></div><div class="progress-track"><i id="fill-progress"></i></div></div></div>
             <div class="output-control"><button id="drain-button" class="water-switch drain-switch" role="switch" aria-label="冲水排出" aria-checked="false" aria-describedby="drain-detail" data-command="DRAIN" data-output="drain" disabled><span class="switch-icon" aria-hidden="true">↗</span><span class="switch-copy"><strong>冲水 · 排出</strong><small id="drain-detail">状态未知</small></span><span class="switch-control" aria-hidden="true"></span></button><div class="output-metrics"><span>配置流速 <b id="drain-rate">— L/min</b></span><span>本次排水 <b id="drain-volume">— L</b></span></div><div class="output-countdown"><span id="drain-countdown-label">预计剩余</span><strong id="drain-countdown">—</strong></div><div class="run-progress"><div><span id="drain-progress-label">排水运行</span><b id="drain-progress-text">— / — 秒</b></div><div class="progress-track drain-progress"><i id="drain-progress"></i></div></div></div>
           </div>
           <div class="water-estimate" aria-label="水量预估"><div class="estimate-grid"><div><span>净流量 · 预估</span><strong id="net-flow">— L/min</strong></div><div><span id="eta-label">预计满水 / 排空</span><strong id="eta-value">—</strong></div></div><p id="estimate-status">校准水位和容量后显示水量预估</p></div>
-          <div class="control-actions"><button id="exchange-button" class="target-button exchange-button" title="先冲水至估算 0%，再自动补水至 100%" disabled>一键换水</button><button id="menu-level-job" class="target-button" data-panel="level-job-dialog" aria-haspopup="dialog" aria-controls="level-job-dialog" aria-expanded="false" disabled>按目标水位 ↗</button></div>
+          </div>
           <p id="command-feedback" class="feedback" role="status" aria-live="polite"></p>
           <p id="control-timeout-note" class="control-foot">限时待设备确认 · 开关以设备回执为准</p>
         </section>

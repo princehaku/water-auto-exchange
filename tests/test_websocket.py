@@ -44,7 +44,7 @@ class ScriptModeWebSocketTests(unittest.TestCase):
                         time.sleep(.02)
                 self.assertIsNotNone(client)
                 client.send(json.dumps(dict(type='auth', key='b' * 32,
-                                            status=dict(STATUS, version='0.8.3', control_mode='manual', need_fill='unknown'))))
+                                            status=dict(STATUS, version='0.8.2', control_mode='manual', need_fill='unknown'))))
                 ready = json.loads(client.recv())
                 self.assertEqual(ready['type'], 'ready')
                 self.assertEqual(ready['soft_limits']['watchdog_ms'], 5000)
@@ -157,9 +157,6 @@ class WebSocketTests(unittest.TestCase):
     def test_web_limits_firmware_concurrent_outputs_and_independent_off_roundtrip(self):
         self.concurrent_outputs_roundtrip('0.8.2')
 
-    def test_graceful_limits_firmware_concurrent_outputs_and_independent_off_roundtrip(self):
-        self.concurrent_outputs_roundtrip('0.8.3')
-
     def test_soft_deadline_owner_runs_without_browser_or_incoming_device_messages(self):
         status = dict(STATUS, version='0.8.2', control_mode='manual', need_fill='unknown')
         client = self.connect(False)
@@ -247,8 +244,8 @@ class WebSocketTests(unittest.TestCase):
         self.assertAlmostEqual(job['current_level'], 100 - 100 / 3)
         self.assertFalse(self.store.db.execute("SELECT 1 FROM commands WHERE command IN ('RESET','DRAIN_TIMEOUT')").fetchone())
 
-    def test_graceful_limit_closes_outputs_and_accepts_manual_restart_without_reset(self):
-        status = dict(STATUS, version='0.8.3', control_mode='manual', need_fill='unknown')
+    def test_deadline_stop_closes_outputs_and_accepts_manual_restart_without_reset(self):
+        status = dict(STATUS, version='0.8.2', control_mode='manual', need_fill='unknown')
         client = self.connect(status=status)
         self.store.enqueue('FILL', 'c' * 32)
         self.assertEqual(json.loads(client.recv())['command'], 'FILL')
@@ -259,11 +256,11 @@ class WebSocketTests(unittest.TestCase):
         self.assertEqual(json.loads(client.recv())['type'], 'received')
         self.now += 180
         offer = json.loads(client.recv())
-        self.assertEqual(offer['command'], 'FILL_TIMEOUT')
+        self.assertEqual(offer['command'], 'STOP')
         client.send(json.dumps(dict(type='claim', id=offer['id'])))
-        self.assertEqual(json.loads(client.recv())['command'], 'FILL_TIMEOUT')
-        status.update(fill='0', state='IDLE', reason='fill_timeout')
-        client.send(json.dumps(dict(type='ack', ack=dict(id=offer['id'], status='succeeded', result='OK FILL_TIMEOUT fill_timeout'), status=status)))
+        self.assertEqual(json.loads(client.recv())['command'], 'STOP')
+        status.update(fill='0', state='IDLE', reason='stopped')
+        client.send(json.dumps(dict(type='ack', ack=dict(id=offer['id'], status='succeeded', result='OK STOP stopped'), status=status)))
         self.assertEqual(json.loads(client.recv())['type'], 'received')
         self.assertIsNone(self.store.control_timeout)
         self.assertEqual(self.store.status['state'], 'IDLE')

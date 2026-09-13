@@ -14,10 +14,8 @@ STATUS = dict(project='water_auto_exchange', version='0.8.2', control_mode='manu
 
 
 class ControlLimitTests(unittest.TestCase):
-    version = '0.8.2'
-
     def setUp(self):
-        self.initial = dict(STATUS, version=self.version)
+        self.initial = dict(STATUS)
         self.wall = self.mono = 1000
         self.temp = tempfile.TemporaryDirectory()
         self.path = str(Path(self.temp.name) / 'water.db')
@@ -29,9 +27,6 @@ class ControlLimitTests(unittest.TestCase):
     def tearDown(self):
         self.store.db.close()
         self.temp.cleanup()
-
-    def timeout_command(self, direction='fill'):
-        return 'STOP' if self.version == '0.8.2' else direction.upper() + '_TIMEOUT'
 
     def advance(self, seconds):
         self.wall += seconds
@@ -70,7 +65,7 @@ class ControlLimitTests(unittest.TestCase):
         self.assertEqual(self.store.control_runs['fill']['since'], 1000)
         self.until(1180)
         offer = self.store.ws_offer(self.session)
-        self.assertEqual(offer['command'], self.timeout_command())
+        self.assertEqual(offer['command'], 'STOP')
         self.assertEqual(self.store.control_limits_snapshot()['timeout_pending'], 'fill')
 
     def test_rejected_start_with_confirmed_off_clears_grant(self):
@@ -103,14 +98,14 @@ class ControlLimitTests(unittest.TestCase):
         self.assertEqual(self.store.control_runs['fill']['since'], 1000)
         self.assertIsNone(self.store.control_runs['drain'])
         self.until(1180)
-        self.assertEqual(self.store.ws_offer(self.session)['command'], self.timeout_command())
+        self.assertEqual(self.store.ws_offer(self.session)['command'], 'STOP')
 
     def test_drain_gets_full_five_minutes_independent_of_browser(self):
         self.start('drain')
         self.until(1299.9)
         self.assertIsNone(self.store.ws_offer(self.session))
         self.until(1300)
-        self.assertEqual(self.store.ws_offer(self.session)['command'], self.timeout_command('drain'))
+        self.assertEqual(self.store.ws_offer(self.session)['command'], 'STOP')
 
     def test_water_calibration_uncertainty_does_not_pause_control(self):
         self.store.configure_simulation(dict(level=50, fill_seconds=200, drain_seconds=200))
@@ -119,7 +114,7 @@ class ControlLimitTests(unittest.TestCase):
         self.assertTrue(self.store.snapshot()['simulation']['uncertain'])
         self.assertFalse(self.store.snapshot()['control_limits']['uncertain'])
         self.until(1180)
-        self.assertEqual(self.store.ws_offer(self.session)['command'], self.timeout_command())
+        self.assertEqual(self.store.ws_offer(self.session)['command'], 'STOP')
 
     def test_timeout_revokes_delivered_open_grants_and_cannot_be_publicly_queued(self):
         self.start()
@@ -132,15 +127,15 @@ class ControlLimitTests(unittest.TestCase):
             with self.assertRaises(Problem) as caught:
                 self.store.enqueue(command, 'f' * 32)
             self.assertEqual(caught.exception.message, 'invalid_command')
-        # A normal STOP cannot cancel the fault-generating timeout command.
+        # A user STOP cannot cancel the higher-priority deadline STOP.
         self.store.enqueue('STOP', 'd' * 32)
-        self.assertEqual(self.store.ws_offer(self.session)['command'], self.timeout_command())
+        self.assertEqual(self.store.ws_offer(self.session)['command'], 'STOP')
 
     def test_unconfirmed_timeout_breaks_heartbeat_lease_and_requires_new_idle_session(self):
         self.start()
         self.until(1180)
         offer = self.store.ws_offer(self.session)
-        self.assertEqual(self.store.ws_claim(self.session, offer['id'])['command'], self.timeout_command())
+        self.assertEqual(self.store.ws_claim(self.session, offer['id'])['command'], 'STOP')
         self.advance(1)
         with self.assertRaises(Problem) as caught:
             self.store.ws_touch(self.session)
@@ -157,7 +152,7 @@ class ControlLimitTests(unittest.TestCase):
         self.until(1180)
         offer = self.store.ws_offer(self.session)
         self.store.ws_claim(self.session, offer['id'])
-        self.ack(offer['id'], fill='0', state='FAULT', reason='fill_timeout')
+        self.ack(offer['id'], fill='0', state='FAULT', reason='communication_timeout')
         self.assertIsNone(self.store.control_timeout)
         row = self.store.db.execute('SELECT status FROM commands WHERE id=?', (offer['id'],)).fetchone()
         self.assertEqual(row['status'], 'succeeded')
@@ -199,7 +194,7 @@ class ControlLimitTests(unittest.TestCase):
         self.assertEqual(self.wall - limits['fill_on_since'], 30)
         self.mono += 150
         self.store.control_tick(self.session)
-        self.assertEqual(self.store.ws_offer(self.session)['command'], self.timeout_command())
+        self.assertEqual(self.store.ws_offer(self.session)['command'], 'STOP')
         self.assertEqual(self.store.control_limits_snapshot()['fill_deadline'], self.wall)
 
     def test_old_firmware_keeps_firmware_owned_limits_and_new_http_gateway_is_rejected(self):
@@ -246,7 +241,7 @@ class ControlLimitTests(unittest.TestCase):
         self.assertEqual(self.store.simulation, previous_simulation)
         self.assertEqual(self.store.seen, old_seen)
         self.until(1180)
-        self.assertEqual(self.store.ws_offer(self.session)['command'], self.timeout_command())
+        self.assertEqual(self.store.ws_offer(self.session)['command'], 'STOP')
 
     def test_replayed_successful_off_ack_cannot_erase_new_unconfirmed_grant(self):
         self.assert_old_off_ack_is_inert(False)
@@ -279,7 +274,7 @@ class ControlLimitTests(unittest.TestCase):
         self.assertEqual(self.store.ws_activity_tick, activity_tick)
         self.assertEqual(self.store.db.execute('SELECT status FROM commands WHERE id=?', (off_id,)).fetchone()['status'], 'succeeded')
         self.until(1180)
-        self.assertEqual(self.store.ws_offer(self.session)['command'], self.timeout_command())
+        self.assertEqual(self.store.ws_offer(self.session)['command'], 'STOP')
 
     def test_expired_ack_cannot_replace_telemetry_or_erase_pending_deadline(self):
         command_id = self.grant('FILL')
@@ -300,15 +295,11 @@ class ControlLimitTests(unittest.TestCase):
         self.assertEqual(caught.exception.message, 'unclaimed_ack')
         self.assertEqual(self.store.status, self.initial)
 
-
-class GracefulControlLimitTests(ControlLimitTests):
-    version = '0.8.3'
-
     def timeout_offer(self, key='fill'):
         self.start(key)
         self.until(1180 if key == 'fill' else 1300)
         offer = self.store.ws_offer(self.session)
-        self.assertEqual(offer['command'], key.upper() + '_TIMEOUT')
+        self.assertEqual(offer['command'], 'STOP')
         return offer
 
     def test_normal_limit_stops_both_outputs_and_allows_a_new_manual_run_without_reset(self):
@@ -318,7 +309,7 @@ class GracefulControlLimitTests(ControlLimitTests):
         self.until(1180)
         offer = self.store.ws_offer(self.session)
         self.store.ws_claim(self.session, offer['id'])
-        self.ack(offer['id'], fill='0', drain='0', state='IDLE', reason='fill_timeout')
+        self.ack(offer['id'], fill='0', drain='0', state='IDLE', reason='stopped')
         self.assertIsNone(self.store.control_timeout)
         self.assertEqual(self.store.control_runs, dict(fill=None, drain=None))
         self.assertIsNone(self.store.ws_offer(self.session))  # never auto-reopen
@@ -328,36 +319,38 @@ class GracefulControlLimitTests(ControlLimitTests):
         self.assertEqual(self.store.control_runs['fill']['until'], 1360.25)
         self.assertFalse(self.store.db.execute("SELECT 1 FROM commands WHERE command='RESET'").fetchone())
 
-    def test_drain_completion_can_confirm_done_without_fault(self):
+    def test_drain_stop_receipt_confirms_idle_without_fault(self):
         offer = self.timeout_offer('drain')
         self.store.ws_claim(self.session, offer['id'])
-        self.ack(offer['id'], drain='0', state='DONE', reason='drain_timeout')
+        self.ack(offer['id'], drain='0', state='IDLE', reason='stopped')
         self.assertIsNone(self.store.control_timeout)
-        self.assertEqual(self.store.status['state'], 'DONE')
+        self.assertEqual(self.store.status['state'], 'IDLE')
         self.start()
 
-    def test_timeout_status_can_confirm_close_and_late_ack_cannot_fault_next_run(self):
+    def test_stop_requires_receipt_and_replayed_receipt_cannot_fault_next_run(self):
         offer = self.timeout_offer()
         self.store.ws_claim(self.session, offer['id'])
-        idle = dict(self.initial, reason='fill_timeout')
+        idle = dict(self.initial, reason='stopped')
         self.store.ws_touch(self.session, idle)
         self.status = idle
+        self.assertIsNotNone(self.store.control_timeout)
+        self.ack(offer['id'])
         self.assertIsNone(self.store.control_timeout)
         row = self.store.db.execute('SELECT status,result FROM commands WHERE id=?', (offer['id'],)).fetchone()
-        self.assertEqual((row['status'], row['result']), ('succeeded', 'outputs_off_confirmed'))
+        self.assertEqual((row['status'], row['result']), ('succeeded', 'OK'))
         self.start()
         self.assertFalse(self.store.ws_touch(self.session, dict(idle, state='FAULT'),
-                                             dict(id=offer['id'], status='succeeded', result='OK FILL_TIMEOUT')))
+                                             dict(id=offer['id'], status='succeeded', result='OK STOP')))
         self.assertEqual(self.store.status['state'], 'FILLING')
         self.assertIsNotNone(self.store.control_runs['fill'])
 
-    def test_old_idle_and_wrong_timeout_reason_cannot_confirm_new_stop(self):
+    def test_plain_off_status_without_receipt_cannot_confirm_timeout(self):
         offer = self.timeout_offer()
-        for reason in ('ready', 'fill_timeout'):
+        for reason in ('ready', 'stopped'):
             self.store.ws_touch(self.session, dict(self.initial, reason=reason))
             self.assertIsNotNone(self.store.control_timeout)
         self.store.ws_claim(self.session, offer['id'])
-        for reason in ('ready', 'drain_timeout'):
+        for reason in ('ready', 'stopped'):
             self.store.ws_touch(self.session, dict(self.initial, reason=reason))
             self.assertIsNotNone(self.store.control_timeout)
         self.advance(1)
@@ -380,7 +373,7 @@ class GracefulControlLimitTests(ControlLimitTests):
         self.store.enqueue('DRAIN_OFF', off_id)
         self.assertIsNone(self.store.ws_offer(self.session))
         self.store.ws_claim(self.session, offer['id'])
-        self.ack(offer['id'], drain='0', state='IDLE', reason='drain_timeout')
+        self.ack(offer['id'], drain='0', state='IDLE', reason='stopped')
         self.assertEqual(self.store.ws_offer(self.session)['id'], off_id)
         self.assertEqual(self.store.ws_claim(self.session, off_id)['type'], 'execute')
         self.ack(off_id, drain='0', state='IDLE', reason='drain_stopped')

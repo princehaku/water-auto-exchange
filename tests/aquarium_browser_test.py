@@ -603,10 +603,9 @@ def assert_logout_race(page):
     assert len(pending) == 1
 
 
-def assert_web_soft_limits(page, store, clock, output, version='0.8.2'):
-    """Exercise versioned Web policies with simulated authenticated WS receipts."""
-    unlocked_timeout = version in ('0.8.2', '0.8.3')
-    image_prefix = 'aquarium-web-limits-' + version.replace('.', '')
+def assert_web_soft_limits(page, store, clock, output):
+    """Exercise 0.8.2 Web STOP policies with authenticated WS receipts."""
+    image_prefix = 'aquarium-web-limits-082'
     console_url = page.url
     # Leave a calibrated water estimate uncertain using an actual telemetry gap.
     # The new control timer must remain usable without recalibrating that history.
@@ -623,7 +622,7 @@ def assert_web_soft_limits(page, store, clock, output, version='0.8.2'):
     assert store.snapshot()['simulation']['uncertain']
     store.gateway = None
     store.gateway_seen = 0
-    status.update(version=version, state='IDLE', reason='ready')
+    status.update(version='0.8.2', state='IDLE', reason='ready')
     session = store.ws_open(status)
     command_requests = []
 
@@ -660,7 +659,7 @@ def assert_web_soft_limits(page, store, clock, output, version='0.8.2'):
     page.on('request', track_commands)
     try:
         sync_status(page)
-        expect(page.locator('#version')).to_have_text('v' + version)
+        expect(page.locator('#version')).to_have_text('v0.8.2')
         expect(page.locator('#device-timeout-note')).to_contain_text('5 秒')
         expect(page.locator('#fill-button')).to_be_enabled()
         expect(page.locator('#estimate-status')).to_contain_text('不确定')
@@ -725,7 +724,10 @@ def assert_web_soft_limits(page, store, clock, output, version='0.8.2'):
         assert store.snapshot()['control_limits']['timeout_pending'] == 'fill'
         page.screenshot(path=str(output / (image_prefix + '-pending-mobile.png')), full_page=True)
 
-        def timeout_receipt(command, reason):
+        def timeout_receipt():
+            # The server uses ordinary STOP before the 0.8.2 board's timeout
+            # fault path, so confirmed outputs return to IDLE without RESET.
+            command = 'STOP'
             requests_before = len(command_requests)
             command_ids_before = {item['id'] for item in store.snapshot()['commands']}
             offer = store.ws_offer(session)
@@ -733,36 +735,30 @@ def assert_web_soft_limits(page, store, clock, output, version='0.8.2'):
             execute = store.ws_claim(session, offer['id'])
             assert execute['type'] == 'execute', execute
             report(ack=dict(id=offer['id'], status='succeeded', result='OK ' + command),
-                   state='IDLE' if unlocked_timeout else 'FAULT',
-                   ready='1' if unlocked_timeout else '0', fill='0', drain='0', reason=reason)
+                   state='IDLE', ready='1', fill='0', drain='0', reason='stopped')
             sync_status(page)
             for name in ('fill', 'drain'):
                 expect(page.locator('#' + name + '-button')).to_have_attribute('aria-checked', 'false')
-                expect_countdown(page, name, (100 if name == 'fill' else 200) if unlocked_timeout else None)
-            if unlocked_timeout:
-                expect(page.locator('#header-connection')).to_contain_text('设备正常')
-                expect(page.locator('#device-state')).to_have_text('待机')
-                expect(page.locator('#control-hint')).not_to_contain_text('故障锁定')
-                expect(page.locator('#fill-button')).to_be_enabled()
-                expect(page.locator('#drain-button')).to_be_enabled()
-                expect(page.locator('#reset')).to_be_disabled()
-                assert store.snapshot()['control_limits']['timeout_pending'] is None
-                assert store.snapshot()['control_limits']['fill_on_since'] is None
-                assert store.snapshot()['control_limits']['drain_on_since'] is None
-                # Allow both the local UI timer and the status poll to run. An
-                # automatic RESET or restart must never be used to unlock limits.
-                page.wait_for_timeout(2200)
-                assert len(command_requests) == requests_before, 'The browser auto-reset or restarted after timeout'
-                assert {item['id'] for item in store.snapshot()['commands']} == command_ids_before, \
-                    'The service auto-reset or restarted after timeout'
-                for name in ('fill', 'drain'):
-                    expect(page.locator('#' + name + '-button')).to_have_attribute('aria-checked', 'false')
-                assert_one_screen(page)
-                page.screenshot(path=str(output / (image_prefix + '-' + command.lower() + '-idle.png')), full_page=True)
-            else:
-                expect(page.locator('#header-connection')).to_contain_text('设备异常')
-                expect(page.locator('#fill-button')).to_be_disabled()
-                expect(page.locator('#reset')).to_be_enabled()
+                expect_countdown(page, name, 100 if name == 'fill' else 200)
+            expect(page.locator('#header-connection')).to_contain_text('设备正常')
+            expect(page.locator('#device-state')).to_have_text('待机')
+            expect(page.locator('#control-hint')).not_to_contain_text('故障锁定')
+            expect(page.locator('#fill-button')).to_be_enabled()
+            expect(page.locator('#drain-button')).to_be_enabled()
+            expect(page.locator('#reset')).to_be_disabled()
+            assert store.snapshot()['control_limits']['timeout_pending'] is None
+            assert store.snapshot()['control_limits']['fill_on_since'] is None
+            assert store.snapshot()['control_limits']['drain_on_since'] is None
+            # Allow both the local UI timer and the status poll to run. An
+            # automatic RESET or restart must never be used to unlock limits.
+            page.wait_for_timeout(2200)
+            assert len(command_requests) == requests_before, 'The browser auto-reset or restarted after timeout'
+            assert {item['id'] for item in store.snapshot()['commands']} == command_ids_before, \
+                'The service auto-reset or restarted after timeout'
+            for name in ('fill', 'drain'):
+                expect(page.locator('#' + name + '-button')).to_have_attribute('aria-checked', 'false')
+            assert_one_screen(page)
+            page.screenshot(path=str(output / (image_prefix + '-' + command.lower() + '-idle.png')), full_page=True)
 
         def reset_fault():
             open_dialog(page, 'device')
@@ -773,12 +769,7 @@ def assert_web_soft_limits(page, store, clock, output, version='0.8.2'):
             close_dialog(page, 'device')
             expect(page.locator('#fill-button')).to_be_enabled()
 
-        timeout_receipt('STOP' if version == '0.8.2' else 'FILL_TIMEOUT',
-                        'stopped' if version == '0.8.2' else 'fill_timeout')
-        if version == '0.8.3':
-            expect(page.locator('#device-reason')).to_contain_text('补水')
-        if not unlocked_timeout:
-            reset_fault()
+        timeout_receipt()
         # A drain-only run gets its complete five-minute policy, independently
         # of the previous inlet timeout and the still-uncertain water estimate.
         apply_command('#drain-button', 'DRAIN', state='DRAINING', drain='1', reason='manual_draining')
@@ -793,38 +784,34 @@ def assert_web_soft_limits(page, store, clock, output, version='0.8.2'):
         expect(page.locator('#drain-button')).to_have_attribute('aria-checked', 'true')
         assert len(command_requests) == manual_count
         assert store.snapshot()['control_limits']['timeout_pending'] == 'drain'
-        timeout_receipt('STOP' if version == '0.8.2' else 'DRAIN_TIMEOUT',
-                        'stopped' if version == '0.8.2' else 'drain_timeout')
-        if version == '0.8.3':
-            expect(page.locator('#device-reason')).to_contain_text('排水')
-        if unlocked_timeout:
-            # Confirmed normal timeout leaves the controls ready for a new,
-            # explicitly requested run with a complete new policy deadline.
-            apply_command('#fill-button', 'FILL', state='FILLING', fill='1', reason='manual_filling')
-            expect_countdown(page, 'fill', 180)
-            new_limits = store.snapshot()['control_limits']
-            assert new_limits['fill_on_since'] > restarted
-            assert new_limits['fill_deadline'] - new_limits['fill_on_since'] == 180
-            expect_countdown(page, 'drain', 200)
-            advance(1)
-            sync_status(page)
-            expect_countdown(page, 'fill', 179)
-            apply_command('#fill-button', 'FILL_OFF', state='IDLE', fill='0', reason='stopped')
+        timeout_receipt()
+        # Confirmed normal timeout leaves the controls ready for a new,
+        # explicitly requested run with a complete new policy deadline.
+        apply_command('#fill-button', 'FILL', state='FILLING', fill='1', reason='manual_filling')
+        expect_countdown(page, 'fill', 180)
+        new_limits = store.snapshot()['control_limits']
+        assert new_limits['fill_on_since'] > restarted
+        assert new_limits['fill_deadline'] - new_limits['fill_on_since'] == 180
+        expect_countdown(page, 'drain', 200)
+        advance(1)
+        sync_status(page)
+        expect_countdown(page, 'fill', 179)
+        apply_command('#fill-button', 'FILL_OFF', state='IDLE', fill='0', reason='stopped')
 
-            # Other firmware faults retain their actual lock and require an
-            # explicit user RESET; a normal timeout is not a blanket fault bypass.
-            requests_before = len(command_requests)
-            command_ids_before = {item['id'] for item in store.snapshot()['commands']}
-            report(state='FAULT', ready='0', reason='communication_timeout')
-            sync_status(page)
-            expect(page.locator('#header-connection')).to_contain_text('设备异常')
-            expect(page.locator('#fill-button')).to_be_disabled()
-            expect(page.locator('#drain-button')).to_be_disabled()
-            expect(page.locator('#reset')).to_be_enabled()
-            expect(page.locator('#control-hint')).to_contain_text('故障锁定')
-            page.wait_for_timeout(2200)
-            assert len(command_requests) == requests_before, 'The browser automatically reset a genuine fault'
-            assert {item['id'] for item in store.snapshot()['commands']} == command_ids_before
+        # Other firmware faults retain their actual lock and require an
+        # explicit user RESET; a normal timeout is not a blanket fault bypass.
+        requests_before = len(command_requests)
+        command_ids_before = {item['id'] for item in store.snapshot()['commands']}
+        report(state='FAULT', ready='0', reason='communication_timeout')
+        sync_status(page)
+        expect(page.locator('#header-connection')).to_contain_text('设备异常')
+        expect(page.locator('#fill-button')).to_be_disabled()
+        expect(page.locator('#drain-button')).to_be_disabled()
+        expect(page.locator('#reset')).to_be_enabled()
+        expect(page.locator('#control-hint')).to_contain_text('故障锁定')
+        page.wait_for_timeout(2200)
+        assert len(command_requests) == requests_before, 'The browser automatically reset a genuine fault'
+        assert {item['id'] for item in store.snapshot()['commands']} == command_ids_before
         reset_fault()
         store.ws_close(session, 'peer_disconnected')
         sync_status(page)
@@ -1674,15 +1661,14 @@ def main(layout_only=False, estimates_only=False, countdowns_only=False, soft_li
                 return
 
             if soft_limits_only:
-                for version in ('0.8.2', '0.8.3'):
-                    assert_web_soft_limits(page, store, now, output, version)
+                assert_web_soft_limits(page, store, now, output)
                 assert_logout_race(page)
                 assert not errors, errors
                 browser.close()
-                print('PASS Web 0.8.2/0.8.3 soft limits: authenticated WS claim/receipt, independent 180/300 seconds, '
+                print('PASS Web 0.8.2 soft limits: authenticated WS claim/receipt, independent 180/300 seconds, '
                       'uncertain water estimate with valid control timer, reload and closed-page persistence, '
                       'API outage hides clocks, server timeout pending without browser commands, '
-                      '0.8.2 STOP / 0.8.3 timeout confirmed IDLE and user-started new run without automatic RESET/ON, '
+                      'STOP confirmed IDLE and user-started new run without automatic RESET/ON, '
                       'other faults require RESET, desktop/phone layouts and logout race')
                 return
 
@@ -1884,8 +1870,7 @@ def main(layout_only=False, estimates_only=False, countdowns_only=False, soft_li
             expect(page.locator('#header-connection')).to_contain_text('设备正常')
             expect(page.locator('#message')).to_be_empty()
 
-            for version in ('0.8.2', '0.8.3'):
-                assert_web_soft_limits(page, store, now, output, version)
+            assert_web_soft_limits(page, store, now, output)
             report()
             sync_status(page)
             assert_level_heartbeats(page, store, now, server, output)
@@ -1909,7 +1894,7 @@ def main(layout_only=False, estimates_only=False, countdowns_only=False, soft_li
                   'concurrent outputs, legacy guards, fault/offline indicator, visible dialog feedback, '
                   'optional capacity, liters/rates/run and calibration totals, net flow/ETA, '
                   'versioned independent protection countdowns, reload persistence, no web timer commands, '
-                  '0.8.2/0.8.3 server limits, normal timeout recovery and fault/reset receipts independent of water estimates, '
+                  '0.8.2 server STOP limits, normal timeout recovery and fault/reset receipts independent of water estimates, '
                   '0.8.2 bare heartbeats, 1000-second target task with four acknowledged bounded rounds, '
                   'task stop/cancel/manual/calibration/disconnection handling and decimal level display, '
                   'independent run reset, uncertainty/recalibration, API recovery, logout race')

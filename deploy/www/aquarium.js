@@ -6,12 +6,12 @@ const resultNames={queued:'等待设备领取',delivered:'等待设备回执',su
 const stateNames={UNCONFIGURED:'等待配置',IDLE:'待机',DRAINING:'正在排水',SETTLING:'切换间隔',FILLING:'正在补水',EXCHANGING:'补水与排水同时进行',DONE:'本轮已完成',FAULT:'故障锁定'};
 const reasonNames={ready:'已就绪，可以操作',manual_filling:'补水正在运行',manual_draining:'冲水正在运行',manual_exchanging:'两路正在同时运行',stopped:'输出已停止',fill_timeout:'补水超时',drain_timeout:'排水超时',communication_timeout:'有效通信中断，输出已保护关断',overflow:'超高水位触发',reset:'故障已复位',mapping_not_confirmed:'输出映射尚未确认',wiring_not_confirmed:'接线尚未确认'};
 const connectionReasons={connected:'设备已连接',connection_closed:'连接已关闭',peer_disconnected:'设备已断开',peer_closed:'设备主动断开',heartbeat_timeout:'设备通信超时',server_restarted:'服务已重启',protocol_or_internal_error:'连接异常',never_connected:'等待首次连接',auth_timeout:'认证超时',stale_session:'旧会话已结束',session_replaced:'新会话已接管',control_stop_unconfirmed:'限时关断未确认，连接已终止',control_state_uncertain:'输出状态未知，连接已终止',control_unowned_output:'输出与本次控制记录不符',control_protocol_changed:'设备控制模式变化，需重新连接'};
-const errors={login_required:'请先登录。',invalid_key:'管理密钥不正确。',try_later:'尝试过于频繁，请稍后再试。',device_offline:'设备已离线，命令未提交。',device_not_ready:'设备尚未就绪。',command_pending:'上一条命令尚在等待回执。',control_timeout_pending:'已达到软上限，正在确认输出关闭。',firmware_upgrade_required:'需要 0.8.0 / 0.8.1 / 0.8.2 / 0.8.3 手动模式才能独立关闭输出。',simulation_requires_idle:'校准时设备须在线，且补水、排水均已关闭。',invalid_simulation:'当前水位须为 0–100%，补排水用时为 1–86400 秒；容量可不填，填写时须为 0.1–100000 L。'};
-const supportedManual=['0.7.0','0.7.1','0.7.2','0.7.3','0.7.4','0.7.5','0.7.6','0.7.7','0.8.0','0.8.1','0.8.2','0.8.3'];
+const errors={login_required:'请先登录。',invalid_key:'管理密钥不正确。',try_later:'尝试过于频繁，请稍后再试。',device_offline:'设备已离线，命令未提交。',device_not_ready:'设备尚未就绪。',command_pending:'上一条命令尚在等待回执。',control_timeout_pending:'已达到软上限，正在确认输出关闭。',firmware_upgrade_required:'需要 0.8.0 / 0.8.1 / 0.8.2 手动模式才能独立关闭输出。',simulation_requires_idle:'校准时设备须在线，且补水、排水均已关闭。',invalid_simulation:'当前水位须为 0–100%，补排水用时为 1–86400 秒；容量可不填，填写时须为 0.1–100000 L。'};
+const supportedManual=['0.7.0','0.7.1','0.7.2','0.7.3','0.7.4','0.7.5','0.7.6','0.7.7','0.8.0','0.8.1','0.8.2'];
 const refreshInterval=2000;
 let scene=null,snapshot=null,lastSnapshot=null,signedIn=false,lastSuccess=0,refreshRequest=null,authEpoch=0,busy=false,jobBusy=false,submittedId=null,formLoaded=false,refreshEnabled=true;
 const outputBusy={fill:false,drain:false};
-Object.assign(errors,{invalid_output_run:'作业参数不正确，请刷新后重试。',output_run_active:'已有补排作业正在执行，请先结束对应作业。',output_run_requires_web:'完整用时作业需要 0.8.2 / 0.8.3 手动模式。',output_run_requires_idle:'本路须关闭并确认就绪后才能开始作业。',output_run_requires_calibration:'请先在校准中保存本路完整用时。',stale_output_run:'本路作业已变化，请等待同步后再操作。',request_id_conflict:'请求标识已使用，请刷新后重试。'});
+Object.assign(errors,{invalid_output_run:'作业参数不正确，请刷新后重试。',output_run_active:'已有补排作业正在执行，请先结束对应作业。',output_run_requires_web:'完整用时作业需要 0.8.2 手动模式。',output_run_requires_idle:'本路须关闭并确认就绪后才能开始作业。',output_run_requires_calibration:'请先在校准中保存本路完整用时。',stale_output_run:'本路作业已变化，请等待同步后再操作。',request_id_conflict:'请求标识已使用，请刷新后重试。'});
 Object.assign(errors,{invalid_level_target:'目标水位须为 0–100%。',level_job_active:'已有目标任务正在执行，请先停止。',level_job_requires_idle:'启动前设备须在线、就绪，且两路均已关闭。',level_job_requires_calibration:'水位估算尚未校准或已不确定，请按现场水位重新校准。',level_job_requires_web:'当前设备暂不支持目标水位任务。',level_target_reached:'当前估算已经达到目标水位。'});
 const jobReasons={done:'已按校准估算完成目标。',target_reached:'已达到预估目标水位。',cancelled_by_user:'已按你的要求停止任务。',manual_override:'手动操作已结束目标任务。',calibration_changed:'重新校准后，原目标任务已结束。',device_disconnected:'设备连接中断，目标任务已结束。',server_restarted:'服务重启，原目标任务未恢复。',output_unknown:'输出状态未知，目标任务已结束。',device_fault:'设备故障，目标任务已停止；请检查现场。',command_rejected:'设备拒绝指令，目标任务已结束。',start_timeout:'开启回执未确认，目标任务已结束。',stop_unconfirmed:'关断尚未确认，请检查设备状态。',estimate_uncertain:'水位估算不确定，请重新校准。'};
 
@@ -53,10 +53,10 @@ function setConnection(data,serviceOk=true){
   $('last-seen').textContent=data?.last_seen?timeLabel(data.last_seen):'—';
   $('online-duration').textContent=serviceOk&&data?.online&&data.connection?.since?durationLabel(serverNow(data)-data.connection.since):'—';
 }
-function concurrent(device){return ['0.8.0','0.8.1','0.8.2','0.8.3'].includes(device?.version)&&device.control_mode==='manual';}
-function webLimits(device){return ['0.8.2','0.8.3'].includes(device?.version)&&device.control_mode==='manual';}
-function outputLimit(device,output){return ['0.8.1','0.8.2','0.8.3'].includes(device?.version)?(output==='fill'?180:300):supportedManual.includes(device?.version)?120:null;}
-function timedStopLabel(device){return webLimits(device)&&device.state==='IDLE'&&device.outputs_known==='1'&&device.fill==='0'&&device.drain==='0'?({stopped:'输出已关闭，可再次开启。',fill_timeout:'补水到时已关闭，可再次开启。',drain_timeout:'排水到时已关闭，可再次开启。'}[device.reason]||null):null;}
+function concurrent(device){return ['0.8.0','0.8.1','0.8.2'].includes(device?.version)&&device.control_mode==='manual';}
+function webLimits(device){return device?.version==='0.8.2'&&device.control_mode==='manual';}
+function outputLimit(device,output){return ['0.8.1','0.8.2'].includes(device?.version)?(output==='fill'?180:300):supportedManual.includes(device?.version)?120:null;}
+function timedStopLabel(device){return webLimits(device)&&device.state==='IDLE'&&device.outputs_known==='1'&&device.fill==='0'&&device.drain==='0'&&device.reason==='stopped'?'输出已关闭，可再次开启。':null;}
 function pendingFor(output){return snapshot?.commands?.find(item=>item.command===(output==='fill'?'FILL':'DRAIN')&&['queued','delivered'].includes(item.status));}
 function runningOutput(output,data=snapshot){const run=data?.output_runs?.[output];return run?.status==='running'?run:null;}
 function hasOutputRuns(data=snapshot){return ['fill','drain'].some(output=>runningOutput(output,data));}
@@ -178,7 +178,7 @@ function renderProgress(data,serviceOk=true){
     $(output+'-countdown').classList.toggle('is-ending',remaining!==null&&remaining<=30);
   }
   const limitsKnown=Number.isFinite(outputLimit(device,'fill'));
-  $('control-timeout-note').textContent=!limitsKnown?'限时待设备确认 · 开关以设备回执为准':web?'自动分轮：补水 170 秒 · 排水 290 秒':['0.8.1','0.8.2','0.8.3'].includes(device.version)?'补水限时 3 分钟 · 排水限时 5 分钟':'当前固件两路各限时 120 秒';
+  $('control-timeout-note').textContent=!limitsKnown?'限时待设备确认 · 开关以设备回执为准':web?'自动分轮：补水 170 秒 · 排水 290 秒':['0.8.1','0.8.2'].includes(device.version)?'补水限时 3 分钟 · 排水限时 5 分钟':'当前固件两路各限时 120 秒';
   $('device-timeout-note').textContent=!limitsKnown?'等待设备确认当前保护时限。':web?'主开关每次累计运行完整的校准用时：补水按空到满用时，排水按满到空用时，不按当前水位缩短，水位估算到 0% / 100% 也不会提前停。服务端按补水每轮最多 170 秒、排水 290 秒执行，确认本路关闭后等待 2 秒，等待不计入运行时长。两路可以同时作业、分别结束。关闭网页后服务端仍执行；每路 180 / 300 秒软上限与固件失联最多 5 秒关断保护保留。真正故障仍需检查后复位。':device.version==='0.8.1'?'当前固件保护：补水最多 180 秒，排水最多 300 秒。两路分别计时，重复开启不会延长计时。到时关闭全部并锁存故障，需复位。':'当前固件每路最多 120 秒，到时关闭全部并锁存故障。';
 }
 function renderWaterEstimate(data,serviceOk=true){
@@ -213,7 +213,7 @@ function renderLevel(data){
   $('level-value').textContent=!calibrated?'未校准':level.toLocaleString('zh-CN',{maximumFractionDigits:1})+'%';
   $('level-detail').textContent=!calibrated?'示意水面 · 请先校准':sim.uncertain?'估算不确定 · 需校准':data.online?'按输出状态推算':'设备离线 · 模拟暂停';
   $('scene-status').textContent=!calibrated?'场景示意':sim.uncertain?'估算不确定':data.online?'模拟同步中':'模拟已暂停';
-  $('model-note').textContent=!calibrated?'没有水位传感器。填写历史满缸与空缸用时，并按现场已知水位校准，才能开始估算。':sim.uncertain?'工作期间通信中断或服务重启，实际停止时刻无法确认。请到现场核实并重新校准；旧水位估算不会继续推进。主开关仍可按已保存的完整用时执行，不会因此解除水位不确定。':'0.8.2 / 0.8.3 根据本次连接已确认的开关状态、有效心跳和校准速率估算水位，双路同时开启时按净变化计算。这里不是实测水位；心跳不会清除已有的不确定历史。';
+  $('model-note').textContent=!calibrated?'没有水位传感器。填写历史满缸与空缸用时，并按现场已知水位校准，才能开始估算。':sim.uncertain?'工作期间通信中断或服务重启，实际停止时刻无法确认。请到现场核实并重新校准；旧水位估算不会继续推进。主开关仍可按已保存的完整用时执行，不会因此解除水位不确定。':'0.8.2 根据本次连接已确认的开关状态、有效心跳和校准速率估算水位，双路同时开启时按净变化计算。这里不是实测水位；心跳不会清除已有的不确定历史。';
   renderCalibrationStatus();
   if(!formLoaded){if(calibrated){$('fill-seconds').value=String(sim.fill_seconds);$('drain-seconds').value=String(sim.drain_seconds);$('anchor-level').value=String(Math.round(sim.level));$('capacity-liters').value=Number.isFinite(sim.capacity_liters)?String(sim.capacity_liters):'';}formLoaded=true;}
   renderWaterEstimate(data);
@@ -232,7 +232,7 @@ function jobStartReason(preview=jobPreview()){
   if(hasOutputRuns(data)||outputBusy.fill||outputBusy.drain)return '请先结束补水和排水作业，再设置目标水位任务。';
   if(busy||jobBusy)return '正在提交，请等待服务端确认。';
   if(!data.online)return '设备离线，暂不能开始任务。';
-  if(!webLimits(device))return '目标任务需要 0.8.2 / 0.8.3 手动模式。';
+  if(!webLimits(device))return '目标任务需要 0.8.2 手动模式。';
   if(device.state==='FAULT')return '设备故障锁定，请检查现场后到设备状态中复位。';
   if(!sim.calibrated||sim.uncertain||!Number.isFinite(sim.level)||!Number.isFinite(sim.fill_seconds)||sim.fill_seconds<=0||!Number.isFinite(sim.drain_seconds)||sim.drain_seconds<=0)return '水位估算未校准或已不确定，请按现场水位重新校准。';
   if(device.ready!=='1'||device.outputs_known!=='1'||device.overflow!=='0'||!['IDLE','DONE'].includes(device.state)||device.fill!=='0'||device.drain!=='0')return '启动前请先关闭两路输出，并等待设备确认待机。';

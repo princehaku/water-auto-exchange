@@ -20,7 +20,7 @@ else:
 ACTIVE = ('DRAINING', 'SETTLING', 'FILLING', 'EXCHANGING')
 COMMANDS = ('START', 'FILL', 'DRAIN', 'FILL_OFF', 'DRAIN_OFF', 'STOP', 'RESET')
 SOFT_LIMITS = dict(version=1, fill_seconds=180, drain_seconds=300, watchdog_ms=5000)
-COMMAND_PRIORITY = "CASE command WHEN 'FILL_TIMEOUT' THEN 0 WHEN 'DRAIN_TIMEOUT' THEN 0 WHEN 'STOP' THEN 1 WHEN 'FILL_OFF' THEN 2 WHEN 'DRAIN_OFF' THEN 2 ELSE 3 END"
+COMMAND_PRIORITY = "CASE command WHEN 'STOP' THEN 0 WHEN 'FILL_OFF' THEN 1 WHEN 'DRAIN_OFF' THEN 1 ELSE 2 END"
 ADMIN_SESSION_TTL_SECONDS = 999 * 24 * 60 * 60
 
 
@@ -32,7 +32,7 @@ class Problem(Exception):
 def validate_status(value):
     if not isinstance(value, dict):
         raise Problem(400, 'invalid_status')
-    if value.get('project') != 'water_auto_exchange' or value.get('version') not in ('0.3.0', '0.4.0', '0.5.0', '0.5.1', '0.5.2', '0.5.3', '0.6.0', '0.7.0', '0.7.1', '0.7.2', '0.7.3', '0.7.4', '0.7.5', '0.7.6', '0.7.7', '0.8.0', '0.8.1', '0.8.2', '0.8.3'):
+    if value.get('project') != 'water_auto_exchange' or value.get('version') not in ('0.3.0', '0.4.0', '0.5.0', '0.5.1', '0.5.2', '0.5.3', '0.6.0', '0.7.0', '0.7.1', '0.7.2', '0.7.3', '0.7.4', '0.7.5', '0.7.6', '0.7.7', '0.8.0', '0.8.1', '0.8.2'):
         raise Problem(409, 'firmware_mismatch')
     if value.get('state') not in ('UNCONFIGURED', 'IDLE', 'DONE', 'FAULT') + ACTIVE:
         raise Problem(400, 'invalid_state')
@@ -48,11 +48,11 @@ def validate_status(value):
             raise Problem(400, 'invalid_flag')
     if result['need_fill'] not in ('0', '1', 'unknown') or not result['cycle'].isdigit():
         raise Problem(400, 'invalid_level_or_cycle')
-    if result['version'] in ('0.7.0', '0.7.1', '0.7.2', '0.7.3', '0.7.4', '0.7.5', '0.7.6', '0.7.7', '0.8.0', '0.8.1', '0.8.2', '0.8.3'):
+    if result['version'] in ('0.7.0', '0.7.1', '0.7.2', '0.7.3', '0.7.4', '0.7.5', '0.7.6', '0.7.7', '0.8.0', '0.8.1', '0.8.2'):
         if value.get('control_mode') not in ('manual', 'automatic'):
             raise Problem(400, 'invalid_control_mode')
         result['control_mode'] = value['control_mode']
-    concurrent = result['version'] in ('0.8.0', '0.8.1', '0.8.2', '0.8.3') and result.get('control_mode') == 'manual'
+    concurrent = result['version'] in ('0.8.0', '0.8.1', '0.8.2') and result.get('control_mode') == 'manual'
     if result['state'] == 'EXCHANGING' and not concurrent:
         raise Problem(400, 'invalid_state')
     if result['outputs_known'] == '1':
@@ -121,7 +121,7 @@ class Store:
         if saved:
             previous = json.loads(saved['value'])
             self.status, self.seen = previous.get('device'), previous.get('last_seen')
-            self.web_limits = bool(self.status and self.status.get('version') in ('0.8.2', '0.8.3')
+            self.web_limits = bool(self.status and self.status.get('version') == '0.8.2'
                                    and self.status.get('control_mode') == 'manual')
         saved_sim = self.db.execute('SELECT value FROM aquarium_simulation WHERE id=1').fetchone()
         self.simulation = json.loads(saved_sim['value']) if saved_sim else dict(
@@ -438,7 +438,7 @@ class Store:
         """
         if not self.web_limits:
             return
-        if status['version'] not in ('0.8.2', '0.8.3') or status.get('control_mode') != 'manual':
+        if status['version'] != '0.8.2' or status.get('control_mode') != 'manual':
             self.control_abort('control_protocol_changed')
         if status['outputs_known'] != '1':
             self.control_abort('control_state_uncertain')
@@ -447,20 +447,16 @@ class Store:
         ack_grant = self.ws_grants.get(ack.get('id')) if ack else None
         timeout = self.control_timeout
         normal_timeout_closed = False
-        if timeout and all_off and status['version'] in ('0.8.2', '0.8.3') and status['state'] in ('IDLE', 'DONE'):
-            timeout_grant = self.ws_grants.get(timeout['id'])
-            expected_reason = 'stopped' if status['version'] == '0.8.2' else timeout['key'] + '_timeout'
+        if timeout and all_off and status['state'] in ('IDLE', 'DONE'):
             # An old in-flight OFF must not acknowledge the new timeout.
-            # A current execute receipt proves ordering directly; unsolicited
-            # status additionally needs the expected timeout completion reason.
+            # Only a fresh successful execute receipt proves the close order.
             normal_timeout_closed = bool(
-                (ack_grant and ack.get('status') == 'succeeded'
+                ack_grant and ack.get('status') == 'succeeded'
                  and ack_grant['sequence'] > timeout['grant_sequence']
                  and (ack['id'] == timeout['id'] or ack_row['command'] in ('STOP', 'FILL_OFF', 'DRAIN_OFF')))
-                or (status['version'] == '0.8.3' and timeout_grant and ack is None and status['reason'] == expected_reason))
         if timeout and all_off and (status['state'] == 'FAULT' or normal_timeout_closed):
-            # 0.8.3 completes normal time limits without faulting. Earlier
-            # firmware, and actual faults on any version, retain their latch.
+            # Normal STOP receipts allow another manual run. Actual device
+            # faults remain latched until the user explicitly resets them.
             self.db.execute("UPDATE commands SET status=?, result=?, finished=? WHERE id=? AND status IN ('queued','delivered') AND id<>?",
                             ('succeeded' if normal_timeout_closed else 'cancelled',
                              'outputs_off_confirmed' if normal_timeout_closed else 'fault_confirmed',
@@ -516,7 +512,7 @@ class Store:
             self.db.execute("UPDATE commands SET status='cancelled', result='superseded_by_timeout', finished=? WHERE status IN ('queued','delivered')", (self.clock(),))
             command_id = secrets.token_hex(16)
             self.db.execute('INSERT INTO commands VALUES(?,?,?,?,?,?,?)',
-                            (command_id, 'STOP' if self.status['version'] == '0.8.2' else key.upper() + '_TIMEOUT', self.clock(),
+                            (command_id, 'STOP', self.clock(),
                              self.clock() + 1, 'queued', None, None))
             self.control_timeout = dict(key=key, id=command_id, confirm_until=now + 1,
                                         grant_sequence=self.ws_grant_sequence)
@@ -524,7 +520,7 @@ class Store:
 
     def control_limits_snapshot(self):
         status = self.status or {}
-        recent = status.get('version') in ('0.8.1', '0.8.2', '0.8.3')
+        recent = status.get('version') in ('0.8.1', '0.8.2')
         result = dict(source='web' if self.web_limits else 'firmware',
                       fill_seconds=180 if recent else 120,
                       drain_seconds=300 if recent else 120,
@@ -748,10 +744,10 @@ class Store:
             s = self.status
             if self.control_timeout and command not in ('STOP', 'FILL_OFF', 'DRAIN_OFF'):
                 raise Problem(409, 'control_timeout_pending')
-            concurrent = s['version'] in ('0.8.0', '0.8.1', '0.8.2', '0.8.3') and s.get('control_mode') == 'manual'
+            concurrent = s['version'] in ('0.8.0', '0.8.1', '0.8.2') and s.get('control_mode') == 'manual'
             if command in ('FILL_OFF', 'DRAIN_OFF') and not concurrent:
                 raise Problem(409, 'firmware_upgrade_required')
-            if command == 'DRAIN' and s['version'] not in ('0.6.0', '0.7.0', '0.7.1', '0.7.2', '0.7.3', '0.7.4', '0.7.5', '0.7.6', '0.7.7', '0.8.0', '0.8.1', '0.8.2', '0.8.3'):
+            if command == 'DRAIN' and s['version'] not in ('0.6.0', '0.7.0', '0.7.1', '0.7.2', '0.7.3', '0.7.4', '0.7.5', '0.7.6', '0.7.7', '0.8.0', '0.8.1', '0.8.2'):
                 raise Problem(409, 'firmware_upgrade_required')
             if command == 'START' and s.get('control_mode') == 'manual':
                 raise Problem(409, 'automatic_mode_required')
@@ -786,7 +782,7 @@ class Store:
 
     def poll(self, gateway, status, ack=None):
         status = validate_status(status)
-        if status['version'] in ('0.8.2', '0.8.3') and status.get('control_mode') == 'manual':
+        if status['version'] == '0.8.2' and status.get('control_mode') == 'manual':
             raise Problem(409, 'firmware_requires_wss')
         if not isinstance(gateway, str) or not 16 <= len(gateway) <= 64:
             raise Problem(400, 'invalid_gateway')
@@ -833,7 +829,7 @@ class Store:
     def ws_open(self, status, previous_session=None):
         status = validate_status(status)
         with self.lock:
-            soft = status['version'] in ('0.8.2', '0.8.3') and status.get('control_mode') == 'manual'
+            soft = status['version'] == '0.8.2' and status.get('control_mode') == 'manual'
             # Only the authenticated previous owner can replace its half-open
             # session immediately; another client still cannot evict a live owner.
             if self.ws_gateway and isinstance(previous_session, str) and hmac.compare_digest(previous_session, self.ws_gateway):
@@ -914,7 +910,7 @@ class Store:
                     fresh_ack = True
             if status is not None:
                 status = validate_status(status)
-                if self.status and any(version in ('0.8.2', '0.8.3') for version in (self.status['version'], status['version'])) and (
+                if self.status and any(version == '0.8.2' for version in (self.status['version'], status['version'])) and (
                         self.status['version'] != status['version'] or self.status.get('control_mode') != status.get('control_mode')):
                     self.control_abort('control_protocol_changed')
                 self.observe_control(status, ack)
@@ -942,7 +938,7 @@ class Store:
                 return None
             # Physical outputs may run together; ordinary command grants are
             # serialized so one lane's fresh receipt cannot obsolete the other.
-            if row['command'] not in ('STOP', 'FILL_TIMEOUT', 'DRAIN_TIMEOUT'):
+            if row['command'] != 'STOP':
                 pending = self.db.execute("SELECT id FROM commands WHERE status='delivered'").fetchall()
                 for pending_row in pending:
                     grant = self.ws_grants.get(pending_row['id'])

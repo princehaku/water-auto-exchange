@@ -248,8 +248,9 @@ export function createAquarium(canvas) {
     for(let i=0;i<=300;i++){const point=perimeter.curve.getPoint(i/300);if(point.z< -1.8&&Math.abs(point.x-x)<distance){nearest=point;distance=Math.abs(point.x-x);}}
     const tie=new THREE.Mesh(new THREE.TorusGeometry(.078,.009,4,10),tieMat);tie.rotation.y=Math.PI/2;tie.position.copy(nearest);habitat.add(tie);
   }
-  // The return hose is a visual route only; its pump is not connected to the controls.
-  tube([[3.57,1.16,-.87],[3.66,1.5,-1.15],[3.82,2.1,-1.99],[3.8,3.58,-2.0],[3.5,3.93,-2.05],[3.12,3.83,-2.25]],.046,greenMat,30);
+  // The existing internal circulation stays independent from fill/drain controls.
+  const circulationPipe=tube([[3.57,1.16,-.87],[3.66,1.5,-1.15],[3.82,2.1,-1.84],[3.8,3.58,-1.86],[3.77,3.99,-1.88],[3.59,4.055,-2.08],[3.38,4.055,-2.36],[3.26,3.56,-2.45]],.046,greenMat,48);
+  circulationPipe.mesh.name='circulation-pipe';
   // The rear LuatOS enclosure is a visual housing for the existing three water routes.
   // All controlled hoses rise over the complete glass rim before reaching its outer face.
   const controller=new THREE.Group();controller.name='luatos-controller';habitat.add(controller);
@@ -298,6 +299,52 @@ export function createAquarium(canvas) {
     box(.16,.2,.065,-2.2,port.y,-2.29,enclosureDark);
     rod([-2.2,port.y,-2.322],[-2.2,port.y,port.z+.07],.027,metalMat);
     const clip=new THREE.Mesh(new THREE.TorusGeometry(.079,.014,6,16),metalMat);clip.rotation.y=Math.PI/2;clip.position.set(-2.2,port.y,port.z);habitat.add(clip);
+  }
+  function rearTag(text,x,y,z,width,parent) {
+    const tagCanvas=document.createElement('canvas');tagCanvas.width=512;tagCanvas.height=128;
+    const ctx=tagCanvas.getContext('2d');ctx.fillStyle='#d3ded4';ctx.fillRect(0,0,512,128);
+    ctx.fillStyle='#26483e';ctx.font='600 71px "Microsoft YaHei",sans-serif';ctx.textAlign='center';ctx.textBaseline='middle';ctx.fillText(text,256,64);
+    const map=new THREE.CanvasTexture(tagCanvas);map.colorSpace=THREE.SRGBColorSpace;map.anisotropy=Math.min(4,renderer.capabilities.getMaxAnisotropy());textures.push(map);
+    box(width+.025,.207,.025,x,y,z+.0125,enclosureDark,parent);
+    const tag=new THREE.Mesh(new THREE.PlaneGeometry(width,.18),new THREE.MeshBasicMaterial({map,toneMapped:false}));
+    tag.rotation.y=Math.PI;tag.position.set(x,y,z-.003);parent.add(tag);
+  }
+  // A fourth tank-side connection receives the original land-pool circulation hose.
+  const circulationPort=new THREE.Group();circulationPort.name='circulation-port';controller.add(circulationPort);
+  rod([.72,2.78,-2.65],[.98,2.78,-2.65],.113,connectorMat,circulationPort);
+  rod([.94,2.78,-2.65],[1.02,2.78,-2.65],.087,greenMat,circulationPort);
+  rod([1.02,2.78,-2.65],[1.1,2.78,-2.65],.067,connectorMat,circulationPort);
+  for(const x of [.80,.88]) {const collar=new THREE.Mesh(new THREE.TorusGeometry(.117,.012,5,14),metalMat);collar.rotation.y=Math.PI/2;collar.position.set(x,2.78,-2.65);circulationPort.add(collar);}
+  rearTag('内循环',1.16,3.005,-2.86,.87,circulationPort);
+  const circulationBack=tube([[3.26,3.56,-2.45],[3.05,3.03,-2.46],[2.44,2.78,-2.54],[1.55,2.78,-2.65],[1.1,2.78,-2.65]],.046,greenMat,44);
+  circulationBack.mesh.name='circulation-back-pipe';
+  box(.17,.20,.065,1.85,2.78,-2.29,enclosureDark);
+  rod([1.85,2.78,-2.32],[1.85,2.78,-2.57],.025,metalMat);
+  const circulationClip=new THREE.Mesh(new THREE.TorusGeometry(.071,.012,6,16),metalMat);circulationClip.rotation.y=Math.PI/2;circulationClip.position.set(1.85,2.78,-2.632);habitat.add(circulationClip);
+
+  // The two external supply/waste tails stay low and entirely behind the opaque panel.
+  // Keep their complete assemblies together so normal geometry occlusion can be checked.
+  const externalInlet=new THREE.Group();externalInlet.name='external-inlet-assembly';habitat.add(externalInlet);
+  const externalOutlet=new THREE.Group();externalOutlet.name='external-outlet-assembly';habitat.add(externalOutlet);
+  const externalWhiteMat=material(0xe8eadd,{roughness:.55});
+  const externalRoutes=[
+    {kind:'inlet',x:-.98,y:1.43,group:externalInlet,mat:greenMat,label:'外接入水',labelX:-.91,
+      points:[[1.45,1.23,-2.73],[.70,1.23,-2.73],[-.26,1.23,-2.73],[-.80,1.29,-2.69],[-.98,1.43,-2.65]]},
+    {kind:'outlet',x:.1,y:1.43,group:externalOutlet,mat:externalWhiteMat,label:'外接排水',labelX:.18,
+      points:[[.1,1.43,-2.65],[.1,1.42,-2.98],[.20,1.18,-3.01],[.50,1.04,-3.02],[1.45,1.06,-3.02]]}
+  ];
+  for(const route of externalRoutes) {
+    const port=new THREE.Group();port.name='external-'+route.kind+'-port';route.group.add(port);
+    rod([route.x,1.73,-2.65],[route.x,1.51,-2.65],.10,connectorMat,port);
+    rod([route.x,1.55,-2.65],[route.x,1.48,-2.65],.087,route.mat,port);
+    rod([route.x,1.48,-2.65],[route.x,1.43,-2.65],.066,connectorMat,port);
+    const collar=new THREE.Mesh(new THREE.TorusGeometry(.103,.012,5,14),metalMat);collar.rotation.x=Math.PI/2;collar.position.set(route.x,1.64,-2.65);port.add(collar);
+    rearTag(route.label,route.labelX,1.795,-2.987,.87,route.group);
+    const pipe=tube(route.points,.055,route.mat,44,route.group);pipe.mesh.name='external-'+route.kind+'-pipe';
+    const end=route.points[route.kind==='inlet'?0:route.points.length-1];
+    rod(end,[1.61,end[1],end[2]],.084,connectorMat,route.group);
+    const endRing=new THREE.Mesh(new THREE.TorusGeometry(.086,.012,5,14),metalMat);endRing.rotation.y=Math.PI/2;endRing.position.set(1.56,end[1],end[2]);route.group.add(endRing);
+    const opening=new THREE.Mesh(new THREE.CircleGeometry(.050,14),new THREE.MeshBasicMaterial({color:0x102320}));opening.rotation.y=Math.PI/2;opening.position.set(1.612,end[1],end[2]);route.group.add(opening);
   }
   const drainHoseMat=material(0xeeeede,{transparent:true,opacity:.76,roughness:.4});
   const drainPipe=tube([[-5.2,.43,-.55],[-5.42,.51,-1.34],[-5.55,1.72,-1.77],[-5.55,3.65,-1.77],[-5.55,4.12,-1.92],[-5.55,4.17,-2.35],[-5.55,3.83,-2.74],[-5.4,2.86,-2.78],[-4.85,2.52,-2.78],[-3.3,2.52,-2.78],[-2.2,2.52,-2.78],[-1.91,2.52,-2.75]],.045,drainHoseMat,92);

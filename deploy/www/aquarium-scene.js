@@ -136,10 +136,14 @@ export function createAquarium(canvas) {
     box(w,.12,.2,x,1.35,2.13);
     glass(w,1.48,.025,x,2.15,2.13);
   }
-  glass(.025,1.51,4.17,-6.0,1.03,0);
-  glass(3.73,1.51,.025,-4.1,1.03,2.13);
-  glass(3.73,2.43,.025,-4.1,1.49,-2.13);
-  for(const [x,z,h] of [[-6,-2.14,2.78],[-6,2.14,1.91],[-2.12,2.14,3.01],[1.87,2.14,3.05],[6.02,2.14,3.92]]) {
+  // The pool's three outer panes form one continuous enclosure up to the land glazing.
+  // Their edges extend into the corner posts; only the internal access ramp stays open.
+  const poolGlassBottom=.275,poolGlassTop=2.89;
+  const poolGlassHeight=poolGlassTop-poolGlassBottom,poolGlassY=(poolGlassTop+poolGlassBottom)/2;
+  glass(.025,poolGlassHeight,4.28,-6.0,poolGlassY,0);
+  glass(3.88,poolGlassHeight,.025,-4.06,poolGlassY,2.13);
+  glass(3.88,poolGlassHeight,.025,-4.06,poolGlassY,-2.13);
+  for(const [x,z,h] of [[-6,-2.14,3.01],[-6,2.14,3.01],[-2.12,2.14,3.01],[1.87,2.14,3.05],[6.02,2.14,3.92]]) {
     box(.2,h,.2,x,.24+h/2,z);
     box(.032,h-.16,.032,x-.059,.24+h/2,z+.112,frameEdgeMat);
     box(.28,.11,.28,x,.29+h,z,darkMat);

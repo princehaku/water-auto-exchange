@@ -35,6 +35,17 @@ function methods:fault(reason)
     return false, self.reason
 end
 
+function methods:timeout(name)
+    if name ~= "fill" and name ~= "drain" then return false, "invalid_timeout" end
+    outputs_off(self)
+    self.drain_only, self.remote_cycle = false, false
+    -- Reaching an operation limit is an ordinary stop. It must never RESET a
+    -- fault that was already latched by overflow, I/O or lost communication.
+    if self.state == "FAULT" then return false, "fault_latched" end
+    self.state, self.reason, self.phase_since = "IDLE", name .. "_timeout", nil
+    return true, self.reason
+end
+
 function methods:input_fault(reason)
     -- A failed read must not leave an old stable sample available to RESET.
     invalidate_samples(self)
@@ -88,9 +99,9 @@ function methods:update(now, need_fill, overflow)
             and now - self.clear_since >= self.settings.debounce_ms
         if self.state == "FAULT" then return false, self.reason end
         if self.drain and not self.drain_web and now - self.drain_since >= self.settings.drain_timeout_ms then
-            return self:fault("drain_timeout")
+            return self:timeout("drain")
         elseif self.fill and not self.fill_web and now - self.fill_since >= self.settings.fill_timeout_ms then
-            return self:fault("fill_timeout")
+            return self:timeout("fill")
         elseif self.state == "IDLE" and self.reason == "waiting_for_inputs" and self.inputs_ready then
             self.reason = "ready"
         end
@@ -110,7 +121,7 @@ function methods:update(now, need_fill, overflow)
     if self.state == "DRAINING" then
         -- A late sample cannot retroactively cancel a hard pumping deadline.
         if now - self.phase_since >= self.settings.drain_timeout_ms then
-            return self:fault("drain_timeout")
+            return self:timeout("drain")
         end
         if self.need_fill == true then
             if self.drain_only then
@@ -132,7 +143,7 @@ function methods:update(now, need_fill, overflow)
         end
     elseif self.state == "FILLING" then
         if now - self.phase_since >= self.settings.fill_timeout_ms then
-            return self:fault("fill_timeout")
+            return self:timeout("fill")
         end
         if self.need_fill == false then
             enter(self, "DONE", "completed", now)

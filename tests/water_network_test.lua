@@ -25,7 +25,8 @@ local function fixture()
     end
     f.controller.remote_timeout=function(name)
         if name~="communication" then f.calls[#f.calls+1]=name:upper().."_TIMEOUT" end
-        f.state="FAULT"
+        if name=="communication" then f.state="FAULT"
+        elseif f.state~="FAULT" then f.state="IDLE" end
         return true,name.."_timeout"
     end
     f.client = {
@@ -37,7 +38,7 @@ local function fixture()
         sys={timerLoopStart=function(fn) f.step=fn; return 1 end},
         transport={new=function(_,callbacks) f.callbacks=callbacks; return f.client end},
         json={encode=function(value) return value end,decode=function() if f.decode_fail then error("decode") end; return f.decoded end},
-        usb={format_status=function() return "project=water_auto_exchange version=0.8.2 control_mode=manual state="..f.state end},
+        usb={format_status=function() return "project=water_auto_exchange version=0.8.3 control_mode=manual state="..f.state end},
         read_cert=function() return f.no_cert and "" or "-----BEGIN CERTIFICATE-----" end}
     -- Ordinary messages use fake JSON tokens; auth concatenation needs strings.
     local serial=0
@@ -108,7 +109,7 @@ test("server timeout commands use claim TTL replay protection and cancel pending
         f.offer(command,string.rep("d",32));assert(f.last().type=="claim")
         f.execute("DRAIN",8000,string.rep("c",32));assert(#f.calls==1)
         f.execute(command,8000,string.rep("d",32))
-        assert(f.calls[2]==command and f.state=="FAULT" and f.last().ack.status=="succeeded")
+        assert(f.calls[2]==command and f.state=="IDLE" and f.last().ack.status=="succeeded")
         f.execute(command,8000,string.rep("d",32));assert(#f.calls==2)
         local g=fixture();g.connect();g.execute(command);assert(#g.calls==0)
         g.offer(command);g.advance(1000);g.execute(command,500)

@@ -55,9 +55,9 @@ test("default manual deadlines limit fill to 180 seconds and drain to 300 second
         equal(c:status()[name], true)
         assert(c["start_" .. name](c, 500 + timeout - 1))
         c:update(500 + timeout, nil, false)
-        equal(state(c, "FAULT").reason, name .. "_timeout")
-        equal(c["start_" .. name](c, 500 + timeout), false)
-        assert(c:reset(500 + timeout)); state(c, "IDLE")
+        equal(state(c, "IDLE").reason, name .. "_timeout")
+        assert(c["start_" .. name](c, 500 + timeout))
+        equal(c:status()[name], true)
     end
 end)
 
@@ -124,7 +124,7 @@ test("relay chatter never resets a drain deadline", function()
         state(c, "DRAINING", false, true)
     end
     c:update(1100, true, false)
-    equal(state(c, "FAULT").reason, "drain_timeout")
+    equal(state(c, "IDLE").reason, "drain_timeout")
 end)
 
 test("fill deadline is hard and late full readings cannot erase a timeout", function()
@@ -134,7 +134,7 @@ test("fill deadline is hard and late full readings cannot erase a timeout", func
     c:update(1000, false, false)
     state(c, "FILLING", true)
     c:update(1100, false, false)
-    equal(state(c, "FAULT").reason, "fill_timeout")
+    equal(state(c, "IDLE").reason, "fill_timeout")
 end)
 
 test("long delayed polling fails closed during drain and fill", function()
@@ -143,7 +143,7 @@ test("long delayed polling fails closed during drain and fill", function()
         sample_ready(c, filling)
         if filling then assert(c:start_fill(100)) else assert(c:start(100)) end
         c:update(100000, not filling, false)
-        equal(state(c, "FAULT").reason, filling and "fill_timeout" or "drain_timeout")
+        equal(state(c, "IDLE").reason, filling and "fill_timeout" or "drain_timeout")
     end
 end)
 
@@ -319,7 +319,7 @@ test("independent drain timeout, overflow, STOP and bad inputs turn outputs off"
             if action == "timeout" then c:update(1100, true, false)
             elseif action == "overflow" then c:update(200, false, true)
             else c:update(200, nil, false) end
-            state(c, "FAULT")
+            state(c, action == "timeout" and "IDLE" or "FAULT")
         end
     end
 end)
@@ -353,11 +353,14 @@ test("manual switches retain timeout and optional overflow shutdown", function()
             local c = fixture({mode="manual"})
             c:update(0,nil,false); c:update(100,nil,false); assert(c[method](c,100))
             c:update(overflow and 200 or 1100, nil, overflow)
-            state(c,"FAULT"); equal(c:stop(),false)
-            c:update(1200,nil,false); equal(c:reset(1200),not overflow)
-            c:update(1300,nil,false)
-            if overflow then assert(c:reset(1300)) end
-            state(c,"IDLE")
+            if overflow then
+                state(c,"FAULT"); equal(c:stop(),false)
+                c:update(1200,nil,false); equal(c:reset(1200),false)
+                c:update(1300,nil,false);assert(c:reset(1300));state(c,"IDLE")
+            else
+                state(c,"IDLE");equal(c:reset(1100),false)
+                assert(c[method](c,1100));assert(c:stop());state(c,"IDLE")
+            end
         end
     end
 end)
@@ -370,7 +373,7 @@ test("manual concurrent outputs retain independent start times and repeated ON c
         assert(c["start_"..other](c,600));state(c,"EXCHANGING",true,true)
         local cycles=c.cycle;assert(c["start_"..first](c,900));equal(c.cycle,cycles)
         c:update(1099,nil,false);state(c,"EXCHANGING",true,true)
-        c:update(1100,nil,false);equal(state(c,"FAULT").reason,first.."_timeout")
+        c:update(1100,nil,false);equal(state(c,"IDLE").reason,first.."_timeout")
     end
 end)
 
@@ -382,7 +385,7 @@ test("manual OFF preserves the other output and its original deadline",function(
         assert(c["stop_"..first](c,800));assert(c["stop_"..first](c,900))
         equal(c:status()[first],false);equal(c:status()[other],true)
         c:update(1599,nil,false);equal(c:status()[other],true)
-        c:update(1600,nil,false);equal(state(c,"FAULT").reason,other.."_timeout")
+        c:update(1600,nil,false);equal(state(c,"IDLE").reason,other.."_timeout")
     end
 end)
 
@@ -399,6 +402,30 @@ test("concurrent STOP overflow and reset never restore either output",function()
     local automatic=fixture();sample_ready(automatic,false);assert(automatic:start_drain(100))
     equal(automatic:start_fill(100),false);equal(automatic:stop_drain(100),false)
     state(automatic,"DRAINING",false,true)
+end)
+
+test("ordinary operation limits never clear an existing fault",function()
+    for _,mode in ipairs({"manual","automatic"}) do
+        for _,reason in ipairs({"overflow","communication_timeout","output_write_failed","sensor_unstable_timeout"}) do
+            local c=fixture({mode=mode});sample_ready(c,false);c:fault(reason)
+            for _,name in ipairs({"fill","drain"}) do
+                equal(c:timeout(name),false)
+                equal(state(c,"FAULT").reason,reason)
+                equal(c:start_fill(100),false);equal(c:start_drain(100),false)
+            end
+        end
+    end
+end)
+
+test("automatic phase limits return to idle without starting the next phase",function()
+    for _,name in ipairs({"fill","drain"}) do
+        local c=fixture();sample_ready(c,name=="fill")
+        assert(c["start_"..name](c,100));c:update(1100,name=="fill",false)
+        equal(state(c,"IDLE").reason,name.."_timeout")
+        c:update(1200,name=="fill",false);state(c,"IDLE")
+        assert(c["start_"..name](c,1200))
+        equal(c:status()[name],true)
+    end
 end)
 
 local failures = 0

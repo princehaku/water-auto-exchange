@@ -44,7 +44,7 @@ local function fixture()
         taskInit=function(callback) h.co=coroutine.create(callback);return h.co end,
         wait=function(ms) return coroutine.yield("WAIT",ms) end}
     _G.rtos={tick=function() return h.tick end}
-    _G.PROJECT,_G.VERSION="water_auto_exchange","0.8.2"
+    _G.PROJECT,_G.VERSION="water_auto_exchange","0.8.3"
     local function encode(value)
         h.serial=h.serial+1;local key="m"..h.serial;h.messages[key]=value;return key
     end
@@ -101,16 +101,17 @@ test("yielding thirty second socket send cannot postpone five second physical OF
     end
 end)
 
-test("real network and controller keep both remote routes past local limits then accept server fault",function()
+test("real network and controller accept normal server timeout then immediately start a fresh run",function()
     for _,timeout in ipairs({"FILL_TIMEOUT","DRAIN_TIMEOUT"}) do
         local h=fixture();h.command("FILL");h.resume("RECV",true)
         h.command("DRAIN",string.rep("c",32));h.resume("RECV",true)
         for _=1,301 do h.run(1000);h.pong();assert(h.controller.status().state=="EXCHANGING") end
         h.command(timeout,string.rep("d",32));h.resume("RECV",true)
-        local s=h.controller.status();assert(s.state=="FAULT" and s.reason==timeout:lower())
+        local s=h.controller.status();assert(s.state=="IDLE" and s.reason==timeout:lower())
         assert(s.outputs_known and not s.fill and not s.drain)
-        h.run(5000);assert(h.controller.status().state=="FAULT")
-        assert(not h.controller.remote_command("fill"))
+        h.command("FILL",string.rep("e",32));h.resume("RECV",true)
+        assert(h.controller.status().state=="FILLING")
+        h.run(1000);h.pong();assert(h.controller.status().fill)
     end
 end)
 
@@ -136,6 +137,20 @@ test("network callback winning the five second timer race still latches communic
     assert(s.state=="FAULT" and s.reason=="communication_timeout")
     assert(s.outputs_known and not s.fill and not s.drain and not h.opened[23] and not h.opened[5])
     h.run(1000);assert(h.controller.status().state=="FAULT")
+end)
+
+test("a consumed timeout execute cannot close the next run and an existing true fault remains latched",function()
+    local h=fixture();h.command("FILL");h.resume("RECV",true)
+    local timeout_id=string.rep("c",32)
+    h.command("FILL_TIMEOUT",timeout_id);h.resume("RECV",true)
+    assert(h.controller.status().state=="IDLE")
+    h.command("DRAIN",string.rep("d",32));h.resume("RECV",true)
+    h.deliver({type="execute",command="FILL_TIMEOUT",id=timeout_id,ttl_ms=8000})
+    assert(h.controller.status().state=="DRAINING")
+    h.run(5000);assert(h.controller.status().reason=="communication_timeout")
+    h.command("DRAIN_TIMEOUT",string.rep("e",32));h.resume("RECV",true)
+    local s=h.controller.status();assert(s.state=="FAULT" and s.reason=="communication_timeout")
+    assert(not h.controller.remote_command("fill"))
 end)
 
 print("water_remote_safety: "..count.." tests passed")

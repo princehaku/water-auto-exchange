@@ -1,12 +1,12 @@
 # Air724UG 自动换水
 
-> 2026-09-13：源码 **0.8.1** 支持补水、冲水同时开启和独立关闭；各路计时不互相重置。工作常亮LED、在线待机随心跳回执短闪、离线恢复原网络闪烁；保留待机30秒/工作1秒心跳和5分钟流量统计。新版本将补水上限设为3分钟、排水上限设为5分钟；需要下载到板子后生效。
+> 2026-09-13：源码 **0.8.2** 的联网手动控制改为 Web 服务端执行补水3分钟、排水5分钟软上限；固件失去有效通信最多5秒关断。关闭网页不取消服务端计时。保留双路独立开关、工作常亮LED、待机30秒/工作1秒心跳和5分钟流量统计；需要下载新固件后生效。
 
-`water_auto_exchange 0.8.1` 默认采用手动模式：FILL开启补水，DRAIN开启冲水（排水），STOP关闭。两路可同时开启，各自从开启时计时，补水最多180秒、排水最多300秒；任一路超时会关闭全部并锁存故障；自动液位模式须显式配置。本地USB控制不需要SIM，4G远程控制需要可用数据连接。
+`water_auto_exchange 0.8.2` 默认采用手动模式：FILL开启补水，DRAIN开启冲水（排水），STOP关闭。两路可同时开启；服务端从开启授权开始独立计时，补水180秒、排水300秒，重复ON和另一条开关不延期。任一路达到软上限时服务端要求全部关断并锁存故障；未确认关断则终止会话，让固件失联保护生效。USB本地控制及自动液位模式仍保留板端180/300秒保护，避免离线调试无限开启。
 
 上电待机，立即打印状态，之后每 5 秒打印一次。USB 支持 `STATUS`、`START`、`FILL`、`DRAIN`、`FILL_OFF`、`DRAIN_OFF`、`STOP`、`RESET`。已实现输入防抖、独立开关计时、阶段超时、故障锁存及可选超高水位输入。当前由手动命令开启/关闭对应输出，尚未设置定时计划。
 
-**最近实板上报为0.8.0，0.8.1新限时待下载生效。** 补水DO2/GPIO23、排水出纸口/GPIO5，关断仍为写LOW后pins.close；两路可同时开，FILL_OFF/DRAIN_OFF分别关闭，STOP关闭全部。WSS保持活动10秒失联停止及重连不重开水，手动模式不要求传感器。
+**最近实板上报为0.8.0，0.8.2新机制待下载生效。** 补水DO2/GPIO23、排水出纸口/GPIO5，关断仍为写LOW后pins.close。0.8.2的WSS远程手动控制必须与支持软上限的服务端完成能力确认；失联保护由控制器独立计时，不被网络收发等待延长，重连不重开水。手动模式不要求传感器。
 
 ## 配置与使用
 
@@ -35,7 +35,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\water-command.ps1 -P
 
 ## 下载
 
-在 LuaTools `water-online-0.8.1` 项目中保留 `LuatOS-Air_V4035_RDA8910_TTS_NOLVGL_FLOAT` CORE 和默认 LuaTask V2.4.4 库。项目配置已改为下载包清单中的 8 个 Lua 文件和 1 个 CA 证书；若界面仍显示旧清单，重新载入项目核对后，由用户点击“下载脚本”：
+在 LuaTools `water-online-0.8.2` 项目中保留 `LuatOS-Air_V4035_RDA8910_TTS_NOLVGL_FLOAT` CORE 和默认 LuaTask V2.4.4 库。项目配置已改为下载包清单中的 8 个 Lua 文件和 1 个 CA 证书；若界面仍显示旧清单，重新载入项目核对后，由用户点击“下载脚本”：
 
 ```text
 build/firmware/main.lua
@@ -51,11 +51,11 @@ build/firmware/water-ca.crt
 
 4G 上板使用同一生成目录中的整包文件，操作步骤见 [Web 与 4G 接入](docs/web-console.md)，避免把已含密钥的配置提交到 src。
 
-下载后通过 `STATUS` 确认 `project=water_auto_exchange version=0.8.1`。默认应为 `state=IDLE reason=ready ready=1 outputs_known=1 control_mode=manual`、两路输出为0（字段顺序可不同）。旧 `motor-command.ps1` 和 `gpio-probe.ps1` 用于历史诊断，不操作新版。
+下载后通过 `STATUS` 确认 `project=water_auto_exchange version=0.8.2`。默认应为 `state=IDLE reason=ready ready=1 outputs_known=1 control_mode=manual`、两路输出为0（字段顺序可不同）。旧 `motor-command.ps1` 和 `gpio-probe.ps1` 用于历史诊断，不操作新版。
 
 ## 本地验证
 
-本轮210项Lua 5.1模拟及72项Python Web/WS回归通过；测试覆盖新180/300秒边界、重复开启不延期及超时关断两路。网页提供每路预计剩余倒计时及水量预估，倒计时按设备版本显示上限。测试未控制实板GPIO，0.8.1新限时仍需下载后生效。
+本地验证覆盖独立5秒失联关断、网络发送等待、有效心跳续期、服务端180/300秒软上限、重复ON不延期、超时全关与故障锁存。网页按设备版本展示保护倒计时，水位与水量估算独立显示。测试使用本地模拟GPIO与设备协议，0.8.2新机制仍需下载后在实板生效。
 
 ## 硬件依据与记录
 
@@ -64,7 +64,7 @@ build/firmware/water-ca.crt
 | GPIO / 模块物理脚 | 用户已报告的观察 | 仍需确认 |
 | --- | --- | --- |
 | 5 / 49 | HIGH 时出纸端约 6.1V；用户补充切换GPIO后无电压 | 配置为排水；关断用LOW后release，新版实物操作待验证 |
-| 12 / 53 | HIGH 阶段对应板上灯 | 0.8.1工作常亮，在线待机随心跳短闪，离线网络闪烁；新灯效待下载验证 |
+| 12 / 53 | HIGH 阶段对应板上灯 | 0.8.2工作常亮，在线待机随心跳短闪，离线网络闪烁；新灯效待下载验证 |
 | 23 / 8 | DO2 HIGH/LOW 均约 12V，STOP/切换后近 0V | 配置为补水；关断用LOW后release，不据此声称单独LOW有效 |
 
 两路已按用户确认的用途和完整关断流程配置；运行就绪不等于实际水流验证。液位板反馈必须是已确认隔离且不带外来电压的触点，或匹配 1.8V 的隔离接口；不能把探针或 12V 直接接 GPIO。具体约束见自动换水说明。
@@ -73,7 +73,7 @@ build/firmware/water-ca.crt
 
 ## 网站入口
 
-项目入口：https://bytegallop.com/water/ 。现已实现带鉴权的控制台、状态/故障展示、命令与回执记录，以及 Air724UG 4G 独立接入。当前下载目标为0.8.1，实板上线仍需核对版本及持续心跳回执。部署脚本、Nginx 片段及操作说明见 [网站部署](docs/deployment.md)。本地仓库位于 `E:\water-auto-exchange`。
+项目入口：https://bytegallop.com/water/ 。现已实现带鉴权的控制台、状态/故障展示、命令与回执记录，以及 Air724UG 4G 独立接入。当前下载目标为0.8.2，实板上线仍需核对版本及持续心跳回执。部署脚本、Nginx 片段及操作说明见 [网站部署](docs/deployment.md)。本地仓库位于 `E:\water-auto-exchange`。
 
 ## 4G 与 Web
 

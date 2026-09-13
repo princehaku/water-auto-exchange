@@ -52,7 +52,7 @@ local function fixture(cfg)
             timerStart = function(callback, delay)
                 event("timer_start", nil, delay)
                 h.next_id = h.next_id + 1
-                h.timers[h.next_id] = { callback = callback, active = true }
+                h.timers[h.next_id] = { callback = callback, active = true, due = h.tick + delay / 5, delay = delay }
                 if h.on_timer_start then return h.on_timer_start(callback, delay, h.next_id) end
                 return h.next_id
             end,
@@ -128,6 +128,19 @@ local function fixture(cfg)
         local id, callback = h.pending()
         h.timers[id].active = false
         callback()
+    end
+    function h.run(ms)
+        local target = h.tick + ms / 5
+        while true do
+            local next_id, due
+            for id, timer in pairs(h.timers) do
+                if timer.active and timer.due <= target and (not due or timer.due < due) then next_id, due = id, timer.due end
+            end
+            if not next_id then break end
+            h.tick = due
+            local timer = h.timers[next_id]; timer.active = false; timer.callback()
+        end
+        h.tick = target
     end
     function h.ready(need_fill)
         h.sensor("need_fill", need_fill == true)
@@ -790,6 +803,113 @@ test("STOP interleaved with an ON write faults instead of restoring a cancelled 
     equal(h.controller.fill(),false);state(h,"FAULT")
     equal(h.opened[23],false);equal(h.opened[5],false)
     h.poll(500);state(h,"FAULT")
+end)
+
+test("Web leases bypass fixed local limits while fresh heartbeats continue", function()
+    local h=board_fixture(); assert(h.controller.init());h.poll(500)
+    assert(h.controller.remote_command("fill"));assert(h.controller.remote_command("drain"))
+    for _=1,361 do
+        h.run(1000);state(h,"EXCHANGING",true,true);assert(h.controller.remote_heartbeat())
+    end
+    equal(h.levels[23],1);equal(h.levels[5],1)
+    assert(h.controller.remote_timeout("fill"));equal(state(h,"FAULT").reason,"fill_timeout")
+    equal(h.opened[23],false);equal(h.opened[5],false)
+end)
+
+test("independent output timer closes remote water at exactly five seconds without network stepping", function()
+    for _,first in ipairs({"fill","drain"}) do
+        local h=board_fixture();assert(h.controller.init());h.poll(500)
+        h.elapse(35) -- Do not align the lease with the 100 ms poll interval.
+        local started=h.tick
+        assert(h.controller.remote_command(first))
+        h.run(4995);equal(h.controller.status()[first],true)
+        local id=h.pending();equal(h.timers[id].delay,35)
+        h.run(5);equal(state(h,"FAULT").reason,"communication_timeout")
+        equal(h.tick-started,1000);equal(h.opened[23],false);equal(h.opened[5],false)
+        equal(h.controller.remote_command(first),false)
+        assert(h.controller.reset());state(h,"IDLE")
+    end
+end)
+
+test("repeated ON second channel and local commands never renew an active remote lease", function()
+    local h=board_fixture();assert(h.controller.init());h.poll(500)
+    assert(h.controller.remote_command("fill"));h.run(4000)
+    assert(h.controller.remote_command("fill"));assert(h.controller.remote_command("drain"))
+    assert(h.controller.fill());h.run(995);state(h,"EXCHANGING",true,true)
+    h.run(5);equal(state(h,"FAULT").reason,"communication_timeout")
+    equal(h.opened[23],false);equal(h.opened[5],false)
+end)
+
+test("late heartbeat cannot renew an expired lease even before its output poll runs", function()
+    local h=board_fixture();assert(h.controller.init());h.poll(500)
+    assert(h.controller.remote_command("fill"));h.elapse(5000)
+    equal(h.controller.remote_heartbeat(),false)
+    equal(state(h,"FAULT").reason,"communication_timeout");equal(h.opened[23],false)
+    assert(h.controller.remote_heartbeat());state(h,"FAULT")
+    equal(h.controller.remote_command("fill"),false)
+end)
+
+test("local USB retains fixed timing and repeated remote ON cannot remove that limit", function()
+    for _,name in ipairs({"fill","drain"}) do
+        local h=board_fixture();assert(h.controller.init());h.poll(500)
+        assert(h.controller[name]());h.poll(500)
+        assert(h.controller.remote_command(name))
+        local limit=h.config.timing[name.."_timeout_ms"]
+        h.poll(limit-501);equal(h.controller.status()[name],true)
+        h.poll(1);equal(state(h,"FAULT").reason,name.."_timeout")
+        equal(h.opened[h.config.outputs[name].gpio],false)
+    end
+end)
+
+test("server timeout closes both outputs LOW then release and invalidates stale callback", function()
+    for _,name in ipairs({"fill","drain"}) do
+        local h=board_fixture();assert(h.controller.init());h.poll(500)
+        assert(h.controller.remote_command("fill"));assert(h.controller.remote_command("drain"))
+        local _,stale=h.pending();local before=#h.events
+        assert(h.controller.remote_timeout(name));equal(state(h,"FAULT").reason,name.."_timeout")
+        for _,gpio in ipairs({23,5}) do
+            local low,closed
+            for i=before+1,#h.events do
+                local e=h.events[i]
+                if e.gpio==gpio and e.kind=="write" and e.value==0 then low=i end
+                if e.gpio==gpio and e.kind=="close" then closed=i end
+            end
+            assert(low and closed and low<closed)
+        end
+        before=#h.events;stale();equal(#h.events,before)
+        equal(h.controller.fill(),false);equal(h.controller.drain(),false)
+        assert(h.controller.reset());state(h,"IDLE")
+        h.run(1000);state(h,"IDLE")
+    end
+end)
+
+test("Web timeout timer or OFF failures never allow an unmonitored restart", function()
+    for _,failure in ipairs({"cancel","schedule","close","write"}) do
+        local h=board_fixture();assert(h.controller.init());h.poll(500)
+        assert(h.controller.remote_command("fill"));assert(h.controller.remote_command("drain"))
+        if failure=="cancel" then h.on_timer_stop=function() error("failed timer stop") end
+        elseif failure=="schedule" then h.on_timer_start=function() return nil end
+        elseif failure=="close" then h.on_close=function(gpio) if gpio==23 then return false end end
+        else h.on_write=function(value,gpio) if gpio==23 and value==0 then return false end end end
+        equal(h.controller.remote_timeout("fill"),false)
+        equal(h.controller.status().state,"FAULT");equal(h.opened[5],false)
+        equal(h.controller.remote_command("drain"),false)
+    end
+end)
+
+test("remote automatic cycles keep local phase limits and a five second communication lease", function()
+    for _,phase in ipairs({"DRAINING","SETTLING"}) do
+        local cfg=config();cfg.timing.drain_timeout_ms=300000;cfg.timing.fill_timeout_ms=180000
+        cfg.timing.switch_delay_ms=10000
+        local h=fixture(cfg);h.ready(false);assert(h.controller.remote_command("start"))
+        if phase=="SETTLING" then h.sensor("need_fill",true);h.run(200) end
+        equal(h.controller.status().state,phase)
+        h.run(phase=="SETTLING" and 4795 or 4995);equal(h.controller.status().state,phase)
+        h.run(5);equal(state(h,"FAULT").reason,"communication_timeout")
+    end
+    local h=fixture();h.ready(false);assert(h.controller.remote_command("start"))
+    h.run(995);assert(h.controller.remote_heartbeat());h.run(5)
+    equal(state(h,"FAULT").reason,"drain_timeout")
 end)
 
 local failures = 0

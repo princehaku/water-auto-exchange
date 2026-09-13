@@ -29,7 +29,8 @@ return {
     timing = {
         debounce_ms = 500,
         switch_delay_ms = 1000,
-        -- Commission these limits using the actual volume and pump/valve flow.
+        -- Local USB / automatic limits. Authenticated Web manual control uses
+        -- the server's soft limits plus a separate fixed 5 s communication lease.
         drain_timeout_ms = 300000,
         fill_timeout_ms = 180000
     }

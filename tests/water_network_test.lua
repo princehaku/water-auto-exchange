@@ -6,15 +6,28 @@ local function test(name, fn) fn(); count=count+1; print("PASS "..name) end
 local function fixture()
     local f = {tick=0, sent={}, kinds={}, calls={}, state="IDLE", decoded={}}
     f.config = {enabled=true, url="wss://example.test/water/api/device/ws",device_key=string.rep("k",32),long_connection_cert={caCert="water-ca.crt",hostNameFlag=1,insist=0},
-        heartbeat_ms=1000,active_heartbeat_ms=1000,offline_stop_ms=10000,idle_timeout_ms=75000}
+        heartbeat_ms=1000,active_heartbeat_ms=1000,offline_stop_ms=5000,idle_timeout_ms=75000}
     f.controller = {
         status=function() return {state=f.state} end,
         start=function() f.calls[#f.calls+1]="START"; f.state="DRAINING"; return true,"started" end,
         fill=function() f.calls[#f.calls+1]="FILL"; f.state="FILLING"; return true,"fill_started" end,
         drain=function() f.calls[#f.calls+1]="DRAIN"; f.state="DRAINING"; return true,"drain_started" end,
-        stop=function() f.calls[#f.calls+1]="STOP"; f.state="IDLE"; return true,"stopped" end,
+        stop=function() f.calls[#f.calls+1]="STOP"; if f.state~="FAULT" then f.state="IDLE" end; return true,"stopped" end,
         reset=function() return false,"not_faulted" end
     }
+    f.controller.remote_command=function(method)
+        f.remote_commands=(f.remote_commands or 0)+1
+        return f.controller[method]()
+    end
+    f.controller.remote_heartbeat=function()
+        f.renewals=(f.renewals or 0)+1
+        return true,"heartbeat_received"
+    end
+    f.controller.remote_timeout=function(name)
+        if name~="communication" then f.calls[#f.calls+1]=name:upper().."_TIMEOUT" end
+        f.state="FAULT"
+        return true,name.."_timeout"
+    end
     f.client = {
         send=function(_,value,kind) f.sent[#f.sent+1]=value;f.kinds[#f.kinds+1]=kind; return not f.send_fail end,
         close=function() f.closed=true end,
@@ -24,7 +37,7 @@ local function fixture()
         sys={timerLoopStart=function(fn) f.step=fn; return 1 end},
         transport={new=function(_,callbacks) f.callbacks=callbacks; return f.client end},
         json={encode=function(value) return value end,decode=function() if f.decode_fail then error("decode") end; return f.decoded end},
-        usb={format_status=function() return "project=water_auto_exchange version=0.8.0 state="..f.state end},
+        usb={format_status=function() return "project=water_auto_exchange version=0.8.2 control_mode=manual state="..f.state end},
         read_cert=function() return f.no_cert and "" or "-----BEGIN CERTIFICATE-----" end}
     -- Ordinary messages use fake JSON tokens; auth concatenation needs strings.
     local serial=0
@@ -36,7 +49,12 @@ local function fixture()
         return token
     end
     function f.start() return network.start(f.controller,f.config,f.deps) end
-    function f.reply(value) f.decoded=value; f.callbacks.message("{}"); end
+    function f.reply(value)
+        if value.type=="ready" and value.soft_limits==nil then
+            value.soft_limits={version=1,fill_seconds=180,drain_seconds=300,watchdog_ms=5000}
+        end
+        f.decoded=value; f.callbacks.message("{}");
+    end
     function f.connect() assert(f.start()); f.callbacks.open(); f.reply({type="ready",session=string.rep("a",32)}) end
     function f.advance(ms) f.tick=(f.tick+ms/5)%4294967296;f.step() end
     function f.last() return f.messages[f.sent[#f.sent]] end
@@ -45,7 +63,63 @@ local function fixture()
     return f
 end
 
-test("shipped defaults save idle traffic while keeping active watchdog",function() local c=require "water_network_config";assert(c.heartbeat_ms==30000 and c.active_heartbeat_ms==1000);assert(c.traffic_interval_s==300);assert(c.offline_stop_ms==10000 and c.idle_timeout_ms==75000) end)
+test("shipped defaults save idle traffic while keeping active watchdog",function() local c=require "water_network_config";assert(c.heartbeat_ms==30000 and c.active_heartbeat_ms==1000);assert(c.traffic_interval_s==300);assert(c.offline_stop_ms==5000 and c.idle_timeout_ms==75000) end)
+
+test("missing or incompatible Web soft limits never authenticate or enable water",function()
+    for _,policy in ipairs({false, {}, {version=1,fill_seconds=180,drain_seconds=300,watchdog_ms=10000},
+        {version=2,fill_seconds=180,drain_seconds=300,watchdog_ms=5000},
+        {version=1,fill_seconds=300,drain_seconds=180,watchdog_ms=5000}}) do
+        local f=fixture();assert(f.start());f.callbacks.open()
+        f.reply({type="ready",session=string.rep("a",32),soft_limits=policy})
+        f.offer("FILL");f.execute("FILL")
+        assert(f.closed and #f.calls==0)
+    end
+    local f=fixture();assert(f.start());f.callbacks.open()
+    f.decoded={type="ready",session=string.rep("a",32)};f.callbacks.message("{}")
+    assert(f.closed and #f.calls==0)
+end)
+
+test("only a consumed fresh pong renews the existing output communication lease",function()
+    local f=fixture();f.connect();f.offer("FILL");f.execute("FILL")
+    assert(f.remote_commands==1 and not f.renewals)
+    f.advance(1000);local seq=f.last().seq
+    f.reply({type="pong",seq=seq});assert(f.renewals==1)
+    f.reply({type="pong",seq=seq});assert(f.renewals==1)
+    f.advance(3000);f.reply({type="received"})
+    f.offer("FILL",string.rep("c",32));f.execute("FILL",8000,string.rep("c",32))
+    f.offer("DRAIN",string.rep("d",32));f.execute("DRAIN",8000,string.rep("d",32))
+    assert(f.remote_commands==3 and f.renewals==1)
+    f.advance(1995);assert(not f.closed)
+    f.advance(5);assert(f.closed and f.calls[#f.calls]=="STOP")
+end)
+
+test("a fresh but too late pong cannot revive an output before the next watchdog step",function()
+    local f=fixture();f.connect();f.offer("FILL");f.execute("FILL")
+    f.advance(4000);local seq=f.last().seq
+    f.tick=f.tick+200 -- last receipt is now exactly 5000 ms old, ping only 1000.
+    f.reply({type="pong",seq=seq})
+    assert(f.closed and f.calls[2]=="STOP" and not f.renewals)
+end)
+
+test("server timeout commands use claim TTL replay protection and cancel pending ON",function()
+    for _,command in ipairs({"FILL_TIMEOUT","DRAIN_TIMEOUT"}) do
+        local f=fixture();f.connect();f.offer("FILL");f.execute("FILL")
+        f.offer("DRAIN",string.rep("c",32))
+        f.offer(command,string.rep("d",32));assert(f.last().type=="claim")
+        f.execute("DRAIN",8000,string.rep("c",32));assert(#f.calls==1)
+        f.execute(command,8000,string.rep("d",32))
+        assert(f.calls[2]==command and f.state=="FAULT" and f.last().ack.status=="succeeded")
+        f.execute(command,8000,string.rep("d",32));assert(#f.calls==2)
+        local g=fixture();g.connect();g.execute(command);assert(#g.calls==0)
+        g.offer(command);g.advance(1000);g.execute(command,500)
+        assert(#g.calls==0 and g.last().ack.status=="rejected")
+    end
+end)
+
+test("an overlong activity communication budget is rejected before opening transport",function()
+    local f=fixture();f.config.offline_stop_ms=10000
+    local ok,reason=f.start();assert(not ok and reason=="network_deadline_invalid" and not f.started)
+end)
 
 test("thirty second idle heartbeat keeps one connection with twenty pings in ten minutes",function()
     local f=fixture();f.config.heartbeat_ms=30000;f.connect()
@@ -71,8 +145,8 @@ test("commands after long idle execute immediately then use one second active he
             f.advance(500);assert(#f.sent==n+1 and f.last().type=="ping")
             f.reply({type="pong",seq=f.last().seq})
         end
-        f.advance(9995);assert(not f.closed and #f.calls==1)
-        f.advance(5);assert(f.closed and f.calls[2]=="STOP" and f.state=="IDLE")
+        f.advance(4995);assert(not f.closed and #f.calls==1)
+        f.advance(5);assert(f.closed and f.calls[2]=="STOP" and f.state=="FAULT")
     end
 end)
 
@@ -144,17 +218,17 @@ end)
 test("long connection budget never extends active output communication deadline",function()
     local f=fixture();f.config.tls_connect_timeout_ms=120000
     f.connect();f.offer("FILL");f.execute("FILL")
-    f.advance(9995);assert(f.state=="FILLING" and not f.closed)
-    f.advance(5);assert(f.closed and f.state=="IDLE" and f.calls[2]=="STOP")
+    f.advance(4995);assert(f.state=="FILLING" and not f.closed)
+    f.advance(5);assert(f.closed and f.state=="FAULT" and f.calls[2]=="STOP")
 end)
 
-test("send budget is bounded independently from the ten second active stop",function()
+test("send budget is bounded independently from the five second active stop",function()
     assert(require("water_network_config").send_timeout_ms==30000)
     for _,ms in ipairs({5000,30000,60000}) do
         local f=fixture();f.config.send_timeout_ms=ms
         f.connect();f.offer("FILL");f.execute("FILL")
-        f.advance(9995);assert(f.state=="FILLING" and not f.closed)
-        f.advance(5);assert(f.state=="IDLE" and f.calls[2]=="STOP" and f.closed)
+        f.advance(4995);assert(f.state=="FILLING" and not f.closed)
+        f.advance(5);assert(f.state=="FAULT" and f.calls[2]=="STOP" and f.closed)
     end
     for _,ms in ipairs({0,30,4999,5500,61000,"30000",false,0/0,math.huge}) do
         local f=fixture();f.config.send_timeout_ms=ms
@@ -226,7 +300,7 @@ test("reconnection does not resume manual outputs or execute old pending command
     end
 end)
 test("active heartbeat follows one second boundaries",function() local f=fixture();f.connect();f.offer("START");f.execute("START");for i=1,15 do local n=#f.sent;f.advance(500);assert(#f.sent==n);f.advance(500);assert(#f.sent==n+1 and f.last().type=="ping");f.reply({type="pong",seq=f.last().seq}) end;assert(not f.closed and #f.calls==1) end)
-test("active timeout stops outputs",function() local f=fixture();f.connect();f.offer("START");f.execute("START");f.advance(10000);assert(f.calls[2]=="STOP" and f.closed) end)
+test("active timeout stops outputs",function() local f=fixture();f.connect();f.offer("START");f.execute("START");f.advance(5000);assert(f.calls[2]=="STOP" and f.closed) end)
 test("pong preserves connection across idle heartbeat",function() local f=fixture();f.connect();for i=1,4 do f.advance(30000);f.reply({type="pong",seq=f.last().seq}) end;assert(not f.closed) end)
 test("wrong pong does not extend deadline",function() local f=fixture();f.connect();f.advance(30000);f.reply({type="pong",seq=-1});f.advance(45000);assert(f.closed) end)
 test("invalid JSON fails closed",function() local f=fixture();f.connect();f.offer("START");f.execute("START");f.decode_fail=true;f.reply({});assert(f.calls[2]=="STOP") end)
@@ -241,7 +315,7 @@ test("authentication budget tolerates delayed ready but is still bounded",functi
     local f=fixture();assert(f.start());f.callbacks.open()
     f.advance(15000);assert(not f.closed)
     f.reply({type="ready",session=string.rep("a",32)})
-    f.offer("FILL");f.execute("FILL");f.advance(10000)
+    f.offer("FILL");f.execute("FILL");f.advance(5000)
     assert(f.closed and f.calls[2]=="STOP")
     local g=fixture();assert(g.start());g.callbacks.open();g.advance(29995);assert(not g.closed)
     g.advance(5);assert(g.closed and #g.calls==0)
@@ -359,7 +433,7 @@ test("simultaneous outputs keep active heartbeats and partial OFF does not relea
         assert(not f.closed)
         f.offer(stop_one,string.rep("d",32));f.execute(stop_one,8000,string.rep("d",32))
         assert(f.state==(stop_one=="FILL_OFF" and "DRAINING" or "FILLING"))
-        f.advance(9995);assert(not f.closed)
+        f.advance(4995);assert(not f.closed)
         f.advance(5);assert(f.closed and f.calls[1]=="STOP")
     end
 end)

@@ -563,7 +563,203 @@ def assert_water_estimates(page, store, report, output):
     assert_one_screen(page)
 
 
-def main(layout_only=False, estimates_only=False, countdowns_only=False):
+def assert_logout_race(page):
+    """Timer/focus events cannot overlap a slow request; logout invalidates it."""
+    pending = []
+    page.route('**/api/status', lambda route: pending.append(route))
+    with page.expect_request('**/api/status'):
+        page.evaluate("window.dispatchEvent(new Event('online'))")
+    page.wait_for_timeout(100)
+    assert len(pending) == 1
+    late_status = pending[0].fetch()
+    page.evaluate("window.dispatchEvent(new Event('focus'));window.dispatchEvent(new Event('online'))")
+    page.wait_for_timeout(2200)
+    assert len(pending) == 1
+    open_dialog(page, 'device')
+    page.locator('#logout').click()
+    expect(page.locator('#login-panel')).to_be_visible()
+    expect(page.locator('#device-dialog')).to_be_hidden()
+    pending[0].fulfill(response=late_status)
+    page.wait_for_timeout(2200)
+    expect(page.locator('#console')).to_be_hidden()
+    assert len(pending) == 1
+
+
+def assert_web_soft_limits(page, store, clock, output):
+    """Exercise the 0.8.2 Web policy with simulated authenticated WS receipts."""
+    console_url = page.url
+    # Leave a calibrated water estimate uncertain using an actual telemetry gap.
+    # The new control timer must remain usable without recalibrating that history.
+    status = dict(store.status, version='0.8.1', control_mode='manual', state='IDLE',
+                  fill='0', drain='0', ready='1', outputs_known='1', reason='ready')
+    gateway = store.gateway
+    store.poll(gateway, status)
+    store.configure_simulation(dict(level=40, fill_seconds=100, drain_seconds=200))
+    status.update(state='FILLING', fill='1', reason='manual_filling')
+    store.poll(gateway, status)
+    clock[0] += 13
+    status.update(state='IDLE', fill='0', reason='stopped')
+    store.poll(gateway, status)
+    assert store.snapshot()['simulation']['uncertain']
+    store.gateway = None
+    store.gateway_seen = 0
+    status.update(version='0.8.2', state='IDLE', reason='ready')
+    session = store.ws_open(status)
+    command_requests = []
+
+    def track_commands(request):
+        if request.method == 'POST' and urlsplit(request.url).path.endswith('/api/commands'):
+            command_requests.append(request.url)
+
+    def report(seconds=0, ack=None, **changes):
+        clock[0] += seconds
+        status.update(changes)
+        store.ws_touch(session, status, ack)
+
+    def advance(seconds):
+        # Keep the device's active one-second reports fresh while fake time moves.
+        for _ in range(seconds):
+            report(seconds=1)
+
+    def apply_command(selector, expected_command, **changes):
+        with page.expect_response('**/api/commands') as response:
+            page.locator(selector).click()
+        assert response.value.ok, response.value.text()
+        offer = store.ws_offer(session)
+        assert offer and offer['command'] == expected_command, offer
+        execute = store.ws_claim(session, offer['id'])
+        assert execute['type'] == 'execute', execute
+        report(ack=dict(id=offer['id'], status='succeeded', result='OK ' + expected_command), **changes)
+        sync_status(page)
+
+    page.on('request', track_commands)
+    try:
+        sync_status(page)
+        expect(page.locator('#version')).to_have_text('v0.8.2')
+        expect(page.locator('#device-timeout-note')).to_contain_text('5 秒')
+        expect(page.locator('#fill-button')).to_be_enabled()
+        expect(page.locator('#estimate-status')).to_contain_text('不确定')
+        expect_countdown(page, 'fill', None)
+        expect_countdown(page, 'drain', None)
+        apply_command('#fill-button', 'FILL', state='FILLING', fill='1', reason='manual_filling')
+        advance(10)
+        apply_command('#drain-button', 'DRAIN', state='EXCHANGING', drain='1', reason='manual_exchanging')
+        starts = store.snapshot()['control_limits']
+        assert starts['source'] == 'web' and not starts['uncertain'], starts
+        assert store.snapshot()['simulation']['uncertain']
+        assert store.snapshot()['simulation']['fill_on_since'] is None
+        expect_countdown(page, 'fill', 170)
+        expect_countdown(page, 'drain', 300)
+        advance(5)
+        sync_status(page)
+        apply_command('#fill-button', 'FILL_OFF', state='DRAINING', fill='0', reason='manual_draining')
+        expect_countdown(page, 'fill', None)
+        expect_countdown(page, 'drain', 295)
+        apply_command('#fill-button', 'FILL', state='EXCHANGING', fill='1', reason='manual_exchanging')
+        expect_countdown(page, 'fill', 180)
+        expect_countdown(page, 'drain', 295)
+        assert store.snapshot()['control_limits']['drain_on_since'] == starts['drain_on_since']
+        restarted = store.snapshot()['control_limits']['fill_on_since']
+        page.reload()
+        expect(page.locator('#console')).to_be_visible()
+        expect_countdown(page, 'fill', 180)
+        assert store.snapshot()['control_limits']['fill_on_since'] == restarted
+        for width, height, name in ((1440, 900, 'desktop'), (390, 844, 'mobile'), (360, 640, 'mobile-small')):
+            page.set_viewport_size({'width': width, 'height': height})
+            assert_one_screen(page)
+            page.screenshot(path=str(output / ('aquarium-web-limits-' + name + '.png')), full_page=True)
+
+        # Browser synchronization loss hides countdowns while the independent
+        # server policy continues observing the authenticated device connection.
+        page.route('**/api/status', lambda route: route.abort())
+        page.evaluate("window.dispatchEvent(new Event('online'))")
+        expect(page.locator('#header-connection')).to_contain_text('状态未知', timeout=6000)
+        expect_countdown(page, 'fill', None)
+        expect_countdown(page, 'drain', None)
+        advance(2)
+        page.unroute('**/api/status')
+        sync_status(page)
+        expect_countdown(page, 'fill', 178)
+        expect_countdown(page, 'drain', 293)
+
+        manual_count = len(command_requests)
+        page.goto('about:blank')
+        advance(177)
+        page.goto(console_url)
+        expect(page.locator('#console')).to_be_visible()
+        expect_countdown(page, 'fill', 1)
+        assert store.snapshot()['control_limits']['fill_on_since'] == restarted
+        advance(1)
+        sync_status(page)
+        expect(page.locator('#fill-countdown')).to_have_text('关断中')
+        expect_countdown(page, 'drain', 115)
+        expect(page.locator('#control-hint')).to_contain_text('服务端正在确认全部关闭')
+        for name in ('fill', 'drain'):
+            expect(page.locator('#' + name + '-button')).to_have_attribute('aria-checked', 'true')
+        assert len(command_requests) == manual_count, 'The browser posted an automatic command'
+        assert store.snapshot()['control_limits']['timeout_pending'] == 'fill'
+        page.screenshot(path=str(output / 'aquarium-web-limit-pending-mobile.png'), full_page=True)
+
+        def timeout_receipt(command, reason):
+            offer = store.ws_offer(session)
+            assert offer and offer['command'] == command, offer
+            execute = store.ws_claim(session, offer['id'])
+            assert execute['type'] == 'execute', execute
+            report(ack=dict(id=offer['id'], status='succeeded', result='OK ' + command),
+                   state='FAULT', ready='0', fill='0', drain='0', reason=reason)
+            sync_status(page)
+            for name in ('fill', 'drain'):
+                expect(page.locator('#' + name + '-button')).to_have_attribute('aria-checked', 'false')
+                expect_countdown(page, name, None)
+            expect(page.locator('#header-connection')).to_contain_text('设备异常')
+            expect(page.locator('#fill-button')).to_be_disabled()
+            expect(page.locator('#reset')).to_be_enabled()
+
+        def reset_fault():
+            open_dialog(page, 'device')
+            page.locator('#reset').click()
+            expect(page.locator('#confirm')).to_be_visible()
+            apply_command('#confirm button[value="ok"]', 'RESET', state='IDLE', ready='1',
+                          fill='0', drain='0', reason='reset')
+            close_dialog(page, 'device')
+            expect(page.locator('#fill-button')).to_be_enabled()
+
+        timeout_receipt('FILL_TIMEOUT', 'fill_timeout')
+        expect(page.locator('#device-reason')).to_contain_text('补水超时')
+        reset_fault()
+        # A drain-only run gets its complete five-minute policy, independently
+        # of the previous inlet timeout and the still-uncertain water estimate.
+        apply_command('#drain-button', 'DRAIN', state='DRAINING', drain='1', reason='manual_draining')
+        expect_countdown(page, 'drain', 300)
+        manual_count = len(command_requests)
+        advance(299)
+        sync_status(page)
+        expect_countdown(page, 'drain', 1)
+        advance(1)
+        sync_status(page)
+        expect(page.locator('#drain-countdown')).to_have_text('关断中')
+        expect(page.locator('#drain-button')).to_have_attribute('aria-checked', 'true')
+        assert len(command_requests) == manual_count
+        assert store.snapshot()['control_limits']['timeout_pending'] == 'drain'
+        timeout_receipt('DRAIN_TIMEOUT', 'drain_timeout')
+        expect(page.locator('#device-reason')).to_contain_text('排水超时')
+        reset_fault()
+        store.ws_close(session, 'peer_disconnected')
+        sync_status(page)
+        expect(page.locator('#header-connection')).to_contain_text('设备异常')
+        expect_countdown(page, 'fill', None)
+        expect_countdown(page, 'drain', None)
+        expect(page.locator('#fill-button')).to_be_disabled()
+        expect(page.locator('#stop')).to_be_disabled()
+        page.screenshot(path=str(output / 'aquarium-web-limits-offline-mobile.png'), full_page=True)
+        assert_one_screen(page)
+    finally:
+        page.remove_listener('request', track_commands)
+        page.unroute('**/api/status')
+        store.ws_close(session, 'peer_disconnected')
+
+
+def main(layout_only=False, estimates_only=False, countdowns_only=False, soft_limits_only=False):
     # A controlled clock keeps simulated device connectivity stable during UI work.
     now = [time.time()]
     store = Store(':memory:', lambda: now[0])
@@ -630,6 +826,17 @@ def main(layout_only=False, estimates_only=False, countdowns_only=False):
             assert page.evaluate("document.querySelector('#tank-canvas').width > 0")
             assert page.evaluate("document.querySelector('#scene-fallback').hidden")
             expect(page.get_by_text('经典控制台', exact=False)).to_have_count(0)
+
+            if soft_limits_only:
+                assert_web_soft_limits(page, store, now, output)
+                assert_logout_race(page)
+                assert not errors, errors
+                browser.close()
+                print('PASS Web 0.8.2 soft limits: authenticated WS claim/receipt, independent 180/300 seconds, '
+                      'uncertain water estimate with valid control timer, reload and closed-page persistence, '
+                      'API outage hides clocks, server timeout pending without browser commands, '
+                      'confirmed all-OFF fault/reset, desktop/phone layouts and logout race')
+                return
 
             # Both the default route and the old 3D bookmark reach this same console.
             for path in ('/water/index.html', '/water/aquarium.html'):
@@ -829,6 +1036,9 @@ def main(layout_only=False, estimates_only=False, countdowns_only=False):
             expect(page.locator('#header-connection')).to_contain_text('设备正常')
             expect(page.locator('#message')).to_be_empty()
 
+            assert_web_soft_limits(page, store, now, output)
+            report()
+            sync_status(page)
             store.gateway = None
             store.connection_event(False, 'peer_disconnected')
             expect(page.locator('#header-connection')).to_contain_text('设备异常', timeout=6000)
@@ -838,25 +1048,7 @@ def main(layout_only=False, estimates_only=False, countdowns_only=False):
             expect(page.locator('#hero-status')).to_contain_text('离线')
             close_dialog(page, 'device')
 
-            # Timer/focus events cannot overlap a slow request; logout invalidates it.
-            pending = []
-            page.route('**/api/status', lambda route: pending.append(route))
-            with page.expect_request('**/api/status'):
-                page.evaluate("window.dispatchEvent(new Event('online'))")
-            page.wait_for_timeout(100)
-            assert len(pending) == 1
-            late_status = pending[0].fetch()
-            page.evaluate("window.dispatchEvent(new Event('focus'));window.dispatchEvent(new Event('online'))")
-            page.wait_for_timeout(2200)
-            assert len(pending) == 1
-            open_dialog(page, 'device')
-            page.locator('#logout').click()
-            expect(page.locator('#login-panel')).to_be_visible()
-            expect(page.locator('#device-dialog')).to_be_hidden()
-            pending[0].fulfill(response=late_status)
-            page.wait_for_timeout(2200)
-            expect(page.locator('#console')).to_be_hidden()
-            assert len(pending) == 1
+            assert_logout_race(page)
             assert not errors, errors
             browser.close()
             print('PASS compact 3D browser: both entry URLs, desktop 1440/1366, phone 390/360, '
@@ -864,6 +1056,7 @@ def main(layout_only=False, estimates_only=False, countdowns_only=False):
                   'concurrent outputs, legacy guards, fault/offline indicator, visible dialog feedback, '
                   'optional capacity, liters/rates/run and calibration totals, net flow/ETA, '
                   'versioned independent protection countdowns, reload persistence, no web timer commands, '
+                  '0.8.2 server limits and fault/reset receipts independent of water estimates, '
                   'independent run reset, uncertainty/recalibration, API recovery, logout race')
     finally:
         server.shutdown()
@@ -874,4 +1067,4 @@ def main(layout_only=False, estimates_only=False, countdowns_only=False):
 
 if __name__ == '__main__':
     main(layout_only='--layout-only' in sys.argv, estimates_only='--estimates-only' in sys.argv,
-         countdowns_only='--countdowns-only' in sys.argv)
+         countdowns_only='--countdowns-only' in sys.argv, soft_limits_only='--soft-limits-only' in sys.argv)

@@ -9,7 +9,7 @@ return {
     long_connection_cert = nil,
     -- Initial DNS/TCP/TLS connection budget; independent of active-output watchdog.
     tls_connect_timeout_ms = 60000,
-    -- Allow cellular retransmission; the active-output watchdog stays at 10s.
+    -- Socket retries cannot extend the independent 5 s active-output watchdog.
     send_timeout_ms = 30000,
     auth_timeout_ms = 30000,
     -- LuaTask IP accounting is an estimate; sample/report every five minutes.
@@ -17,6 +17,6 @@ return {
     traffic_interval_s = 300,
     heartbeat_ms = 30000,
     active_heartbeat_ms = 1000,
-    offline_stop_ms = 10000,
+    offline_stop_ms = 5000,
     idle_timeout_ms = 75000
 }

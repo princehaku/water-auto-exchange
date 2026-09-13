@@ -1,13 +1,13 @@
 import {createAquarium} from './aquarium-scene.js';
 
 const $ = id => document.getElementById(id);
-const commandNames={START:'完整换水',FILL:'开启补水',DRAIN:'开启冲水',FILL_OFF:'关闭补水',DRAIN_OFF:'关闭冲水',STOP:'停止全部输出',RESET:'故障复位'};
+const commandNames={START:'完整换水',FILL:'开启补水',DRAIN:'开启冲水',FILL_OFF:'关闭补水',DRAIN_OFF:'关闭冲水',STOP:'停止全部输出',RESET:'故障复位',FILL_TIMEOUT:'补水软上限 · 关闭全部',DRAIN_TIMEOUT:'排水软上限 · 关闭全部'};
 const resultNames={queued:'等待设备领取',delivered:'等待设备回执',succeeded:'设备已确认',rejected:'设备已拒绝',expired:'命令已过期',uncertain:'结果待核实',cancelled:'命令已取消'};
 const stateNames={UNCONFIGURED:'等待配置',IDLE:'待机',DRAINING:'正在排水',SETTLING:'切换间隔',FILLING:'正在补水',EXCHANGING:'补水与排水同时进行',DONE:'本轮已完成',FAULT:'故障锁定'};
-const reasonNames={ready:'已就绪，可以操作',manual_filling:'补水正在运行',manual_draining:'冲水正在运行',manual_exchanging:'两路正在同时运行',stopped:'输出已停止',fill_timeout:'补水超时',drain_timeout:'排水超时',overflow:'超高水位触发',reset:'故障已复位',mapping_not_confirmed:'输出映射尚未确认',wiring_not_confirmed:'接线尚未确认'};
-const connectionReasons={connected:'设备已连接',connection_closed:'连接已关闭',peer_disconnected:'设备已断开',peer_closed:'设备主动断开',heartbeat_timeout:'设备通信超时',server_restarted:'服务已重启',protocol_or_internal_error:'连接异常',never_connected:'等待首次连接',auth_timeout:'认证超时',stale_session:'旧会话已结束',session_replaced:'新会话已接管'};
-const errors={login_required:'请先登录。',invalid_key:'管理密钥不正确。',try_later:'尝试过于频繁，请稍后再试。',device_offline:'设备已离线，命令未提交。',device_not_ready:'设备尚未就绪。',command_pending:'上一条命令尚在等待回执。',firmware_upgrade_required:'需要 0.8.0 / 0.8.1 手动模式才能独立关闭输出。',simulation_requires_idle:'校准时设备须在线，且补水、排水均已关闭。',invalid_simulation:'当前水位须为 0–100%，补排水用时为 1–86400 秒；容量可不填，填写时须为 0.1–100000 L。'};
-const supportedManual=['0.7.0','0.7.1','0.7.2','0.7.3','0.7.4','0.7.5','0.7.6','0.7.7','0.8.0','0.8.1'];
+const reasonNames={ready:'已就绪，可以操作',manual_filling:'补水正在运行',manual_draining:'冲水正在运行',manual_exchanging:'两路正在同时运行',stopped:'输出已停止',fill_timeout:'补水超时',drain_timeout:'排水超时',communication_timeout:'有效通信中断，输出已保护关断',overflow:'超高水位触发',reset:'故障已复位',mapping_not_confirmed:'输出映射尚未确认',wiring_not_confirmed:'接线尚未确认'};
+const connectionReasons={connected:'设备已连接',connection_closed:'连接已关闭',peer_disconnected:'设备已断开',peer_closed:'设备主动断开',heartbeat_timeout:'设备通信超时',server_restarted:'服务已重启',protocol_or_internal_error:'连接异常',never_connected:'等待首次连接',auth_timeout:'认证超时',stale_session:'旧会话已结束',session_replaced:'新会话已接管',control_stop_unconfirmed:'限时关断未确认，连接已终止',control_state_uncertain:'输出状态未知，连接已终止',control_unowned_output:'输出与本次控制记录不符',control_protocol_changed:'设备控制模式变化，需重新连接'};
+const errors={login_required:'请先登录。',invalid_key:'管理密钥不正确。',try_later:'尝试过于频繁，请稍后再试。',device_offline:'设备已离线，命令未提交。',device_not_ready:'设备尚未就绪。',command_pending:'上一条命令尚在等待回执。',control_timeout_pending:'已达到软上限，正在确认输出关闭。',firmware_upgrade_required:'需要 0.8.0 / 0.8.1 / 0.8.2 手动模式才能独立关闭输出。',simulation_requires_idle:'校准时设备须在线，且补水、排水均已关闭。',invalid_simulation:'当前水位须为 0–100%，补排水用时为 1–86400 秒；容量可不填，填写时须为 0.1–100000 L。'};
+const supportedManual=['0.7.0','0.7.1','0.7.2','0.7.3','0.7.4','0.7.5','0.7.6','0.7.7','0.8.0','0.8.1','0.8.2'];
 const refreshInterval=2000;
 let scene=null,snapshot=null,lastSnapshot=null,signedIn=false,lastSuccess=0,refreshRequest=null,authEpoch=0,busy=false,submittedId=null,formLoaded=false,refreshEnabled=true;
 
@@ -48,8 +48,9 @@ function setConnection(data,serviceOk=true){
   $('last-seen').textContent=data?.last_seen?timeLabel(data.last_seen):'—';
   $('online-duration').textContent=serviceOk&&data?.online&&data.connection?.since?durationLabel(serverNow(data)-data.connection.since):'—';
 }
-function concurrent(device){return ['0.8.0','0.8.1'].includes(device?.version)&&device.control_mode==='manual';}
-function outputLimit(device,output){return device?.version==='0.8.1'?(output==='fill'?180:300):supportedManual.includes(device?.version)?120:null;}
+function concurrent(device){return ['0.8.0','0.8.1','0.8.2'].includes(device?.version)&&device.control_mode==='manual';}
+function webLimits(device){return device?.version==='0.8.2'&&device.control_mode==='manual';}
+function outputLimit(device,output){return ['0.8.1','0.8.2'].includes(device?.version)?(output==='fill'?180:300):supportedManual.includes(device?.version)?120:null;}
 function pendingFor(output){return snapshot?.commands?.find(item=>item.command===(output==='fill'?'FILL':'DRAIN')&&['queued','delivered'].includes(item.status));}
 function switchCommand(button){
   const output=button.dataset.output,device=snapshot?.device;
@@ -65,6 +66,7 @@ function can(command){
   if(command==='FILL_OFF'||command==='DRAIN_OFF')return concurrent(device);
   if(data.commands.some(item=>['queued','delivered'].includes(item.status)))return false;
   if(command==='RESET')return device.state==='FAULT';
+  if(webLimits(device)&&(data.control_limits?.source!=='web'||data.control_limits?.uncertain||data.control_limits?.timeout_pending))return false;
   return ['FILL','DRAIN'].includes(command)&&supportedManual.includes(device.version)&&device.control_mode==='manual'&&device.ready==='1'&&device.outputs_known==='1'&&device.overflow==='0'&&(concurrent(device)?['IDLE','DONE','FILLING','DRAINING','EXCHANGING']:['IDLE','DONE']).includes(device.state);
 }
 function renderControls(){
@@ -79,23 +81,26 @@ function renderControls(){
   }
   $('stop').disabled=!can('STOP');$('reset').disabled=!can('RESET');
   const deviceOnline=snapshot?.online===true;
-  $('control-hint').textContent=!snapshot?'浏览器与服务连接中断，控制暂不可用。':!deviceOnline?'设备离线，等待重新连接。':!device?'等待设备状态。':!supportedManual.includes(device.version)?'当前固件不支持此手动控制页面。':device.control_mode!=='manual'?'设备处于自动模式，此处仅显示状态。':device.state==='FAULT'?'故障锁定，请检查现场后复位。':device.state==='UNCONFIGURED'?'输出尚未配置。':concurrent(device)?'两路可同时开启，并可分别关闭。':['FILLING','DRAINING'].includes(device.state)?'当前固件两路互锁；先关闭当前输出。':'当前固件两路互锁；升级 0.8.0 可同时开启。';
+  $('control-hint').textContent=!snapshot?'浏览器与服务连接中断，控制暂不可用。':!deviceOnline?'设备离线，等待重新连接。':!device?'等待设备状态。':!supportedManual.includes(device.version)?'当前固件不支持此手动控制页面。':device.control_mode!=='manual'?'设备处于自动模式，此处仅显示状态。':device.state==='FAULT'?'故障锁定，请检查现场后复位。':snapshot.control_limits?.timeout_pending?'已达到软上限，服务端正在确认全部关闭。':webLimits(device)&&(snapshot.control_limits?.source!=='web'||snapshot.control_limits?.uncertain)?'服务端计时待确认，暂不能开启。':device.state==='UNCONFIGURED'?'输出尚未配置。':concurrent(device)?'两路可同时开启，并可分别关闭。':['FILLING','DRAINING'].includes(device.state)?'当前固件两路互锁；先关闭当前输出。':'当前固件两路互锁；升级 0.8.0 可同时开启。';
 }
 function renderProgress(data,serviceOk=true){
-  const now=serverNow(data),sim=data?.simulation||{},device=data?.device;
+  const now=serverNow(data),sim=data?.simulation||{},device=data?.device,web=webLimits(device),control=data?.control_limits||{};
+  const timing=web?control:sim;
   const fresh=serviceOk&&Date.now()-lastSuccess<=10000&&data?.online&&device?.outputs_known==='1';
   for(const output of ['fill','drain']){
-    const on=fresh&&device[output]==='1',limit=outputLimit(device,output);
-    const since=sim[output+'_on_since'];
-    const seconds=on&&!sim.uncertain&&Number.isFinite(since)&&Number.isFinite(limit)?Math.max(0,now-since):null;
+    const on=fresh&&device[output]==='1',limit=web?control[output+'_seconds']:outputLimit(device,output);
+    const since=timing[output+'_on_since'],deadline=control[output+'_deadline'];
+    const valid=on&&!timing.uncertain&&Number.isFinite(since)&&Number.isFinite(limit)&&(!web||(control.source==='web'&&Number.isFinite(deadline)));
+    const seconds=valid?Math.max(0,now-since):null;
+    const remaining=valid?Math.max(0,web?deadline-now:limit-seconds):null;
     $(output+'-progress-text').textContent=seconds===null?(on?'开启时刻待核实':'— / '+(limit??'—')+' 秒'):Math.floor(seconds)+' / '+limit+' 秒';
     $(output+'-progress').style.width=seconds===null?'0%':Math.min(100,seconds/limit*100)+'%';
-    $(output+'-countdown').textContent=seconds===null?'—':etaLabel(Math.max(0,limit-seconds));
-    $(output+'-countdown').classList.toggle('is-ending',seconds!==null&&limit-seconds<=30);
+    $(output+'-countdown').textContent=on&&web&&control.timeout_pending===output?'关断中':etaLabel(remaining);
+    $(output+'-countdown').classList.toggle('is-ending',remaining!==null&&remaining<=30);
   }
   const limitsKnown=Number.isFinite(outputLimit(device,'fill'));
-  $('control-timeout-note').textContent=!limitsKnown?'限时待设备确认 · 开关以设备回执为准':device.version==='0.8.1'?'补水限时 3 分钟 · 排水限时 5 分钟':'当前固件两路各限时 120 秒';
-  $('device-timeout-note').textContent=!limitsKnown?'等待设备确认当前保护时限。':device.version==='0.8.1'?'当前保护：补水最多 180 秒，排水最多 300 秒。两路分别计时，开启另一路或重复开启不会延长计时。任一路超时都会故障锁定并关闭全部，需复位。':'当前固件每路最多 120 秒。刷入 0.8.1 后改为补水 180 秒、排水 300 秒；网页更新不会改变板端保护。';
+  $('control-timeout-note').textContent=!limitsKnown?'限时待设备确认 · 开关以设备回执为准':web?'服务端限时：补水 3 分钟 · 排水 5 分钟':device.version==='0.8.1'?'补水限时 3 分钟 · 排水限时 5 分钟':'当前固件两路各限时 120 秒';
+  $('device-timeout-note').textContent=!limitsKnown?'等待设备确认当前保护时限。':web?'联网手动控制由 Web 服务端执行补水 180 秒、排水 300 秒软上限，关闭网页后仍执行。任一路到期关闭全部并锁存故障，需复位。固件在失去有效通信后最多 5 秒关断；重复开启不会延长时限。':device.version==='0.8.1'?'当前固件保护：补水最多 180 秒，排水最多 300 秒。两路分别计时，开启另一路或重复开启不会延长计时。任一路超时都会故障锁定并关闭全部，需复位。':'当前固件每路最多 120 秒。刷入 0.8.2 后联网手动控制改为服务端补水 180 秒、排水 300 秒软上限和固件失联 5 秒保护。';
 }
 function renderWaterEstimate(data,serviceOk=true){
   const sim=data?.simulation||{},device=data?.device;
@@ -115,7 +120,7 @@ function renderWaterEstimate(data,serviceOk=true){
   const full=trusted&&Number.isFinite(sim.eta_full_seconds),empty=trusted&&Number.isFinite(sim.eta_empty_seconds);
   $('eta-label').textContent=full?'预计满水':empty?'预计排空':'预计满 / 空';
   $('eta-value').textContent=etaLabel(full?sim.eta_full_seconds:empty?sim.eta_empty_seconds:null);
-  $('estimate-status').textContent=!synced?'同步中断 · 预估暂停':!calibrated?'按现场水位校准后开始预估':sim.uncertain?'估算不确定 · 请重新校准':!data.online?'设备离线 · 预估暂停':device?.outputs_known!=='1'?'输出未知 · 预估暂停':!hasCapacity?'填写容量后可显示升数':device.fill==='0'&&device.drain==='0'?'待机 · 水量估算已保留':full||empty?'按当前开关估算 · 不会自动停泵':'进出平衡 · 水位预计保持';
+  $('estimate-status').textContent=!synced?'同步中断 · 预估暂停':!calibrated?'按现场水位校准后开始预估':sim.uncertain?'估算不确定 · 请重新校准':!data.online?'设备离线 · 预估暂停':device?.outputs_known!=='1'?'输出未知 · 预估暂停':!hasCapacity?'填写容量后可显示升数':device.fill==='0'&&device.drain==='0'?'待机 · 水量估算已保留':full||empty?'满空时间为估算 · 保护计时独立':'进出平衡 · 水位预计保持';
   $('calibration-updated').textContent=!calibrated?'尚未校准':Number.isFinite(sim.calibrated_at)?'上次校准 · '+timeLabel(sim.calibrated_at):'校准时间未记录';
 }
 function renderLevel(data){

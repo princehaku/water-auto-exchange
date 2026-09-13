@@ -1,5 +1,9 @@
 import json
+import os
+import socket
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -13,6 +17,44 @@ from server.app import Server, Store, Problem
 STATUS = dict(project='water_auto_exchange', version='0.6.0', state='IDLE', reason='ready',
               ready='1', fill='0', drain='0', outputs_known='1', need_fill='0', overflow='0',
               cycle='0', overflow_protection='0')
+
+
+class ScriptModeWebSocketTests(unittest.TestCase):
+    def test_python_app_script_can_upgrade_and_advertise_soft_limits(self):
+        root = Path(__file__).resolve().parents[1]
+        with socket.socket() as probe:
+            probe.bind(('127.0.0.1', 0))
+            port = probe.getsockname()[1]
+        with tempfile.TemporaryDirectory() as folder:
+            env = dict(os.environ, WATER_ADMIN_KEY='test-admin-' + 'a' * 32,
+                       WATER_DEVICE_KEY='b' * 32, WATER_DB=str(Path(folder) / 'water.db'),
+                       WATER_PORT=str(port), PYTHONPATH=str(root / 'build' / 'debug-python'))
+            process = subprocess.Popen([sys.executable, str(root / 'server' / 'app.py')],
+                                       cwd=str(root / 'server'), env=env,
+                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            client = None
+            try:
+                for _ in range(100):
+                    if process.poll() is not None:
+                        self.fail('Script server exited: ' + process.communicate()[1].decode())
+                    try:
+                        client = websocket.create_connection('ws://127.0.0.1:%d/water/api/device/ws' % port, timeout=1)
+                        break
+                    except OSError:
+                        time.sleep(.02)
+                self.assertIsNotNone(client)
+                client.send(json.dumps(dict(type='auth', key='b' * 32,
+                                            status=dict(STATUS, version='0.8.2', control_mode='manual', need_fill='unknown'))))
+                ready = json.loads(client.recv())
+                self.assertEqual(ready['type'], 'ready')
+                self.assertEqual(ready['soft_limits']['watchdog_ms'], 5000)
+                client.send(json.dumps(dict(type='ping', seq=1)))
+                self.assertEqual(json.loads(client.recv()), dict(type='pong', seq=1))
+            finally:
+                if client:
+                    client.close()
+                process.terminate()
+                process.communicate(timeout=5)
 
 
 class WebSocketTests(unittest.TestCase):
@@ -111,6 +153,69 @@ class WebSocketTests(unittest.TestCase):
 
     def test_timeout_firmware_concurrent_outputs_and_independent_off_roundtrip(self):
         self.concurrent_outputs_roundtrip('0.8.1')
+
+    def test_web_limits_firmware_concurrent_outputs_and_independent_off_roundtrip(self):
+        self.concurrent_outputs_roundtrip('0.8.2')
+
+    def test_soft_deadline_owner_runs_without_browser_or_incoming_device_messages(self):
+        status = dict(STATUS, version='0.8.2', control_mode='manual', need_fill='unknown')
+        client = self.connect(False)
+        client.send(json.dumps(dict(type='auth', key='b' * 32, status=status)))
+        ready = json.loads(client.recv())
+        self.assertEqual(ready['soft_limits'], dict(version=1, fill_seconds=180, drain_seconds=300, watchdog_ms=5000))
+        self.store.enqueue('FILL', 'f' * 32)
+        offer = json.loads(client.recv())
+        client.send(json.dumps(dict(type='claim', id=offer['id'])))
+        self.assertEqual(json.loads(client.recv())['command'], 'FILL')
+        # Deliberately lose every ON status and ACK. The execute grant already
+        # reserved the deadline, and the socket owner ticks independently.
+        self.now += 180
+        timeout_offer = json.loads(client.recv())
+        self.assertEqual(timeout_offer['command'], 'FILL_TIMEOUT')
+        client.send(json.dumps(dict(type='claim', id=timeout_offer['id'])))
+        self.assertEqual(json.loads(client.recv())['command'], 'FILL_TIMEOUT')
+        self.now += 1
+        # No fault confirmation: close the socket instead of renewing pongs.
+        try:
+            client.send(json.dumps(dict(type='ping', seq=2)))
+            self.assertEqual(client.recv(), '')
+        except (ConnectionAbortedError, ConnectionResetError, websocket.WebSocketConnectionClosedException):
+            pass  # Windows may abort the client's response to the close frame.
+        self.assertEqual(self.store.connection_reason, 'control_stop_unconfirmed')
+        self.assertIsNone(self.store.ws_gateway)
+
+    def test_soft_limit_auth_cannot_continue_an_old_active_output(self):
+        client = self.connect(False)
+        client.send(json.dumps(dict(type='auth', key='b' * 32,
+                                    status=dict(STATUS, version='0.8.2', control_mode='manual',
+                                                need_fill='unknown', state='FILLING', fill='1'))))
+        self.assertEqual(client.recv(), '')
+        self.assertIsNone(self.store.ws_gateway)
+
+    def test_replayed_off_receipt_over_socket_cannot_erase_new_deadline(self):
+        status = dict(STATUS, version='0.8.2', control_mode='manual', need_fill='unknown')
+        client = self.connect(status=status)
+        for number, command in enumerate(('FILL', 'FILL_OFF', 'FILL'), 1):
+            command_id = format(number, '032x')
+            self.store.enqueue(command, command_id)
+            offer = json.loads(client.recv())
+            self.assertEqual(offer['id'], command_id)
+            client.send(json.dumps(dict(type='claim', id=command_id)))
+            self.assertEqual(json.loads(client.recv())['command'], command)
+            if number != 3:
+                status.update(fill='1' if command == 'FILL' else '0', state='FILLING' if command == 'FILL' else 'IDLE')
+                client.send(json.dumps(dict(type='ack', ack=dict(id=command_id, status='succeeded', result='OK'), status=status)))
+                self.assertEqual(json.loads(client.recv())['type'], 'received')
+        observed = self.store.simulation['observed_at']
+        self.now += 1
+        # The endpoint still remembers this claim; the Store must consume its
+        # receipt only once before treating its attached status as telemetry.
+        client.send(json.dumps(dict(type='ack', ack=dict(id=format(2, '032x'), status='succeeded', result='OK FILL_OFF'), status=status)))
+        self.assertEqual(json.loads(client.recv())['type'], 'received')
+        self.assertEqual(self.store.control_runs['fill']['command_id'], format(3, '032x'))
+        self.assertEqual(self.store.simulation['observed_at'], observed)
+        self.now += 179
+        self.assertEqual(json.loads(client.recv())['command'], 'FILL_TIMEOUT')
 
     def concurrent_outputs_roundtrip(self, version):
         status=dict(STATUS,version=version,control_mode='manual',need_fill='unknown')

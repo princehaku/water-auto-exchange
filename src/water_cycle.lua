@@ -17,6 +17,7 @@ end
 local function outputs_off(self)
     self.fill, self.drain = false, false
     self.fill_since, self.drain_since = nil, nil
+    self.fill_web, self.drain_web = false, false
 end
 
 local function invalidate_samples(self)
@@ -86,9 +87,9 @@ function methods:update(now, need_fill, overflow)
         self.inputs_ready = not overflow and self.clear_since ~= nil
             and now - self.clear_since >= self.settings.debounce_ms
         if self.state == "FAULT" then return false, self.reason end
-        if self.drain and now - self.drain_since >= self.settings.drain_timeout_ms then
+        if self.drain and not self.drain_web and now - self.drain_since >= self.settings.drain_timeout_ms then
             return self:fault("drain_timeout")
-        elseif self.fill and now - self.fill_since >= self.settings.fill_timeout_ms then
+        elseif self.fill and not self.fill_web and now - self.fill_since >= self.settings.fill_timeout_ms then
             return self:fault("fill_timeout")
         elseif self.state == "IDLE" and self.reason == "waiting_for_inputs" and self.inputs_ready then
             self.reason = "ready"
@@ -149,13 +150,16 @@ local function manual_state(self)
     else self.state, self.reason = "IDLE", "stopped" end
 end
 
-local function manual_on(self, name, now)
+local function manual_on(self, name, now, web_controlled)
     if not check_time(self, now) then return false, self.reason end
     if self.state == "FAULT" then return false, "fault_latched" end
     if not self.inputs_ready then return false, "inputs_not_stable" end
     -- Explicit ON is idempotent and never extends an already running deadline.
     if self[name] then return true, name .. "_already_on" end
     self[name], self[name .. "_since"] = true, now
+    -- Only the adapter's guarded remote path may delegate the fixed deadline.
+    -- Repeated ON must not upgrade a locally timed output to Web ownership.
+    self[name .. "_web"] = web_controlled == true
     self.cycle = self.cycle + 1
     manual_state(self)
     return true, name .. "_started"
@@ -165,6 +169,7 @@ local function manual_off(self, name, now)
     if not check_time(self, now) then return false, self.reason end
     if self.mode ~= "manual" then return false, "manual_mode_required" end
     self[name], self[name .. "_since"] = false, nil
+    self[name .. "_web"] = false
     if self.state ~= "FAULT" then manual_state(self) end
     return true, name .. "_stopped"
 end
@@ -180,35 +185,38 @@ local function can_start(self, now)
     return true
 end
 
-function methods:start(now)
+function methods:start(now, web_controlled)
     local ok, reason = can_start(self, now)
     if not ok then return false, reason end
     if self.mode == "manual" then return false, "automatic_mode_required" end
     if self.need_fill ~= false then return false, "level_not_ready" end
     self.drain_only = false
+    self.remote_cycle = web_controlled == true
     self.cycle = self.cycle + 1
     enter(self, "DRAINING", "draining", now)
     return true, "started"
 end
 
 -- Independent drain: stop at B without entering the automatic refill phase.
-function methods:start_drain(now)
-    if self.mode == "manual" then return manual_on(self, "drain", now) end
+function methods:start_drain(now, web_controlled)
+    if self.mode == "manual" then return manual_on(self, "drain", now, web_controlled) end
     local ok, reason = can_start(self, now)
     if not ok then return false, reason end
     if self.mode ~= "manual" and self.need_fill ~= false then return false, "level_not_ready" end
     self.drain_only = true
+    self.remote_cycle = web_controlled == true
     self.cycle = self.cycle + 1
     enter(self, "DRAINING", self.mode == "manual" and "manual_draining" or "flushing", now)
     return true, "drain_started"
 end
 
-function methods:start_fill(now)
-    if self.mode == "manual" then return manual_on(self, "fill", now) end
+function methods:start_fill(now, web_controlled)
+    if self.mode == "manual" then return manual_on(self, "fill", now, web_controlled) end
     local ok, reason = can_start(self, now)
     if not ok then return false, reason end
     if self.mode ~= "manual" and self.need_fill ~= true then return false, "fill_not_requested" end
     self.drain_only = false
+    self.remote_cycle = web_controlled == true
     self.cycle = self.cycle + 1
     enter(self, "FILLING", self.mode == "manual" and "manual_filling" or "filling", now)
     return true, "fill_started"
@@ -239,6 +247,13 @@ function methods:status()
         need_fill = self.need_fill, overflow = self.overflow,
         cycle = self.cycle, inputs_ready = self.inputs_ready
     }
+end
+
+function methods:remote_active()
+    if self.mode == "manual" then return ((self.fill and self.fill_web) or (self.drain and self.drain_web)) == true end
+    -- Automatic remote cycles retain their fixed phase limits, while their
+    -- communication lease also covers the no-output settling interval.
+    return self.remote_cycle == true and (self.state == "DRAINING" or self.state == "SETTLING" or self.state == "FILLING")
 end
 
 function M.new(config)

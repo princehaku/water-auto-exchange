@@ -14,6 +14,8 @@ from socketserver import ThreadingMixIn
 
 ACTIVE = ('DRAINING', 'SETTLING', 'FILLING', 'EXCHANGING')
 COMMANDS = ('START', 'FILL', 'DRAIN', 'FILL_OFF', 'DRAIN_OFF', 'STOP', 'RESET')
+SOFT_LIMITS = dict(version=1, fill_seconds=180, drain_seconds=300, watchdog_ms=5000)
+COMMAND_PRIORITY = "CASE command WHEN 'FILL_TIMEOUT' THEN 0 WHEN 'DRAIN_TIMEOUT' THEN 0 WHEN 'STOP' THEN 1 WHEN 'FILL_OFF' THEN 2 WHEN 'DRAIN_OFF' THEN 2 ELSE 3 END"
 ADMIN_SESSION_TTL_SECONDS = 999 * 24 * 60 * 60
 
 
@@ -25,7 +27,7 @@ class Problem(Exception):
 def validate_status(value):
     if not isinstance(value, dict):
         raise Problem(400, 'invalid_status')
-    if value.get('project') != 'water_auto_exchange' or value.get('version') not in ('0.3.0', '0.4.0', '0.5.0', '0.5.1', '0.5.2', '0.5.3', '0.6.0', '0.7.0', '0.7.1', '0.7.2', '0.7.3', '0.7.4', '0.7.5', '0.7.6', '0.7.7', '0.8.0', '0.8.1'):
+    if value.get('project') != 'water_auto_exchange' or value.get('version') not in ('0.3.0', '0.4.0', '0.5.0', '0.5.1', '0.5.2', '0.5.3', '0.6.0', '0.7.0', '0.7.1', '0.7.2', '0.7.3', '0.7.4', '0.7.5', '0.7.6', '0.7.7', '0.8.0', '0.8.1', '0.8.2'):
         raise Problem(409, 'firmware_mismatch')
     if value.get('state') not in ('UNCONFIGURED', 'IDLE', 'DONE', 'FAULT') + ACTIVE:
         raise Problem(400, 'invalid_state')
@@ -41,11 +43,11 @@ def validate_status(value):
             raise Problem(400, 'invalid_flag')
     if result['need_fill'] not in ('0', '1', 'unknown') or not result['cycle'].isdigit():
         raise Problem(400, 'invalid_level_or_cycle')
-    if result['version'] in ('0.7.0', '0.7.1', '0.7.2', '0.7.3', '0.7.4', '0.7.5', '0.7.6', '0.7.7', '0.8.0', '0.8.1'):
+    if result['version'] in ('0.7.0', '0.7.1', '0.7.2', '0.7.3', '0.7.4', '0.7.5', '0.7.6', '0.7.7', '0.8.0', '0.8.1', '0.8.2'):
         if value.get('control_mode') not in ('manual', 'automatic'):
             raise Problem(400, 'invalid_control_mode')
         result['control_mode'] = value['control_mode']
-    concurrent = result['version'] in ('0.8.0', '0.8.1') and result.get('control_mode') == 'manual'
+    concurrent = result['version'] in ('0.8.0', '0.8.1', '0.8.2') and result.get('control_mode') == 'manual'
     if result['state'] == 'EXCHANGING' and not concurrent:
         raise Problem(400, 'invalid_state')
     if result['outputs_known'] == '1':
@@ -58,8 +60,13 @@ def validate_status(value):
 
 
 class Store:
-    def __init__(self, path, clock=time.time):
+    soft_limits = SOFT_LIMITS
+
+    def __init__(self, path, clock=time.time, control_clock=None):
         self.clock = clock
+        # Deadlines must survive wall-clock corrections. A supplied test clock
+        # controls both clocks unless the test explicitly separates them.
+        self.control_clock = control_clock or (time.monotonic if clock is time.time else clock)
         self.lock = threading.RLock()
         self.db = sqlite3.connect(path, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
@@ -85,11 +92,19 @@ class Store:
         self.status, self.seen, self.gateway = None, None, None
         self.gateway_seen = 0
         self.ws_gateway = None
+        self.ws_grants = {}
+        self.ws_grant_sequence = 0
+        self.web_limits = False
+        self.control_runs = dict(fill=None, drain=None)
+        self.control_timeout = None
+        self.control_uncertain = True
         self.connection_state, self.connection_since, self.connection_reason = 'offline', None, 'never_connected'
         saved = self.db.execute('SELECT value FROM device_snapshot WHERE id=1').fetchone()
         if saved:
             previous = json.loads(saved['value'])
             self.status, self.seen = previous.get('device'), previous.get('last_seen')
+            self.web_limits = bool(self.status and self.status.get('version') == '0.8.2'
+                                   and self.status.get('control_mode') == 'manual')
         saved_sim = self.db.execute('SELECT value FROM aquarium_simulation WHERE id=1').fetchone()
         self.simulation = json.loads(saved_sim['value']) if saved_sim else dict(
             level=None, fill_seconds=None, drain_seconds=None, updated_at=None,
@@ -141,6 +156,109 @@ class Store:
         self.db.execute('INSERT OR REPLACE INTO aquarium_simulation VALUES(1,?)',
                         (json.dumps(self.simulation),))
         self.db.commit()
+
+    def control_abort(self, reason):
+        self.control_uncertain = True
+        if self.ws_gateway:
+            self.ws_close(self.ws_gateway, reason)
+        raise Problem(409, reason)
+
+    def control_start(self, key, command_id):
+        if self.control_runs[key] is None:
+            seconds = SOFT_LIMITS[key + '_seconds']
+            now = self.clock()
+            self.control_runs[key] = dict(since=now, deadline=now + seconds,
+                                          until=self.control_clock() + seconds,
+                                          command_id=command_id, observed_on=False,
+                                          grant_sequence=self.ws_grants[command_id]['sequence'])
+
+    def observe_control(self, status, ack=None):
+        """Control authority is separate from calibrated water estimates.
+
+        An execute grant reserves its deadline before any status/ACK arrives.
+        An older all-OFF status cannot erase an unconfirmed execute grant.
+        """
+        if not self.web_limits:
+            return
+        if status['version'] != '0.8.2' or status.get('control_mode') != 'manual':
+            self.control_abort('control_protocol_changed')
+        if status['outputs_known'] != '1':
+            self.control_abort('control_state_uncertain')
+        all_off = status['fill'] == status['drain'] == '0'
+        ack_row = self.db.execute('SELECT * FROM commands WHERE id=?', (ack.get('id'),)).fetchone() if ack else None
+        if self.control_timeout and all_off and status['state'] == 'FAULT':
+            # The fault latches locally; any queued timeout is now obsolete.
+            self.db.execute("UPDATE commands SET status='cancelled', result='fault_confirmed', finished=? WHERE command IN ('FILL_TIMEOUT','DRAIN_TIMEOUT') AND status IN ('queued','delivered') AND id<>?", (self.clock(), ack.get('id', '') if ack else ''))
+            self.control_runs = dict(fill=None, drain=None)
+            self.control_timeout = None
+            self.control_uncertain = False
+            self.db.commit()
+            return
+        for key in ('fill', 'drain'):
+            run = self.control_runs[key]
+            if status[key] == '1':
+                if run is None:
+                    self.control_abort('control_unowned_output')
+                run['observed_on'] = True
+            elif run is not None and not self.control_timeout:
+                rejected_start = ack and ack.get('status') == 'rejected' and ack.get('id') == run['command_id']
+                ack_grant = self.ws_grants.get(ack.get('id')) if ack else None
+                confirmed_stop = (ack_row and ack_grant and ack.get('status') == 'succeeded'
+                                  and ack_row['command'] in ('STOP', key.upper() + '_OFF')
+                                  and ack_grant['sequence'] >= run['grant_sequence'])
+                if run['observed_on'] or rejected_start or confirmed_stop or (all_off and status['state'] == 'FAULT'):
+                    self.control_runs[key] = None
+        self.control_uncertain = False
+
+    def control_tick(self, session=None):
+        """Called by the WS owner every 100 ms, even with no browser/pings."""
+        with self.lock:
+            if session is not None and session != self.ws_gateway:
+                raise Problem(409, 'stale_session')
+            if not self.web_limits or self.ws_gateway is None:
+                return
+            now = self.control_clock()
+            if self.control_timeout:
+                if now >= self.control_timeout['confirm_until']:
+                    self.control_uncertain = True
+                    if session is not None:
+                        self.control_abort('control_stop_unconfirmed')
+                return
+            expired = [(run['until'], key) for key, run in self.control_runs.items()
+                       if run is not None and now >= run['until']]
+            if not expired:
+                return
+            _, key = min(expired)
+            # Revoke every unexecuted grant before the stop offer, including
+            # delivered commands that have not yet reached their claim.
+            self.db.execute("UPDATE commands SET status='cancelled', result='superseded_by_timeout', finished=? WHERE status IN ('queued','delivered')", (self.clock(),))
+            command_id = secrets.token_hex(16)
+            self.db.execute('INSERT INTO commands VALUES(?,?,?,?,?,?,?)',
+                            (command_id, key.upper() + '_TIMEOUT', self.clock(),
+                             self.clock() + 1, 'queued', None, None))
+            self.control_timeout = dict(key=key, id=command_id, confirm_until=now + 1)
+            self.db.commit()
+
+    def control_limits_snapshot(self):
+        status = self.status or {}
+        recent = status.get('version') in ('0.8.1', '0.8.2')
+        result = dict(source='web' if self.web_limits else 'firmware',
+                      fill_seconds=180 if recent else 120,
+                      drain_seconds=300 if recent else 120,
+                      uncertain=self.control_uncertain if self.web_limits else self.simulation['uncertain'],
+                      timeout_pending=self.control_timeout['key'] if self.control_timeout else None)
+        for key in ('fill', 'drain'):
+            run = self.control_runs[key] if self.web_limits else None
+            since = None if self.web_limits else self.simulation[key + '_since']
+            deadline = since + result[key + '_seconds'] if since is not None else None
+            if run:
+                # Project monotonic remaining time onto the current wall clock
+                # so a clock correction cannot lengthen the UI countdown.
+                deadline = self.clock() + max(0, run['until'] - self.control_clock())
+                since = deadline - result[key + '_seconds']
+            result[key + '_on_since'] = since
+            result[key + '_deadline'] = deadline
+        return result
 
     def observe_outputs(self, status):
         """Integrate only spans supported by consecutive, fresh device reports."""
@@ -313,13 +431,16 @@ class Store:
 
     def online(self):
         with self.lock:
-            limit = 75 if self.ws_gateway and self.status and self.status['state'] not in ACTIVE else 10
+            active = self.status and self.status['state'] in ACTIVE
+            active = active or (self.web_limits and any(self.control_runs.values()))
+            limit = 75 if self.ws_gateway and not active else (5 if self.web_limits else 10)
             online = self.gateway is not None and self.seen is not None and self.clock() - self.seen <= limit
             self.connection_event(online, 'connected' if online else 'heartbeat_timeout')
             return online
 
     def snapshot(self):
         with self.lock:
+            self.control_tick()
             self.expire()
             online = self.online()
             return dict(online=online, last_seen=self.seen, device=self.status, server_time=self.clock(),
@@ -327,12 +448,14 @@ class Store:
                                         events=[dict(r) for r in self.db.execute('SELECT at,state,reason FROM connection_events ORDER BY id DESC LIMIT 60')]),
                         traffic=self.traffic_snapshot(),
                         simulation=self.simulation_snapshot(),
+                        control_limits=self.control_limits_snapshot(),
                         commands=[dict(r) for r in self.db.execute('SELECT * FROM commands ORDER BY created DESC, rowid DESC LIMIT 60')])
 
     def enqueue(self, command, request_id):
         if command not in COMMANDS or not isinstance(request_id, str) or len(request_id) != 32 or any(c not in '0123456789abcdef' for c in request_id):
             raise Problem(400, 'invalid_command')
         with self.lock:
+            self.control_tick()
             self.expire()
             previous = self.db.execute('SELECT * FROM commands WHERE id=?', (request_id,)).fetchone()
             if previous:
@@ -342,10 +465,12 @@ class Store:
             if not self.online():
                 raise Problem(409, 'device_offline')
             s = self.status
-            concurrent = s['version'] in ('0.8.0', '0.8.1') and s.get('control_mode') == 'manual'
+            if self.control_timeout and command not in ('STOP', 'FILL_OFF', 'DRAIN_OFF'):
+                raise Problem(409, 'control_timeout_pending')
+            concurrent = s['version'] in ('0.8.0', '0.8.1', '0.8.2') and s.get('control_mode') == 'manual'
             if command in ('FILL_OFF', 'DRAIN_OFF') and not concurrent:
                 raise Problem(409, 'firmware_upgrade_required')
-            if command == 'DRAIN' and s['version'] not in ('0.6.0', '0.7.0', '0.7.1', '0.7.2', '0.7.3', '0.7.4', '0.7.5', '0.7.6', '0.7.7', '0.8.0', '0.8.1'):
+            if command == 'DRAIN' and s['version'] not in ('0.6.0', '0.7.0', '0.7.1', '0.7.2', '0.7.3', '0.7.4', '0.7.5', '0.7.6', '0.7.7', '0.8.0', '0.8.1', '0.8.2'):
                 raise Problem(409, 'firmware_upgrade_required')
             if command == 'START' and s.get('control_mode') == 'manual':
                 raise Problem(409, 'automatic_mode_required')
@@ -358,7 +483,7 @@ class Store:
             if command == 'RESET' and s['state'] != 'FAULT':
                 raise Problem(409, 'not_faulted')
             if command == 'STOP':
-                self.db.execute("UPDATE commands SET status='cancelled', result='superseded_by_stop', finished=? WHERE status='queued'", (self.clock(),))
+                self.db.execute("UPDATE commands SET status='cancelled', result='superseded_by_stop', finished=? WHERE status='queued' AND command NOT IN ('FILL_TIMEOUT','DRAIN_TIMEOUT')", (self.clock(),))
             elif command in ('FILL_OFF', 'DRAIN_OFF'):
                 self.db.execute("UPDATE commands SET status='cancelled', result='superseded_by_output_off', finished=? WHERE status='queued' AND command=?", (self.clock(), command[:-4]))
             elif self.db.execute("SELECT 1 FROM commands WHERE status IN ('queued','delivered')").fetchone():
@@ -370,6 +495,8 @@ class Store:
 
     def poll(self, gateway, status, ack=None):
         status = validate_status(status)
+        if status['version'] == '0.8.2' and status.get('control_mode') == 'manual':
+            raise Problem(409, 'firmware_requires_wss')
         if not isinstance(gateway, str) or not 16 <= len(gateway) <= 64:
             raise Problem(400, 'invalid_gateway')
         with self.lock:
@@ -380,6 +507,11 @@ class Store:
             if self.gateway != gateway:
                 self.db.execute("UPDATE commands SET status='uncertain', result='gateway_changed' WHERE status IN ('queued','delivered')")
             self.gateway, self.gateway_seen = gateway, now
+            self.web_limits = False
+            self.ws_grants = {}
+            self.ws_grant_sequence = 0
+            self.control_runs = dict(fill=None, drain=None)
+            self.control_timeout = None
             self.expire()
             if ack is not None:
                 if not isinstance(ack, dict) or ack.get('status') not in ('succeeded', 'rejected', 'uncertain') or not isinstance(ack.get('result'), str) or len(ack['result']) > 256:
@@ -408,6 +540,7 @@ class Store:
     def ws_open(self, status, previous_session=None):
         status = validate_status(status)
         with self.lock:
+            soft = status['version'] == '0.8.2' and status.get('control_mode') == 'manual'
             # Only the authenticated previous owner can replace its half-open
             # session immediately; another client still cannot evict a live owner.
             if self.ws_gateway and isinstance(previous_session, str) and hmac.compare_digest(previous_session, self.ws_gateway):
@@ -416,7 +549,15 @@ class Store:
                 self.ws_close(self.ws_gateway, 'heartbeat_timeout')
             if self.ws_gateway or (self.gateway and self.gateway_seen > self.clock() - 15):
                 raise Problem(409, 'another_device_active')
+            if soft and (status['outputs_known'] != '1' or status['fill'] != '0' or status['drain'] != '0'):
+                raise Problem(409, 'control_state_uncertain')
             self.ws_gateway = self.gateway = secrets.token_hex(16)
+            self.ws_grants = {}
+            self.ws_grant_sequence = 0
+            self.web_limits = soft
+            self.control_runs = dict(fill=None, drain=None)
+            self.control_timeout = None
+            self.control_uncertain = False
             self.db.execute("UPDATE commands SET status='uncertain', result='device_reconnected' WHERE status IN ('queued','delivered')")
             self.db.commit()
             self.status, self.seen = status, self.clock()
@@ -427,14 +568,35 @@ class Store:
 
     def ws_touch(self, session, status=None, ack=None):
         with self.lock:
-            if session != self.ws_gateway:
+            if session is None or session != self.ws_gateway:
                 raise Problem(409, 'stale_session')
+            self.control_tick(session)
+            if ack is not None and (not isinstance(ack, dict) or ack.get('status') not in ('succeeded', 'rejected', 'uncertain') or not isinstance(ack.get('result'), str) or len(ack['result']) > 256 or not isinstance(ack.get('id'), str)):
+                raise Problem(400, 'invalid_ack')
+            if ack is not None:
+                grant = self.ws_grants.get(ack['id'])
+                if grant is None:
+                    raise Problem(400, 'unclaimed_ack')
+                if grant['acked']:
+                    return False
+                self.expire()
+                row = self.db.execute('SELECT status FROM commands WHERE id=?', (ack['id'],)).fetchone()
+                grant['acked'] = True
+                if row is None or row['status'] != 'delivered':
+                    return False
+                if grant['sequence'] < self.ws_grant_sequence:
+                    # A late first receipt is useful history, but its attached
+                    # OFF/ON snapshot predates newer execute authority.
+                    status = None
             if status is not None:
-                self.status = validate_status(status)
+                status = validate_status(status)
+                if self.status and '0.8.2' in (self.status['version'], status['version']) and (
+                        self.status['version'] != status['version'] or self.status.get('control_mode') != status.get('control_mode')):
+                    self.control_abort('control_protocol_changed')
+                self.observe_control(status, ack)
+                self.status = status
                 self.observe_outputs(self.status)
             if ack is not None:
-                if not isinstance(ack, dict) or ack.get('status') not in ('succeeded', 'rejected', 'uncertain') or not isinstance(ack.get('result'), str) or len(ack['result']) > 256 or not isinstance(ack.get('id'), str):
-                    raise Problem(400, 'invalid_ack')
                 self.db.execute("UPDATE commands SET status=?, result=?, finished=? WHERE id=? AND status IN ('delivered','uncertain')", (ack['status'], ack['result'], self.clock(), ack['id']))
                 self.db.commit()
             self.seen = self.gateway_seen = self.clock()
@@ -442,10 +604,11 @@ class Store:
 
     def ws_offer(self, session):
         with self.lock:
-            if session != self.ws_gateway:
+            if session is None or session != self.ws_gateway:
                 return None
+            self.control_tick(session)
             self.expire()
-            row = self.db.execute("SELECT * FROM commands WHERE status='queued' ORDER BY CASE command WHEN 'STOP' THEN 0 WHEN 'FILL_OFF' THEN 1 WHEN 'DRAIN_OFF' THEN 1 ELSE 2 END, created LIMIT 1").fetchone()
+            row = self.db.execute("SELECT * FROM commands WHERE status='queued' ORDER BY " + COMMAND_PRIORITY + ", created LIMIT 1").fetchone()
             if not row:
                 return None
             self.db.execute("UPDATE commands SET status='delivered' WHERE id=?", (row['id'],))
@@ -454,12 +617,18 @@ class Store:
 
     def ws_claim(self, session, command_id):
         with self.lock:
-            if session != self.ws_gateway or not isinstance(command_id, str):
+            if session is None or session != self.ws_gateway or not isinstance(command_id, str):
                 raise Problem(409, 'stale_session')
+            self.control_tick(session)
             self.expire()
             row = self.db.execute("SELECT * FROM commands WHERE id=? AND status='delivered'", (command_id,)).fetchone()
             if not row:
                 return dict(type='expired', id=command_id)
+            if command_id not in self.ws_grants:
+                self.ws_grant_sequence += 1
+                self.ws_grants[command_id] = dict(sequence=self.ws_grant_sequence, acked=False)
+            if self.web_limits and row['command'] in ('FILL', 'DRAIN'):
+                self.control_start(row['command'].lower(), row['id'])
             return dict(type='execute', id=row['id'], command=row['command'], ttl_ms=max(0, int((row['expires'] - self.clock()) * 1000)))
 
     def ws_close(self, session, reason='connection_closed'):
@@ -469,6 +638,7 @@ class Store:
             self.db.execute("UPDATE commands SET status='uncertain', result='device_disconnected', finished=? WHERE status IN ('queued','delivered')", (self.clock(),))
             self.db.commit()
             self.ws_gateway = self.gateway = None
+            self.control_uncertain = True
             self.gateway_seen = 0
             self.connection_event(False, reason)
             self.save_device_snapshot()

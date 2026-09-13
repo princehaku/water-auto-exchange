@@ -81,6 +81,8 @@ function M.new(config, dependencies)
     local io_error
     local timer_id, timer_callback, generation = nil, nil, 0
     local previous_tick, elapsed_ms = nil, 0
+    local remote_deadline
+    local REMOTE_WATCHDOG_MS = 5000
     local schedule, fault, poll
     local last_state
 
@@ -159,6 +161,7 @@ function M.new(config, dependencies)
     end
 
     fault = function(reason)
+        remote_deadline = nil
         engine:fault(clean(reason))
         local ok, err = off_all()
         if not ok then io_error = "off_failed:" .. err end
@@ -211,6 +214,12 @@ function M.new(config, dependencies)
             error(t, 0)
         end
         engine:update(t, need_fill, overflow)
+        if engine:remote_active() then
+            if not remote_deadline or t >= remote_deadline then
+                engine:fault("communication_timeout")
+                remote_deadline = nil
+            end
+        else remote_deadline = nil end
         return t
     end
 
@@ -223,7 +232,11 @@ function M.new(config, dependencies)
             poll()
         end
         timer_callback = callback -- Also retain partially registered timers on failure.
-        local id = sys.timerStart(callback, cfg.poll_ms)
+        -- This timer belongs to output control, never to the socket task.
+        -- Shorten the final poll so a 5 s lease is not rounded up by poll_ms.
+        local delay = cfg.poll_ms
+        if remote_deadline then delay = math.max(1, math.min(delay, remote_deadline - now())) end
+        local id = sys.timerStart(callback, delay)
         assert(type(id) == "number" and id > 0, "timer_start_failed")
         timer_id = id
     end
@@ -307,7 +320,7 @@ function M.new(config, dependencies)
         return true, "initialized"
     end
 
-    local function command(method)
+    local function command(method, web_controlled)
         if not valid then return false, config_reason end
         if not initialized then return false, "not_initialized" end
         if not running then return false, "poller_stopped_restart_required" end
@@ -321,7 +334,12 @@ function M.new(config, dependencies)
         local token = generation
         local ok, err = pcall(function()
             local t = sample() -- Recheck raw overflow even between periodic polls.
-            accepted, reason = engine[method](engine, t)
+            accepted, reason = engine[method](engine, t, web_controlled)
+            -- A fresh remote output gets one initial communication lease.
+            -- Opening/repeating another route never renews an existing lease.
+            if accepted and engine:remote_active() and not remote_deadline then
+                remote_deadline = t + REMOTE_WATCHDOG_MS
+            elseif not engine:remote_active() then remote_deadline = nil end
             apply(token)
             if method == "reset" and accepted then io_error = nil end
         end)
@@ -344,7 +362,46 @@ function M.new(config, dependencies)
     function self.drain_off() return command("stop_drain") end
     function self.reset() return command("reset") end
 
+    -- Internal WSS entry points; the USB parser does not expose these methods.
+    function self.remote_command(method)
+        local mapped = ({start="start", fill="start_fill", drain="start_drain"})[method]
+        if not mapped then return false, "invalid_remote_command" end
+        return command(mapped, true)
+    end
+
+    function self.remote_heartbeat()
+        if not initialized or not running then return false, "poller_stopped_restart_required" end
+        local ok, result, reason = pcall(function()
+            local t = now()
+            if engine:remote_active() then
+                -- Check expiration before renewal, even before the next poll.
+                if not remote_deadline or t >= remote_deadline then return fault("communication_timeout") end
+                remote_deadline = t + REMOTE_WATCHDOG_MS
+            end
+            return true, "heartbeat_received"
+        end)
+        if not ok then return fault(result) end
+        return result, reason
+    end
+
+    function self.remote_timeout(name)
+        if name ~= "fill" and name ~= "drain" and name ~= "communication" then return false, "invalid_remote_timeout" end
+        -- Generation invalidation prevents a queued callback from reopening a
+        -- physical output after the server's time limit closes everything.
+        local timer_ok, detail = cancel()
+        fault(name .. "_timeout")
+        if not timer_ok then running = false; return fault("stop:" .. clean(detail)) end
+        if running then
+            local ok, err = pcall(schedule)
+            if not ok then running = false; cancel(); return fault(err) end
+        end
+        local s = self.status()
+        if not s.outputs_known or s.fill or s.drain then return false, s.reason end
+        return true, s.reason
+    end
+
     function self.stop()
+        remote_deadline = nil
         local timer_ok, timer_error = cancel()
         engine:stop()
         local outputs_ok, outputs_error = off_all()

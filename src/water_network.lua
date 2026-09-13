@@ -1,7 +1,8 @@
 -- WSS application protocol; socket I/O is queued to water_ws_transport's task.
 local M = {}
 local ACTIVE = { DRAINING = true, SETTLING = true, FILLING = true, EXCHANGING = true }
-local ALLOWED = { START = "start", FILL = "fill", DRAIN = "drain", FILL_OFF = "fill_off", DRAIN_OFF = "drain_off", STOP = "stop", RESET = "reset" }
+local ALLOWED = { START = "start", FILL = "fill", DRAIN = "drain", FILL_OFF = "fill_off", DRAIN_OFF = "drain_off", STOP = "stop", RESET = "reset",
+    FILL_TIMEOUT = "remote_timeout", DRAIN_TIMEOUT = "remote_timeout" }
 
 function M.start(controller, config, deps)
     if type(config) ~= "table" or config.enabled ~= true then return false, "network_disabled" end
@@ -52,7 +53,7 @@ function M.start(controller, config, deps)
             return false, "network_timing_invalid"
         end
     end
-    if config.offline_stop_ms > 10000 or config.active_heartbeat_ms >= config.offline_stop_ms
+    if config.offline_stop_ms > 5000 or config.active_heartbeat_ms >= config.offline_stop_ms
         or config.heartbeat_ms >= config.idle_timeout_ms or config.heartbeat_ms > 30000 then
         return false, "network_deadline_invalid"
     end
@@ -102,7 +103,14 @@ function M.start(controller, config, deps)
         if not ok or stopped ~= true then print("WATER WS stop_unconfirmed", tostring(ok and reason or "exception")) end
     end
     local function lost(reason)
-        if owned then stop_outputs() end
+        if owned then
+            -- The network timer can win the same-deadline dispatch race with
+            -- the controller poll. Both orders must latch the same fault.
+            if reason == "heartbeat_timeout" and controller.remote_timeout then
+                pcall(controller.remote_timeout, "communication")
+            end
+            stop_outputs()
+        end
         ready, opened, owned, pending, pings = false, false, false, {}, {}
         if deps.on_connection then pcall(deps.on_connection, false) end
         if client then client:close(not enabled) end
@@ -133,6 +141,11 @@ function M.start(controller, config, deps)
         local time = now()
         if not ready then
             if value.type ~= "ready" or type(value.session) ~= "string" or #value.session ~= 32 then lost("auth_failed"); return end
+            local policy = value.soft_limits
+            if type(policy) ~= "table" or policy.version ~= 1 or policy.fill_seconds ~= 180
+                or policy.drain_seconds ~= 300 or policy.watchdog_ms ~= 5000 then
+                lost("server_soft_limits_required"); return
+            end
             ready, last_ok, last_ping = true, time, time
             -- Keep one server-issued meter id across reconnects, until reboot.
             meter_id = meter_id or value.session
@@ -141,6 +154,12 @@ function M.start(controller, config, deps)
             print("WATER WS online")
             return
         end
+        local was_active = ACTIVE[telemetry().state] == true
+        -- A message arriving at/after the deadline cannot revive a lease while
+        -- its control timer is waiting to dispatch in this same event turn.
+        if owned and was_active and time - last_ok >= config.offline_stop_ms then
+            lost("heartbeat_timeout"); return
+        end
         if value.type == "pong" then
             local sent_at = pings[value.seq]
             local active = ACTIVE[telemetry().state] == true
@@ -148,18 +167,24 @@ function M.start(controller, config, deps)
             -- A cellular reply can arrive after the next ping was queued.
             -- Accept fresh outstanding replies once, never an old-session pong.
             if sent_at and value.seq > pong_seq and time - sent_at < limit then
+                if owned and was_active and controller.remote_heartbeat then
+                    local ok, renewed = pcall(controller.remote_heartbeat)
+                    if not ok or renewed ~= true then lost("heartbeat_rejected"); return end
+                end
                 last_ok, pong_seq = time, value.seq
                 for seq in pairs(pings) do if seq <= pong_seq then pings[seq] = nil end end
                 -- Indication follows a valid reply, not a queued/unsent ping.
                 if deps.on_heartbeat then pcall(deps.on_heartbeat) end
             end
-        elseif value.type == "received" then last_ok = time
+        elseif value.type == "received" then
+            -- Unsequenced ACK receipts are not communication lease renewals.
+            -- A duplicate receipt or traffic accounting must not keep water on.
         elseif value.type == "offer" then
             if type(value.id) ~= "string" or #value.id ~= 32 or not value.id:match("^[a-f0-9]+$") or not ALLOWED[value.command] then
                 lost("invalid_offer"); return
             end
             if seen[value.id] or pending[value.id] then return end
-            if value.command == "STOP" then pending = {} end
+            if value.command == "STOP" or value.command == "FILL_TIMEOUT" or value.command == "DRAIN_TIMEOUT" then pending = {} end
             local off_target = ({FILL_OFF="FILL", DRAIN_OFF="DRAIN"})[value.command]
             if off_target then
                 for id, item in pairs(pending) do
@@ -176,20 +201,29 @@ function M.start(controller, config, deps)
             local ack = {id = value.id, status = "rejected", result = "invalid_or_expired_command"}
             if value.command == item.command and type(value.ttl_ms) == "number"
                 and value.ttl_ms > time - item.started and value.ttl_ms <= 8000 and time - item.started < 5000 then
+                local was_owned = owned
                 local action = value.command == "STOP" and raw_stop or controller[ALLOWED[value.command]]
+                if value.command == "FILL_TIMEOUT" or value.command == "DRAIN_TIMEOUT" then
+                    action = function() return controller.remote_timeout(value.command == "FILL_TIMEOUT" and "fill" or "drain") end
+                elseif value.command == "START" or value.command == "FILL" or value.command == "DRAIN" then
+                    action = function() return controller.remote_command(ALLOWED[value.command]) end
+                end
                 local called, ok, reason = pcall(action)
-                if value.command == "STOP" then owned = false end
+                if value.command == "STOP" or ((value.command == "FILL_TIMEOUT" or value.command == "DRAIN_TIMEOUT") and called and ok == true) then owned = false end
                 if not called then
                     ack.status, ack.result = "uncertain", "controller_exception_no_retry"
                     stop_outputs(); owned = false
                 else
                     ack.status = ok == true and "succeeded" or "rejected"
                     ack.result = (ok == true and "OK " or "ERROR ") .. value.command .. " " .. tostring(reason):sub(1,160)
-                    if ok == true and (value.command == "START" or value.command == "FILL" or value.command == "DRAIN") then owned = true end
+                    if ok == true and (value.command == "START" or value.command == "FILL" or value.command == "DRAIN") then
+                        owned = true
+                        if not was_active or not was_owned then last_ok = time end
+                    end
                 end
             end
-            last_ok = time
             local status, text = telemetry()
+            if not ACTIVE[status.state] then last_ok = time end
             if send({type = "ack", ack = ack, status = status}) then signature = text end
         else lost("invalid_type") end
     end

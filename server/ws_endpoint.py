@@ -11,7 +11,8 @@ SAFE_CLOSE_REASONS = frozenset((
     'auth_failed', 'another_device_active', 'firmware_mismatch', 'stale_session',
     'invalid_status', 'invalid_state', 'invalid_control_mode', 'invalid_flag',
     'invalid_level_or_cycle', 'invalid_message', 'message_too_large',
-    'invalid_claim', 'session_limit', 'unclaimed_ack', 'invalid_ack', 'invalid_type', 'invalid_traffic'))
+    'invalid_claim', 'session_limit', 'unclaimed_ack', 'invalid_ack', 'invalid_type', 'invalid_traffic',
+    'control_state_uncertain', 'control_unowned_output', 'control_protocol_changed', 'control_stop_unconfirmed'))
 
 
 def safe_close_reason(error):
@@ -46,11 +47,13 @@ def serve(handler):
         while True:
             with store.lock:
                 active = store.status and store.status.get('state') in ('DRAINING', 'SETTLING', 'FILLING', 'EXCHANGING')
-            deadline = 10 if active else 75
+                active = active or (store.web_limits and any(store.control_runs.values()))
+                deadline = (5 if store.web_limits else 10) if active else 75
             if time.monotonic() - last_rx > (deadline if authenticated else 30):
                 close_reason = 'heartbeat_timeout' if authenticated else 'auth_timeout'
                 break
             if authenticated:
+                store.control_tick(session)
                 offer = store.ws_offer(session)
                 if offer:
                     send(offer)
@@ -94,7 +97,7 @@ def serve(handler):
                         return
                     session = store.ws_open(message.get('status'), message.get('previous_session'))
                     authenticated = True
-                    send(dict(type='ready', session=session))
+                    send(dict(type='ready', session=session, soft_limits=dict(store.soft_limits)))
                 elif kind == 'ping':
                     store.ws_touch(session)
                     send(dict(type='pong', seq=message.get('seq')))

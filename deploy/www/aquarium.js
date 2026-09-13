@@ -10,6 +10,8 @@ const errors={login_required:'请先登录。',invalid_key:'管理密钥不正�
 const supportedManual=['0.7.0','0.7.1','0.7.2','0.7.3','0.7.4','0.7.5','0.7.6','0.7.7','0.8.0','0.8.1','0.8.2','0.8.3'];
 const refreshInterval=2000;
 let scene=null,snapshot=null,lastSnapshot=null,signedIn=false,lastSuccess=0,refreshRequest=null,authEpoch=0,busy=false,jobBusy=false,submittedId=null,formLoaded=false,refreshEnabled=true;
+const outputBusy={fill:false,drain:false};
+Object.assign(errors,{invalid_output_run:'作业参数不正确，请刷新后重试。',output_run_active:'已有补排作业正在执行，请先结束对应作业。',output_run_requires_web:'完整用时作业需要 0.8.2 / 0.8.3 手动模式。',output_run_requires_idle:'本路须关闭并确认就绪后才能开始作业。',output_run_requires_calibration:'请先在校准中保存本路完整用时。',stale_output_run:'本路作业已变化，请等待同步后再操作。',request_id_conflict:'请求标识已使用，请刷新后重试。'});
 Object.assign(errors,{invalid_level_target:'目标水位须为 0–100%。',level_job_active:'已有目标任务正在执行，请先停止。',level_job_requires_idle:'启动前设备须在线、就绪，且两路均已关闭。',level_job_requires_calibration:'水位估算尚未校准或已不确定，请按现场水位重新校准。',level_job_requires_web:'当前设备暂不支持目标水位任务。',level_target_reached:'当前估算已经达到目标水位。'});
 const jobReasons={done:'已按校准估算完成目标。',target_reached:'已达到预估目标水位。',cancelled_by_user:'已按你的要求停止任务。',manual_override:'手动操作已结束目标任务。',calibration_changed:'重新校准后，原目标任务已结束。',device_disconnected:'设备连接中断，目标任务已结束。',server_restarted:'服务重启，原目标任务未恢复。',output_unknown:'输出状态未知，目标任务已结束。',device_fault:'设备故障，目标任务已停止；请检查现场。',command_rejected:'设备拒绝指令，目标任务已结束。',start_timeout:'开启回执未确认，目标任务已结束。',stop_unconfirmed:'关断尚未确认，请检查设备状态。',estimate_uncertain:'水位估算不确定，请重新校准。'};
 
@@ -37,7 +39,7 @@ async function api(path,body,signal=AbortSignal.timeout(6000)){
   return data;
 }
 function cancelRefresh(){authEpoch++;refreshRequest?.abort();refreshRequest=null;}
-function showLogin(){cancelRefresh();refreshEnabled=false;signedIn=false;snapshot=null;lastSnapshot=null;submittedId=null;lastSuccess=0;formLoaded=false;jobBusy=false;closePanels();updateMenus();$('console').hidden=true;$('login-panel').hidden=false;$('logout').hidden=true;$('header-connection').textContent='未登录';$('header-connection').className='connection-pill';$('header-connection').removeAttribute('title');$('header-connection').setAttribute('aria-label','未登录');$('hero-status').textContent='登录后查看设备';$('hero-seen').textContent='';}
+function showLogin(){cancelRefresh();refreshEnabled=false;signedIn=false;snapshot=null;lastSnapshot=null;submittedId=null;lastSuccess=0;formLoaded=false;jobBusy=false;outputBusy.fill=outputBusy.drain=false;closePanels();updateMenus();$('console').hidden=true;$('login-panel').hidden=false;$('logout').hidden=true;$('header-connection').textContent='未登录';$('header-connection').className='connection-pill';$('header-connection').removeAttribute('title');$('header-connection').setAttribute('aria-label','未登录');$('hero-status').textContent='登录后查看设备';$('hero-seen').textContent='';}
 function setConnection(data,serviceOk=true){
   const connection=$('header-connection');
   const online=serviceOk&&data?.online===true,device=data?.device;
@@ -56,6 +58,33 @@ function webLimits(device){return ['0.8.2','0.8.3'].includes(device?.version)&&d
 function outputLimit(device,output){return ['0.8.1','0.8.2','0.8.3'].includes(device?.version)?(output==='fill'?180:300):supportedManual.includes(device?.version)?120:null;}
 function timedStopLabel(device){return webLimits(device)&&device.state==='IDLE'&&device.outputs_known==='1'&&device.fill==='0'&&device.drain==='0'?({stopped:'输出已关闭，可再次开启。',fill_timeout:'补水到时已关闭，可再次开启。',drain_timeout:'排水到时已关闭，可再次开启。'}[device.reason]||null):null;}
 function pendingFor(output){return snapshot?.commands?.find(item=>item.command===(output==='fill'?'FILL':'DRAIN')&&['queued','delivered'].includes(item.status));}
+function runningOutput(output,data=snapshot){const run=data?.output_runs?.[output];return run?.status==='running'?run:null;}
+function hasOutputRuns(data=snapshot){return ['fill','drain'].some(output=>runningOutput(output,data));}
+function calibratedDuration(output,data=snapshot){const seconds=data?.simulation?.[output+'_seconds'];return Number.isFinite(seconds)&&seconds>=1&&seconds<=86400?seconds:null;}
+function displayedOutputRun(output,data){
+  const run=data?.output_runs?.[output];
+  if(!webLimits(data?.device)||data?.level_job?.status==='running')return null;
+  if(!run)return null;
+  if(run.status==='running')return run;
+  if(data.device?.[output]==='1'||data.simulation?.calibrated_at>run.created_at||data.level_job?.created_at>run.created_at)return null;
+  if((data.commands||[]).some(item=>item.created>run.finished_at&&[output.toUpperCase(),output.toUpperCase()+'_OFF','STOP','START'].includes(item.command)&&!['rejected','cancelled','expired'].includes(item.status)))return null;
+  return run;
+}
+function canStartOutput(output){
+  const data=snapshot,device=data?.device,control=data?.control_limits;
+  if(!signedIn||!data?.online||Date.now()-lastSuccess>10000||!webLimits(device)||outputBusy[output]||jobBusy||busy)return false;
+  if(data.level_job?.status==='running'||runningOutput(output)||calibratedDuration(output)===null)return false;
+  if(device.ready!=='1'||device.outputs_known!=='1'||device.overflow!=='0'||device[output]!=='0'||!['IDLE','DONE','FILLING','DRAINING','EXCHANGING'].includes(device.state))return false;
+  if(control?.source!=='web'||control.uncertain||control.timeout_pending||control[output+'_on_since']!=null||control[output+'_deadline']!=null)return false;
+  return !(data.commands||[]).some(item=>['queued','delivered'].includes(item.status)&&[output.toUpperCase(),output.toUpperCase()+'_OFF','STOP','RESET','START'].includes(item.command));
+}
+function outputUsesRun(button){return !!button.dataset.output&&webLimits(snapshot?.device)&&(!!runningOutput(button.dataset.output)||switchCommand(button)===button.dataset.command);}
+function canOutputAction(button){
+  const output=button.dataset.output,run=runningOutput(output);
+  if(webLimits(snapshot?.device)&&snapshot?.level_job?.status==='running')return false;
+  if(!outputUsesRun(button))return can(switchCommand(button));
+  return run?!!snapshot&&signedIn&&Date.now()-lastSuccess<=10000&&!outputBusy[output]&&run.reason!=='cancelled_by_user':canStartOutput(output);
+}
 function switchCommand(button){
   const output=button.dataset.output,device=snapshot?.device;
   if(!output)return button.dataset.command;
@@ -73,10 +102,11 @@ function can(command){
   if(webLimits(device)&&(data.control_limits?.source!=='web'||data.control_limits?.uncertain||data.control_limits?.timeout_pending))return false;
   return ['FILL','DRAIN'].includes(command)&&supportedManual.includes(device.version)&&device.control_mode==='manual'&&device.ready==='1'&&device.outputs_known==='1'&&device.overflow==='0'&&(concurrent(device)?['IDLE','DONE','FILLING','DRAINING','EXCHANGING']:['IDLE','DONE']).includes(device.state);
 }
-const calibrationWaitNotice='请等待当前输出状态与关闭回执确认后再校准；目标任务轮间两路关闭时可以保存。';
+const calibrationWaitNotice='请先结束补排作业，并等待输出关闭确认后校准；目标水位任务可在轮间全关时校准。';
 function canCalibrate(){
   const data=snapshot,device=data?.device,control=data?.control_limits;
   if(!data?.online||Date.now()-lastSuccess>10000||device?.outputs_known!=='1'||device.fill!=='0'||device.drain!=='0')return false;
+  if(hasOutputRuns(data)||outputBusy.fill||outputBusy.drain)return false;
   if((data.commands||[]).some(item=>['FILL','DRAIN','START'].includes(item.command)&&['queued','delivered'].includes(item.status)))return false;
   if(control?.source==='web'&&(control.uncertain||control.timeout_pending||['fill_on_since','drain_on_since','fill_deadline','drain_deadline'].some(key=>control[key]!=null)))return false;
   return !(data.level_job?.status==='running'&&['starting','active','stopping'].includes(data.level_job.phase));
@@ -91,15 +121,20 @@ function renderControls(){
   const device=lastSnapshot?.device;
   for(const output of ['fill','drain']){
     const button=$(output+'-button'),on=device?.outputs_known==='1'&&device[output]==='1',known=device?.outputs_known==='1';
-    button.disabled=!can(switchCommand(button));
+    const run=runningOutput(output,lastSnapshot),previous=displayedOutputRun(output,lastSnapshot),web=webLimits(device);
+    button.disabled=!canOutputAction(button);
     button.classList.toggle('is-on',on);
+    button.classList.toggle('has-run',!!run);button.dataset.runPhase=run?.phase||'';
     button.setAttribute('aria-checked',on?'true':'false');
-    $(output+'-detail').textContent=!known?'状态未知':pendingFor(output)?'命令待设备确认':on?'已开启 · 点击独立关闭':'已关闭 · 点击开启';
+    const detail=!known?'状态未知':device.state==='FAULT'?'故障锁定 · 请先复位':run?(run.reason==='cancelled_by_user'?'正在结束 · 等待关断':run.phase==='waiting'?'等待下一轮 · 点击结束':run.phase==='starting'?'等待开启 · 点击结束':run.phase==='stopping'?'等待关闭 · 点击结束':'运行中 · 点击结束'):outputBusy[output]?'正在提交作业':pendingFor(output)?'命令待设备确认':on?'已开启 · 点击独立关闭':web&&calibratedDuration(output,lastSnapshot)===null?'未校准 · 请先校准用时':previous?({completed:'已完成',cancelled:'已结束',failed:'已中止'}[previous.status]||'已关闭')+' · 点击再运行':web?'已关闭 · 运行完整用时':'已关闭 · 点击开启';
+    $(output+'-detail').textContent=detail;
+    button.title=run?(on?'阀门已开启。':'阀门已关闭。')+detail:!on&&web?'每次累计运行 '+durationLabel(calibratedDuration(output,lastSnapshot))+'，按完整校准用时分轮；不会按当前水位缩短。':detail;
     $(output+'-state').textContent=!known?'未知':snapshot?.online?(on?'开启':'关闭'):(on?'上次上报：开启':'上次上报：关闭');
   }
   $('reset').disabled=!can('RESET');
   const deviceOnline=snapshot?.online===true;
   $('control-hint').textContent=!snapshot?'浏览器与服务连接中断，控制暂不可用。':!deviceOnline?'设备离线，等待重新连接。':!device?'等待设备状态。':!supportedManual.includes(device.version)?'当前固件不支持此手动控制页面。':device.control_mode!=='manual'?'设备处于自动模式，此处仅显示状态。':device.state==='FAULT'?'故障锁定，请检查现场后复位。':snapshot.control_limits?.timeout_pending?'已达到软上限，服务端正在确认全部关闭。':webLimits(device)&&(snapshot.control_limits?.source!=='web'||snapshot.control_limits?.uncertain)?'服务端计时待确认，暂不能开启。':device.state==='UNCONFIGURED'?'输出尚未配置。':timedStopLabel(device)?timedStopLabel(device):concurrent(device)?'两路可同时开启，并可分别关闭。':['FILLING','DRAINING'].includes(device.state)?'当前固件两路互锁；先关闭当前输出。':'当前固件两路互锁；升级 0.8.0 可同时开启。';
+  if(deviceOnline&&webLimits(device)&&device.ready==='1'&&device.outputs_known==='1'&&device.overflow==='0'&&device.state!=='FAULT'&&snapshot.control_limits?.source==='web'&&!snapshot.control_limits.uncertain&&!snapshot.control_limits.timeout_pending)$('control-hint').textContent=calibratedDuration('fill')===null||calibratedDuration('drain')===null?'请先在校准中填写补排用时，再运行完整作业。':'每次按完整校准用时分轮，两路可同时运行、独立结束。';
   renderLevelJob();
   renderCalibrationStatus();
 }
@@ -108,6 +143,30 @@ function renderProgress(data,serviceOk=true){
   const timing=web?control:sim;
   const fresh=serviceOk&&Date.now()-lastSuccess<=10000&&data?.online&&device?.outputs_known==='1';
   for(const output of ['fill','drain']){
+    const run=displayedOutputRun(output,data);
+    if(run){
+      const active=run.status==='running',advancing=active&&run.phase==='active'&&fresh&&device[output]==='1'&&!control.uncertain;
+      const additional=advancing?Math.min(Math.max(0,(Date.now()-lastSuccess)/1000),run.remaining_seconds||0,run.round_remaining_seconds??Infinity):0;
+      const elapsed=Number.isFinite(run.elapsed_seconds)?run.elapsed_seconds+additional:null,remaining=Number.isFinite(run.remaining_seconds)?Math.max(0,run.remaining_seconds-additional):null;
+      $(output+'-progress-label').textContent='第 '+run.round+'/'+run.estimated_rounds+' 轮';
+      $(output+'-countdown-label').textContent='本次剩余';
+      $(output+'-progress-text').textContent=(elapsed===null?'—':Math.floor(elapsed))+' / '+(run.total_seconds??'—')+' 秒';
+      $(output+'-progress').style.width=Number.isFinite(run.total_seconds)&&run.total_seconds>0&&elapsed!==null?Math.min(100,elapsed/run.total_seconds*100)+'%':'0%';
+      $(output+'-countdown').textContent=run.status==='failed'?'已中止':run.status==='cancelled'?'已结束':active&&!fresh?'—':active&&run.reason==='cancelled_by_user'?'结束中':active&&run.phase==='stopping'&&remaining<=0?'关断中':etaLabel(remaining);
+      $(output+'-countdown').classList.toggle('is-ending',active&&remaining!==null&&remaining<=30);
+      continue;
+    }
+    $(output+'-progress-label').textContent=output==='fill'?'补水运行':'排水运行';
+    $(output+'-countdown-label').textContent='预计剩余';
+    const duration=calibratedDuration(output,data),pending=(data?.commands||[]).some(item=>['queued','delivered'].includes(item.status)&&[output.toUpperCase(),output.toUpperCase()+'_OFF','STOP','START','RESET'].includes(item.command));
+    if(web&&fresh&&device[output]==='0'&&device.ready==='1'&&device.overflow==='0'&&device.state!=='FAULT'&&data.level_job?.status!=='running'&&!pending&&control.source==='web'&&!control.uncertain&&!control.timeout_pending&&control[output+'_on_since']==null&&control[output+'_deadline']==null&&duration!==null){
+      $(output+'-countdown-label').textContent='完整用时';
+      $(output+'-countdown').textContent=etaLabel(duration);
+      $(output+'-countdown').classList.remove('is-ending');
+      $(output+'-progress-text').textContent='0 / '+duration+' 秒';
+      $(output+'-progress').style.width='0%';
+      continue;
+    }
     const on=fresh&&device[output]==='1',limit=web?control[output+'_seconds']:outputLimit(device,output);
     const since=timing[output+'_on_since'],deadline=control[output+'_deadline'];
     const valid=on&&!timing.uncertain&&Number.isFinite(since)&&Number.isFinite(limit)&&(!web||(control.source==='web'&&Number.isFinite(deadline)));
@@ -119,8 +178,8 @@ function renderProgress(data,serviceOk=true){
     $(output+'-countdown').classList.toggle('is-ending',remaining!==null&&remaining<=30);
   }
   const limitsKnown=Number.isFinite(outputLimit(device,'fill'));
-  $('control-timeout-note').textContent=!limitsKnown?'限时待设备确认 · 开关以设备回执为准':web?'服务端限时：补水 3 分钟 · 排水 5 分钟':['0.8.1','0.8.2','0.8.3'].includes(device.version)?'补水限时 3 分钟 · 排水限时 5 分钟':'当前固件两路各限时 120 秒';
-  $('device-timeout-note').textContent=!limitsKnown?'等待设备确认当前保护时限。':web?'手动控制由服务端执行补水 180 秒、排水 300 秒软上限，到时关闭全部，确认关闭后可再次开启。目标水位任务按补水 170 秒、排水 290 秒分轮，确认关闭后等待 2 秒再继续。关闭网页后服务端仍执行；固件失去有效通信后最多 5 秒关断。真正故障仍需检查后复位。':device.version==='0.8.1'?'当前固件保护：补水最多 180 秒，排水最多 300 秒。两路分别计时，重复开启不会延长计时。到时关闭全部并锁存故障，需复位。':'当前固件每路最多 120 秒，到时关闭全部并锁存故障。';
+  $('control-timeout-note').textContent=!limitsKnown?'限时待设备确认 · 开关以设备回执为准':web?'自动分轮：补水 170 秒 · 排水 290 秒':['0.8.1','0.8.2','0.8.3'].includes(device.version)?'补水限时 3 分钟 · 排水限时 5 分钟':'当前固件两路各限时 120 秒';
+  $('device-timeout-note').textContent=!limitsKnown?'等待设备确认当前保护时限。':web?'主开关每次累计运行完整的校准用时：补水按空到满用时，排水按满到空用时，不按当前水位缩短，水位估算到 0% / 100% 也不会提前停。服务端按补水每轮最多 170 秒、排水 290 秒执行，确认本路关闭后等待 2 秒，等待不计入运行时长。两路可以同时作业、分别结束。关闭网页后服务端仍执行；每路 180 / 300 秒软上限与固件失联最多 5 秒关断保护保留。真正故障仍需检查后复位。':device.version==='0.8.1'?'当前固件保护：补水最多 180 秒，排水最多 300 秒。两路分别计时，重复开启不会延长计时。到时关闭全部并锁存故障，需复位。':'当前固件每路最多 120 秒，到时关闭全部并锁存故障。';
 }
 function renderWaterEstimate(data,serviceOk=true){
   const sim=data?.simulation||{},device=data?.device;
@@ -131,7 +190,8 @@ function renderWaterEstimate(data,serviceOk=true){
   for(const output of ['fill','drain']){
     const rate=sim[output+'_rate_lpm'];
     $(output+'-rate').textContent=rateLabel(rate);
-    $(output+'-volume').textContent=waterLabel(sim[output+'_run_liters']);
+    const run=displayedOutputRun(output,data);
+    $(output+'-volume').textContent=waterLabel(run?run.estimated_liters:sim[output+'_run_liters']);
     $(output+'-total').textContent=waterLabel(sim[output+'_total_liters']);
   }
   const net=trusted&&Number.isFinite(sim.net_lpm)?sim.net_lpm:null;
@@ -153,7 +213,7 @@ function renderLevel(data){
   $('level-value').textContent=!calibrated?'未校准':level.toLocaleString('zh-CN',{maximumFractionDigits:1})+'%';
   $('level-detail').textContent=!calibrated?'示意水面 · 请先校准':sim.uncertain?'估算不确定 · 需校准':data.online?'按输出状态推算':'设备离线 · 模拟暂停';
   $('scene-status').textContent=!calibrated?'场景示意':sim.uncertain?'估算不确定':data.online?'模拟同步中':'模拟已暂停';
-  $('model-note').textContent=!calibrated?'没有水位传感器。填写历史满缸与空缸用时，并按现场已知水位校准，才能开始估算。':sim.uncertain?'工作期间通信中断或服务重启，实际停止时刻无法确认。请到现场核实并重新校准；旧估算不会继续推进。':'0.8.2 / 0.8.3 根据本次连接已确认的开关状态、有效心跳和校准速率估算水位，双路同时开启时按净变化计算。这里不是实测水位；心跳不会清除已有的不确定历史。';
+  $('model-note').textContent=!calibrated?'没有水位传感器。填写历史满缸与空缸用时，并按现场已知水位校准，才能开始估算。':sim.uncertain?'工作期间通信中断或服务重启，实际停止时刻无法确认。请到现场核实并重新校准；旧水位估算不会继续推进。主开关仍可按已保存的完整用时执行，不会因此解除水位不确定。':'0.8.2 / 0.8.3 根据本次连接已确认的开关状态、有效心跳和校准速率估算水位，双路同时开启时按净变化计算。这里不是实测水位；心跳不会清除已有的不确定历史。';
   renderCalibrationStatus();
   if(!formLoaded){if(calibrated){$('fill-seconds').value=String(sim.fill_seconds);$('drain-seconds').value=String(sim.drain_seconds);$('anchor-level').value=String(Math.round(sim.level));$('capacity-liters').value=Number.isFinite(sim.capacity_liters)?String(sim.capacity_liters):'';}formLoaded=true;}
   renderWaterEstimate(data);
@@ -169,6 +229,7 @@ function jobStartReason(preview=jobPreview()){
   const data=snapshot,device=data?.device,sim=data?.simulation||{};
   if(!signedIn||!data||Date.now()-lastSuccess>10000)return '状态同步中断，请等待重新同步。';
   if(data.level_job?.status==='running')return '任务正在执行；先停止当前任务才能设置新目标。';
+  if(hasOutputRuns(data)||outputBusy.fill||outputBusy.drain)return '请先结束补水和排水作业，再设置目标水位任务。';
   if(busy||jobBusy)return '正在提交，请等待服务端确认。';
   if(!data.online)return '设备离线，暂不能开始任务。';
   if(!webLimits(device))return '目标任务需要 0.8.2 / 0.8.3 手动模式。';
@@ -266,7 +327,22 @@ function updateClock(){if(!signedIn||!lastSnapshot||document.hidden)return;setCo
 $('login-form').addEventListener('submit',async event=>{event.preventDefault();const button=event.target.querySelector('button');button.disabled=true;try{await api('login',{key:$('key').value});cancelRefresh();refreshEnabled=true;$('key').value='';setMessage('');await refresh();}catch(error){setMessage(error.message);}finally{button.disabled=false;}});
 $('logout').addEventListener('click',async()=>{try{await api('logout',{});showLogin();setMessage('已退出。');}catch(error){setMessage(error.message);}});
 async function confirmReset(){const dialog=$('confirm');dialog.returnValue='cancel';dialog.showModal();return new Promise(resolve=>dialog.addEventListener('close',()=>resolve(dialog.returnValue==='ok'),{once:true}));}
+async function submitOutputRun(output){
+  const button=$(output+'-button');if(!canOutputAction(button))return;
+  const run=runningOutput(output),epoch=authEpoch,name=output==='fill'?'补水':'排水';
+  outputBusy[output]=true;renderControls();
+  try{
+    const body=run?{direction:output,run_id:run.id}:{direction:output,id:Array.from(crypto.getRandomValues(new Uint8Array(16)),value=>value.toString(16).padStart(2,'0')).join('')};
+    await api(run?'output-run/cancel':'output-run',body);
+    if(epoch!==authEpoch)return;
+    setFeedback(name+(run?'停止请求已提交，等待本路关闭确认。':'作业已提交，等待设备回执。'));
+    await refresh();
+  }catch(error){if(epoch===authEpoch){if(error.status===401){showLogin();return;}setFeedback(error.message+' 请等待同步后核实本路作业状态。');}}
+  finally{if(epoch===authEpoch){outputBusy[output]=false;renderControls();}}
+}
 for(const button of document.querySelectorAll('[data-command]'))button.addEventListener('click',async()=>{
+  if(button.dataset.output&&!canOutputAction(button))return;
+  if(outputUsesRun(button)){await submitOutputRun(button.dataset.output);return;}
   const command=switchCommand(button);
   if(!can(command)||command==='RESET'&&!await confirmReset()||!can(command)||switchCommand(button)!==command)return;
   busy=true;renderControls();

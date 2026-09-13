@@ -86,3 +86,5 @@ h1,h2{font-size:22px;font-weight:600;letter-spacing:-.025em;margin:0;color:#f2fa
 @media(max-height:520px) and (min-width:701px){.job-summary{min-height:0;font-size:11px}.target-button{min-height:36px;font-size:11px}}
 
 .job-totals{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;border-top:1px solid var(--line);margin-top:14px;padding-top:12px}.job-totals span{display:block;font-size:10px;color:#8fb8c1;line-height:1.5}.job-totals strong{display:block;color:#c4e9e3;font-size:14px;font-variant-numeric:tabular-nums;margin-top:5px;line-height:1.6;overflow-wrap:anywhere}
+
+.water-switch.has-run:not(.is-on){border-style:dashed;border-color:#8daea8}

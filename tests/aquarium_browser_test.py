@@ -261,6 +261,22 @@ def sync_status(page):
     assert response.value.ok, response.value.text()
 
 
+def post_from_page(page, path, body):
+    """Use the real page's same-origin login cookie for local HTTP assertions."""
+    return page.evaluate("""async ({path, body}) => {
+      const response = await fetch('./api/' + path, {method:'POST', credentials:'same-origin',
+        headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
+      return {status:response.status, body:await response.json()};
+    }""", dict(path=path, body=body))
+
+
+def post_control(page, command):
+    request_id = page.evaluate("crypto.randomUUID().replaceAll('-','')")
+    response = post_from_page(page, 'commands', dict(command=command, id=request_id))
+    assert response['status'] == 202, response
+    return response['body']
+
+
 def expect_countdown(page, output, seconds):
     selector = '#' + output + '-countdown'
     if seconds is None:
@@ -626,9 +642,14 @@ def assert_web_soft_limits(page, store, clock, output, version='0.8.2'):
             report(seconds=1)
 
     def apply_command(selector, expected_command, **changes):
-        with page.expect_response('**/api/commands') as response:
-            page.locator(selector).click()
-        assert response.value.ok, response.value.text()
+        if expected_command == 'RESET':
+            with page.expect_response('**/api/commands') as response:
+                page.locator(selector).click()
+            assert response.value.ok, response.value.text()
+        else:
+            # Raw soft-limit protocol checks deliberately bypass the main
+            # switches, which now start a full calibrated-duration operation.
+            post_control(page, expected_command)
         offer = store.ws_offer(session)
         assert offer and offer['command'] == expected_command, offer
         execute = store.ws_claim(session, offer['id'])
@@ -643,8 +664,8 @@ def assert_web_soft_limits(page, store, clock, output, version='0.8.2'):
         expect(page.locator('#device-timeout-note')).to_contain_text('5 秒')
         expect(page.locator('#fill-button')).to_be_enabled()
         expect(page.locator('#estimate-status')).to_contain_text('不确定')
-        expect_countdown(page, 'fill', None)
-        expect_countdown(page, 'drain', None)
+        expect_countdown(page, 'fill', 100)
+        expect_countdown(page, 'drain', 200)
         apply_command('#fill-button', 'FILL', state='FILLING', fill='1', reason='manual_filling')
         advance(10)
         apply_command('#drain-button', 'DRAIN', state='EXCHANGING', drain='1', reason='manual_exchanging')
@@ -657,7 +678,7 @@ def assert_web_soft_limits(page, store, clock, output, version='0.8.2'):
         advance(5)
         sync_status(page)
         apply_command('#fill-button', 'FILL_OFF', state='DRAINING', fill='0', reason='manual_draining')
-        expect_countdown(page, 'fill', None)
+        expect_countdown(page, 'fill', 100)
         expect_countdown(page, 'drain', 295)
         apply_command('#fill-button', 'FILL', state='EXCHANGING', fill='1', reason='manual_exchanging')
         expect_countdown(page, 'fill', 180)
@@ -717,15 +738,11 @@ def assert_web_soft_limits(page, store, clock, output, version='0.8.2'):
             sync_status(page)
             for name in ('fill', 'drain'):
                 expect(page.locator('#' + name + '-button')).to_have_attribute('aria-checked', 'false')
-                expect_countdown(page, name, None)
+                expect_countdown(page, name, (100 if name == 'fill' else 200) if unlocked_timeout else None)
             if unlocked_timeout:
                 expect(page.locator('#header-connection')).to_contain_text('设备正常')
                 expect(page.locator('#device-state')).to_have_text('待机')
                 expect(page.locator('#control-hint')).not_to_contain_text('故障锁定')
-                if version == '0.8.3':
-                    expect(page.locator('#control-hint')).to_contain_text('到时已关闭，可再次开启')
-                else:
-                    expect(page.locator('#control-hint')).to_contain_text('输出已关闭，可再次开启')
                 expect(page.locator('#fill-button')).to_be_enabled()
                 expect(page.locator('#drain-button')).to_be_enabled()
                 expect(page.locator('#reset')).to_be_disabled()
@@ -788,7 +805,7 @@ def assert_web_soft_limits(page, store, clock, output, version='0.8.2'):
             new_limits = store.snapshot()['control_limits']
             assert new_limits['fill_on_since'] > restarted
             assert new_limits['fill_deadline'] - new_limits['fill_on_since'] == 180
-            expect_countdown(page, 'drain', None)
+            expect_countdown(page, 'drain', 200)
             advance(1)
             sync_status(page)
             expect_countdown(page, 'fill', 179)
@@ -911,9 +928,7 @@ def assert_level_heartbeats(page, store, clock, server, output):
         sync_status(page)
 
     def command(output_name, expected_command, **changes):
-        with page.expect_response('**/api/commands') as response:
-            page.locator('#' + output_name + '-button').click()
-        assert response.value.ok, response.value.text()
+        post_control(page, expected_command)
         receipt(expected_command, **changes)
 
     def ping(seconds=1):
@@ -1019,9 +1034,7 @@ def assert_level_heartbeats(page, store, clock, server, output):
         # cannot turn a known OFF output into estimated moving water.
         advance(20)
         assert store.snapshot()['simulation']['level'] == 100
-        with page.expect_response('**/api/commands') as response:
-            page.locator('#drain-button').click()
-        assert response.value.ok
+        post_control(page, 'DRAIN')
         on = claim('DRAIN')
         advance(3)
         assert store.snapshot()['simulation']['level'] == 100
@@ -1216,8 +1229,368 @@ def assert_level_heartbeats(page, store, clock, server, output):
         close_device()
 
 
+def assert_calibrated_runs(browser, output):
+    """Two calibrated operations over real local HTTP/WS, with physical ACKs."""
+    clock = [time.time()]
+    store = Store(':memory:', lambda: clock[0])
+    server = Server(('127.0.0.1', 0), store, 'runs-admin-key-' * 3, 'runs-device-key-' * 3, '')
+    server.RequestHandlerClass = StaticHandler
+    server.origin = 'http://127.0.0.1:' + str(server.server_port)
+    worker = threading.Thread(target=server.serve_forever, daemon=True)
+    worker.start()
+    context = browser.new_context(viewport=dict(width=1440, height=900), device_scale_factor=1)
+    page = context.new_page()
+    errors, inbox, trace = [], [], []
+    page.on('pageerror', lambda error: errors.append(str(error)))
+    status = dict(project='water_auto_exchange', version='0.8.2', control_mode='manual',
+                  state='IDLE', reason='ready', ready='1', fill='0', drain='0', outputs_known='1',
+                  need_fill='unknown', overflow='0', cycle='0', overflow_protection='0')
+    client, seq, heartbeat = None, 0, None
+    wire = threading.RLock()
+    heartbeat_stop = threading.Event()
+    heartbeat_errors = []
+
+    def receive(kind):
+        for index, frame in enumerate(inbox):
+            if frame['type'] == kind:
+                return inbox.pop(index)
+        for _ in range(20):
+            raw = client.recv()
+            assert raw, ('Local device unexpectedly disconnected', store.snapshot())
+            frame = json.loads(raw)
+            if frame['type'] == kind:
+                return frame
+            inbox.append(frame)
+        raise AssertionError((kind, inbox))
+
+    def ping(seconds=1):
+        nonlocal seq
+        with wire:
+            clock[0] += seconds
+            seq += 1
+            client.send(json.dumps(dict(type='ping', seq=seq)))
+            assert receive('pong') == dict(type='pong', seq=seq)
+            snapshot = store.snapshot()
+            assert snapshot['online'], snapshot
+            return snapshot
+
+    def close_device():
+        nonlocal client, heartbeat
+        heartbeat_stop.set()
+        if heartbeat:
+            heartbeat.join(timeout=5)
+            assert not heartbeat.is_alive()
+            heartbeat = None
+        assert not heartbeat_errors, heartbeat_errors
+        if client:
+            client.close()
+            client = None
+            for _ in range(100):
+                if store.ws_gateway is None:
+                    break
+                time.sleep(.01)
+            assert store.ws_gateway is None
+
+    def open_device():
+        nonlocal client, seq, heartbeat
+        close_device()
+        inbox.clear()
+        seq = 0
+        status.update(state='IDLE', reason='ready', ready='1', fill='0', drain='0')
+        client = websocket.create_connection('ws://127.0.0.1:%d/water/api/device/ws' % server.server_port, timeout=3)
+        client.send(json.dumps(dict(type='auth', key=server.device_key, status=status)))
+        assert receive('ready')['soft_limits']['watchdog_ms'] == 5000
+        heartbeat_stop.clear()
+
+        def keep_alive():
+            # Device networking continues during slow screenshots and dialogs.
+            # These pings keep real WS time alive without advancing fake water time.
+            while not heartbeat_stop.wait(.5):
+                try:
+                    ping(0)
+                except Exception as error:
+                    heartbeat_errors.append(error)
+                    return
+
+        heartbeat = threading.Thread(target=keep_alive, daemon=True)
+        heartbeat.start()
+
+    def receipt(command):
+        with wire:
+            offer = receive('offer')
+            assert offer['command'] == command, (command, offer, trace)
+            client.send(json.dumps(dict(type='claim', id=offer['id'])))
+            execute = receive('execute')
+            assert execute['id'] == offer['id'] and execute['command'] == command, execute
+            if command in ('FILL', 'DRAIN'):
+                status[command.lower()] = '1'
+            elif command in ('FILL_OFF', 'DRAIN_OFF'):
+                status[command[:-4].lower()] = '0'
+            elif command == 'STOP':
+                status.update(fill='0', drain='0')
+            else:
+                raise AssertionError(('Unexpected command for a calibrated run', command))
+            active = (status['fill'] == '1', status['drain'] == '1')
+            state, reason = { (True, True):('EXCHANGING', 'manual_exchanging'),
+                              (True, False):('FILLING', 'manual_filling'),
+                              (False, True):('DRAINING', 'manual_draining'),
+                              (False, False):('IDLE', 'stopped') }[active]
+            status.update(state=state, reason=reason)
+            client.send(json.dumps(dict(type='ack', status=status,
+                ack=dict(id=offer['id'], status='succeeded', result='OK ' + command))))
+            receive('received')
+            trace.append((command, clock[0], status['fill'], status['drain']))
+
+    def run(direction):
+        return store.snapshot()['output_runs'][direction]
+
+    def advance(seconds):
+        for _ in range(seconds):
+            ping()
+        assert not heartbeat_errors, heartbeat_errors
+
+    def calibrate(level=40, fill_seconds=200, drain_seconds=400):
+        sync_status(page)
+        open_dialog(page, 'calibration')
+        for field, value in [('anchor-level', level), ('fill-seconds', fill_seconds),
+                             ('drain-seconds', drain_seconds), ('capacity-liters', 60)]:
+            page.locator('#' + field).fill(str(value))
+        with page.expect_response('**/api/simulation') as response:
+            page.locator('#save-calibration').click()
+        assert response.value.ok, response.value.text()
+        close_dialog(page, 'calibration')
+        sync_status(page)
+
+    def switch(direction, cancel=False):
+        path = '**/api/output-run/cancel' if cancel else '**/api/output-run'
+        with page.expect_response(path) as response:
+            page.locator('#' + direction + '-button').click()
+        assert response.value.ok, response.value.text()
+        return response.value.json()
+
+    def assert_stays_stopped(direction, seconds=5):
+        before = len(trace)
+        advance(seconds)
+        assert run(direction)['status'] != 'running', run(direction)
+        assert status[direction] == '0'
+        assert len(trace) == before
+        with wire:
+            assert not any(frame['type'] == 'offer' and frame.get('command') == direction.upper() for frame in inbox), inbox
+
+    try:
+        open_device()
+        page.goto(server.origin + '/water/')
+        page.locator('#key').fill(server.admin_key)
+        page.locator('#login-form button[type="submit"]').click()
+        expect(page.locator('#console')).to_be_visible()
+        expect(page.locator('#version')).to_have_text('v0.8.2')
+        for direction in ('fill', 'drain'):
+            expect(page.locator('#' + direction + '-button')).to_be_disabled()
+        expect(page.locator('#control-hint')).to_contain_text('校准')
+        refused = post_from_page(page, 'output-run', dict(direction='drain', id='1' * 32))
+        assert refused['status'] == 409, refused
+        assert not store.snapshot()['simulation']['calibrated']
+
+        calibrate(fill_seconds=60)
+        expect_countdown(page, 'fill', 60)
+        expect(page.locator('#fill-countdown-label')).to_have_text('完整用时')
+        expect(page.locator('#fill-progress-text')).to_have_text('0 / 60 秒')
+        calibrate()
+        for direction, seconds in [('fill', 200), ('drain', 400)]:
+            expect_countdown(page, direction, seconds)
+            expect(page.locator('#' + direction + '-countdown-label')).to_have_text('完整用时')
+            expect(page.locator('#' + direction + '-progress-text')).to_have_text('0 / %d 秒' % seconds)
+        switch('drain')
+        drain_id = run('drain')['id']
+        expect(page.locator('#drain-button')).to_have_attribute('aria-checked', 'false')
+        # An independent request is allowed before the other ON is acknowledged;
+        # the service still serializes the actual WS command/ACK exchange.
+        expect(page.locator('#fill-button')).to_be_enabled()
+        switch('fill')
+        fill_id = run('fill')['id']
+        receipt('DRAIN')
+        receipt('FILL')
+        started = clock[0]
+        sync_status(page)
+        for direction in ('fill', 'drain'):
+            expect(page.locator('#' + direction + '-button')).to_have_attribute('aria-checked', 'true')
+        open_dialog(page, 'calibration')
+        expect(page.locator('#save-calibration')).to_be_disabled()
+        close_dialog(page, 'calibration')
+        open_dialog(page, 'level-job')
+        expect(page.locator('#start-level-job')).to_be_disabled()
+        close_dialog(page, 'level-job')
+        assert post_from_page(page, 'level-job', dict(target_level=80))['status'] == 409
+        duplicate = post_from_page(page, 'output-run', dict(direction='drain', id=drain_id))
+        assert duplicate['status'] == 202 and run('drain')['id'] == drain_id, duplicate
+        advance(10)
+        assert run('fill')['elapsed_seconds'] == run('drain')['elapsed_seconds'] == 10
+        assert run('fill')['remaining_seconds'] == 190 and run('drain')['remaining_seconds'] == 390
+        page.reload()
+        expect(page.locator('#console')).to_be_visible()
+        assert run('drain')['id'] == drain_id and run('fill')['id'] == fill_id
+        expect_countdown(page, 'fill', 190)
+        expect_countdown(page, 'drain', 390)
+        expect_number(page, '#fill-volume', 3)
+        expect_number(page, '#drain-volume', 1.5)
+        for width, height, name in [(1440, 900, 'desktop'), (390, 844, 'mobile'), (360, 640, 'mobile-small')]:
+            page.set_viewport_size(dict(width=width, height=height))
+            assert_one_screen(page)
+            page.screenshot(path=str(output / ('calibrated-runs-' + name + '.png')), full_page=True)
+
+        page.goto('about:blank')
+        advance(160)
+        assert run('fill')['phase'] == 'stopping' and run('drain')['phase'] == 'active'
+        receipt('FILL_OFF')
+        assert status['drain'] == '1' and run('fill')['phase'] == 'waiting'
+        advance(1)
+        assert run('fill')['phase'] == 'waiting'
+        advance(1)
+        receipt('FILL')
+        advance(30)
+        receipt('FILL_OFF')
+        assert run('fill')['status'] == 'completed' and run('fill')['elapsed_seconds'] == 200, run('fill')
+        assert math.isclose(run('fill')['estimated_liters'], 60, abs_tol=1e-7)
+        assert run('drain')['status'] == 'running' and status['drain'] == '1'
+        page.goto(server.origin + '/water/')
+        expect(page.locator('#console')).to_be_visible()
+        expect(page.locator('#fill-button')).to_have_attribute('aria-checked', 'false')
+        expect(page.locator('#drain-button')).to_have_attribute('aria-checked', 'true')
+        expect_number(page, '#fill-volume', 60)
+        expect_number(page, '#drain-volume', 30.3)
+        completed_duplicate = post_from_page(page, 'output-run', dict(direction='fill', id=fill_id))
+        assert completed_duplicate['status'] == 202 and run('fill')['status'] == 'completed', completed_duplicate
+        advance(88)
+        receipt('DRAIN_OFF')
+        sync_status(page)
+        expect(page.locator('#drain-button')).to_have_attribute('aria-checked', 'false')
+        expect_countdown(page, 'drain', 110)
+        expect_number(page, '#drain-volume', 43.5)
+        expect(page.locator('#drain-detail')).to_contain_text('结束')
+        page.screenshot(path=str(output / 'calibrated-runs-waiting-mobile.png'), full_page=True)
+        advance(2)
+        receipt('DRAIN')
+        advance(110)
+        receipt('DRAIN_OFF')
+        assert run('drain')['status'] == 'completed' and run('drain')['elapsed_seconds'] == 400, run('drain')
+        assert math.isclose(run('drain')['estimated_liters'], 60, abs_tol=1e-7)
+        assert math.isclose(store.snapshot()['simulation']['level'], 40, abs_tol=1e-6)
+        assert clock[0] - started == 402
+        assert [event[0] for event in trace] == ['DRAIN', 'FILL', 'FILL_OFF', 'FILL', 'FILL_OFF', 'DRAIN_OFF', 'DRAIN', 'DRAIN_OFF'], trace
+        assert_stays_stopped('fill')
+        assert_stays_stopped('drain')
+
+        # Empty estimated water is not the completion condition of a full-time
+        # operation; continue until its duration or an explicit per-output cancel.
+        sync_status(page)
+        switch('drain')
+        receipt('DRAIN')
+        advance(160)
+        assert store.snapshot()['simulation']['level'] <= 1e-6
+        assert run('drain')['status'] == 'running' and run('drain')['remaining_seconds'] == 240
+        advance(130)
+        receipt('DRAIN_OFF')
+        sync_status(page)
+        assert run('drain')['phase'] == 'waiting'
+        paused_id = run('drain')['id']
+        expect(page.locator('#drain-button')).to_have_attribute('aria-checked', 'false')
+        expect(page.locator('#drain-detail')).to_contain_text('结束')
+        switch('fill')
+        receipt('FILL')
+        sync_status(page)
+        switch('drain', cancel=True)
+        receipt('DRAIN_OFF')
+        assert run('drain')['status'] == 'cancelled' and run('drain')['id'] == paused_id
+        assert status['fill'] == '1' and run('fill')['status'] == 'running'
+        advance(3)
+        sync_status(page)
+        switch('fill', cancel=True)
+        receipt('FILL_OFF')
+        assert run('fill')['status'] == 'cancelled'
+        assert_stays_stopped('drain')
+
+        calibrate()
+        switch('drain')
+        receipt('DRAIN')
+        advance(3)
+        frozen_level = store.snapshot()['simulation']['level']
+        close_device()
+        assert run('drain')['status'] == 'failed'
+        clock[0] += 6
+        open_device()
+        assert_stays_stopped('drain')
+        sync_status(page)
+        assert store.snapshot()['simulation']['uncertain']
+        expect(page.locator('#estimate-status')).to_contain_text('不确定')
+        expect(page.locator('#fill-button')).to_be_enabled()
+        switch('fill')
+        receipt('FILL')
+        advance(170)
+        receipt('FILL_OFF')
+        advance(2)
+        receipt('FILL')
+        advance(30)
+        receipt('FILL_OFF')
+        assert run('fill')['status'] == 'completed' and run('fill')['elapsed_seconds'] == 200
+        assert math.isclose(run('fill')['estimated_liters'], 60, abs_tol=1e-7)
+        assert store.snapshot()['simulation']['uncertain'] and store.snapshot()['simulation']['level'] == frozen_level
+        sync_status(page)
+        expect(page.locator('#estimate-status')).to_contain_text('不确定')
+        expect_number(page, '#fill-volume', 60)
+
+        # Align two physical round deadlines: draining starts 120 seconds
+        # before filling, so both ordinary OFFs are due at elapsed 290.
+        # Each acknowledged OFF must preserve the other output's latest state.
+        calibrate()
+        switch('drain')
+        receipt('DRAIN')
+        advance(120)
+        sync_status(page)
+        switch('fill')
+        receipt('FILL')
+        advance(170)
+        assert run('fill')['phase'] == run('drain')['phase'] == 'stopping'
+        receipt('FILL_OFF')
+        assert status['fill'] == '0' and status['drain'] == '1'
+        receipt('DRAIN_OFF')
+        assert run('fill')['phase'] == run('drain')['phase'] == 'waiting'
+        sync_status(page)
+        switch('fill', cancel=True)
+        receipt('FILL_OFF')
+        sync_status(page)
+        switch('drain', cancel=True)
+        receipt('DRAIN_OFF')
+        assert_stays_stopped('fill')
+        assert_stays_stopped('drain')
+
+        # Custom-level tasks still own the controls exclusively while active.
+        calibrate()
+        assert post_from_page(page, 'level-job', dict(target_level=41))['status'] == 202
+        sync_status(page)
+        for direction in ('fill', 'drain'):
+            expect(page.locator('#' + direction + '-button')).to_be_disabled()
+        assert post_from_page(page, 'output-run', dict(direction='drain', id='2' * 32))['status'] == 409
+        receipt('FILL')
+        advance(2)
+        receipt('FILL_OFF')
+        assert store.snapshot()['level_job']['status'] == 'completed'
+        assert not errors, errors
+        print('PASS calibrated runs: real WS 0.8.2 bare pings, concurrent fill200/drain400, '
+              '170+30 and 290+110 with confirmed 2-second gaps, simultaneous OFF boundaries, independent completion/cancel, '
+              'physical aria and cross-round totals, full duration beyond estimated empty, '
+              'idempotent active/completed IDs, close/reload persistence, missing calibration/owned-task guards, '
+              'uncertain water remains uncertain while calibrated timed work completes, no reconnect restart, three viewports')
+    finally:
+        close_device()
+        context.close()
+        server.shutdown()
+        server.server_close()
+        worker.join()
+        store.db.close()
+
+
 def main(layout_only=False, estimates_only=False, countdowns_only=False, soft_limits_only=False,
-         level_heartbeats_only=False):
+         level_heartbeats_only=False, calibrated_runs_only=False):
     # A controlled clock keeps simulated device connectivity stable during UI work.
     now = [time.time()]
     store = Store(':memory:', lambda: now[0])
@@ -1268,6 +1641,10 @@ def main(layout_only=False, estimates_only=False, countdowns_only=False, soft_li
         with sync_playwright() as p:
             browser = p.chromium.launch(channel='msedge', headless=True,
                 args=['--enable-webgl', '--use-gl=angle', '--use-angle=swiftshader'])
+            if calibrated_runs_only:
+                assert_calibrated_runs(browser, output)
+                browser.close()
+                return
             context = browser.new_context(viewport={'width': 1440, 'height': 900}, device_scale_factor=1)
             page = context.new_page()
             errors = []
@@ -1512,6 +1889,7 @@ def main(layout_only=False, estimates_only=False, countdowns_only=False, soft_li
             report()
             sync_status(page)
             assert_level_heartbeats(page, store, now, server, output)
+            assert_calibrated_runs(browser, output)
             report()
             sync_status(page)
             store.gateway = None
@@ -1545,4 +1923,5 @@ def main(layout_only=False, estimates_only=False, countdowns_only=False, soft_li
 if __name__ == '__main__':
     main(layout_only='--layout-only' in sys.argv, estimates_only='--estimates-only' in sys.argv,
          countdowns_only='--countdowns-only' in sys.argv, soft_limits_only='--soft-limits-only' in sys.argv,
-         level_heartbeats_only=any(flag in sys.argv for flag in ('--level-heartbeats-only', '--target-level-only')))
+         level_heartbeats_only=any(flag in sys.argv for flag in ('--level-heartbeats-only', '--target-level-only')),
+         calibrated_runs_only='--calibrated-runs-only' in sys.argv)

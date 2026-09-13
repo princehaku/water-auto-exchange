@@ -12,6 +12,11 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 
+if __package__:
+    from .output_runs import OutputRuns
+else:
+    from output_runs import OutputRuns
+
 ACTIVE = ('DRAINING', 'SETTLING', 'FILLING', 'EXCHANGING')
 COMMANDS = ('START', 'FILL', 'DRAIN', 'FILL_OFF', 'DRAIN_OFF', 'STOP', 'RESET')
 SOFT_LIMITS = dict(version=1, fill_seconds=180, drain_seconds=300, watchdog_ms=5000)
@@ -96,6 +101,7 @@ class Store:
         self.ws_grants = {}
         self.ws_grant_sequence = 0
         self.ws_ping_sequence = 0
+        self.ws_activity_tick = None
         self.estimate_tick = None
         self._job_runtime = {}
         self._job_ticking = False
@@ -144,6 +150,7 @@ class Store:
             self.connection_state, self.connection_since, self.connection_reason = event['state'], event['at'], event['reason']
             if self.connection_state == 'online':
                 self.connection_event(False, 'server_restarted')
+        self.output_runner = OutputRuns(self, Problem)
 
     def connection_event(self, online, reason):
         state = 'online' if online else 'offline'
@@ -273,6 +280,8 @@ class Store:
         with self.lock:
             if self.job_running():
                 raise Problem(409, 'level_job_active')
+            if self.output_runner.running():
+                raise Problem(409, 'output_run_active')
             self.expire()
             status = self.status or {}
             if not self.web_limits or self.ws_gateway is None:
@@ -412,6 +421,8 @@ class Store:
 
     def control_start(self, key, command_id):
         if self.control_runs[key] is None:
+            if not any(self.control_runs.values()):
+                self.ws_activity_tick = self.control_clock()
             seconds = SOFT_LIMITS[key + '_seconds']
             now = self.clock()
             self.control_runs[key] = dict(since=now, deadline=now + seconds,
@@ -480,6 +491,7 @@ class Store:
             if session is not None and session != self.ws_gateway:
                 raise Problem(409, 'stale_session')
             try:
+                self.output_runner.tick()
                 self.job_tick()
             except Problem:
                 if session is not None:
@@ -498,6 +510,7 @@ class Store:
             if not expired:
                 return
             _, key = min(expired)
+            self.output_runner.end_all('control_timeout')
             # Revoke every unexecuted grant before the stop offer, including
             # delivered commands that have not yet reached their claim.
             self.db.execute("UPDATE commands SET status='cancelled', result='superseded_by_timeout', finished=? WHERE status IN ('queued','delivered')", (self.clock(),))
@@ -577,7 +590,7 @@ class Store:
             self.expire()
             pending_on = self.db.execute("SELECT 1 FROM commands WHERE status IN ('queued','delivered') AND command IN ('FILL','DRAIN','START')").fetchone()
             control_pending = self.control_timeout or any(self.control_runs.values()) or (self.web_limits and self.control_uncertain)
-            job_pending = self.job_running() and self.level_job['phase'] != 'waiting'
+            job_pending = self.output_runner.running() or (self.job_running() and self.level_job['phase'] != 'waiting')
             if not self.online() or not self.status or self.status['outputs_known'] != '1' or self.status['fill'] != '0' or self.status['drain'] != '0' or pending_on or control_pending or job_pending:
                 raise Problem(409, 'simulation_requires_idle')
             self.job_finish('cancelled', 'calibration_changed')
@@ -716,6 +729,7 @@ class Store:
                         simulation=self.simulation_snapshot(),
                         control_limits=self.control_limits_snapshot(),
                         level_job=self.job_refresh(),
+                        output_runs=self.output_runner.snapshot(),
                         commands=[dict(r) for r in self.db.execute('SELECT * FROM commands ORDER BY created DESC, rowid DESC LIMIT 60')])
 
     def enqueue(self, command, request_id):
@@ -741,6 +755,8 @@ class Store:
                 raise Problem(409, 'firmware_upgrade_required')
             if command == 'START' and s.get('control_mode') == 'manual':
                 raise Problem(409, 'automatic_mode_required')
+            if command in ('FILL', 'DRAIN') and self.output_runner.running(command.lower()):
+                raise Problem(409, 'output_run_active')
             if command in ('START', 'FILL', 'DRAIN'):
                 allowed_states = ('IDLE', 'DONE', 'FILLING', 'DRAINING', 'EXCHANGING') if concurrent else ('IDLE', 'DONE')
                 if s['ready'] != '1' or s['outputs_known'] != '1' or s['overflow'] != '0' or s['state'] not in allowed_states:
@@ -764,6 +780,7 @@ class Store:
                 self.db.execute("UPDATE commands SET status='cancelled', result='superseded_by_output_off', finished=? WHERE status='queued' AND command=?", (self.clock(), command[:-4]))
             now = self.clock()
             self.db.execute('INSERT INTO commands VALUES (?,?,?,?,?,?,?)', (request_id, command, now, now + 8, 'queued', None, None))
+            self.output_runner.manual_command(command, request_id)
             self.db.commit()
             return dict(self.db.execute('SELECT * FROM commands WHERE id=?', (request_id,)).fetchone())
 
@@ -785,6 +802,7 @@ class Store:
             self.ws_grants = {}
             self.ws_grant_sequence = 0
             self.ws_ping_sequence = 0
+            self.ws_activity_tick = None
             self.control_runs = dict(fill=None, drain=None)
             self.control_timeout = None
             self.expire()
@@ -830,6 +848,7 @@ class Store:
             self.ws_grants = {}
             self.ws_grant_sequence = 0
             self.ws_ping_sequence = 0
+            self.ws_activity_tick = self.control_clock()
             self.web_limits = soft
             self.control_runs = dict(fill=None, drain=None)
             self.control_timeout = None
@@ -865,14 +884,15 @@ class Store:
                 sim['estimate_basis'] = 'confirmed_outputs_heartbeat_estimate'
                 self.save_simulation()
             self.ws_ping_sequence = sequence
-            self.ws_touch(session)
+            self.ws_touch(session, effective_ping=True)
             return True
 
-    def ws_touch(self, session, status=None, ack=None):
+    def ws_touch(self, session, status=None, ack=None, effective_ping=False):
         with self.lock:
             if session is None or session != self.ws_gateway:
                 raise Problem(409, 'stale_session')
             self.control_tick(session)
+            fresh_ack = False
             if ack is not None and (not isinstance(ack, dict) or ack.get('status') not in ('succeeded', 'rejected', 'uncertain') or not isinstance(ack.get('result'), str) or len(ack['result']) > 256 or not isinstance(ack.get('id'), str)):
                 raise Problem(400, 'invalid_ack')
             if ack is not None:
@@ -890,6 +910,8 @@ class Store:
                     # A late first receipt is useful history, but its attached
                     # OFF/ON snapshot predates newer execute authority.
                     status = None
+                else:
+                    fresh_ack = True
             if status is not None:
                 status = validate_status(status)
                 if self.status and any(version in ('0.8.2', '0.8.3') for version in (self.status['version'], status['version'])) and (
@@ -903,6 +925,9 @@ class Store:
                 self.db.commit()
             if status is not None:
                 self.job_observe(status, ack)
+                self.output_runner.observe(status, ack)
+            if status is not None or fresh_ack or effective_ping:
+                self.ws_activity_tick = self.control_clock()
             self.seen = self.gateway_seen = self.clock()
             self.connection_event(True, 'connected')
 
@@ -915,6 +940,14 @@ class Store:
             row = self.db.execute("SELECT * FROM commands WHERE status='queued' ORDER BY CASE WHEN id=? THEN 0 ELSE 1 END, " + COMMAND_PRIORITY + ", created LIMIT 1", (self.control_timeout['id'] if self.control_timeout else '',)).fetchone()
             if not row:
                 return None
+            # Physical outputs may run together; ordinary command grants are
+            # serialized so one lane's fresh receipt cannot obsolete the other.
+            if row['command'] not in ('STOP', 'FILL_TIMEOUT', 'DRAIN_TIMEOUT'):
+                pending = self.db.execute("SELECT id FROM commands WHERE status='delivered'").fetchall()
+                for pending_row in pending:
+                    grant = self.ws_grants.get(pending_row['id'])
+                    if grant is None or (not grant['acked'] and grant['sequence'] == self.ws_grant_sequence):
+                        return None
             self.db.execute("UPDATE commands SET status='delivered' WHERE id=?", (row['id'],))
             self.db.commit()
             return dict(type='offer', id=row['id'], command=row['command'])
@@ -939,6 +972,7 @@ class Store:
         with self.lock:
             if session != self.ws_gateway:
                 return
+            self.output_runner.end_all('device_disconnected')
             self.job_finish('failed', 'device_disconnected')
             self.db.execute("UPDATE commands SET status='uncertain', result='device_disconnected', finished=? WHERE status IN ('queued','delivered')", (self.clock(),))
             self.db.commit()
@@ -1059,6 +1093,10 @@ class Handler(BaseHTTPRequestHandler):
         if path == '/water/api/level-job/cancel' and post:
             self.body()
             return self.respond(200, self.server.store.cancel_level_job())
+        if path == '/water/api/output-run' and post:
+            return self.respond(202, self.server.store.output_runner.start(self.body()))
+        if path == '/water/api/output-run/cancel' and post:
+            return self.respond(200, self.server.store.output_runner.cancel(self.body()))
         if path == '/water/api/commands' and post:
             data = self.body()
             return self.respond(202, self.server.store.enqueue(data.get('command'), data.get('id')))

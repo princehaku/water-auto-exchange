@@ -14,7 +14,9 @@ SAFE_CLOSE_REASONS = frozenset((
     'invalid_claim', 'session_limit', 'unclaimed_ack', 'invalid_ack', 'invalid_type', 'invalid_traffic',
     'control_state_uncertain', 'control_unowned_output', 'control_protocol_changed', 'control_stop_unconfirmed',
     'invalid_ping', 'level_job_command_rejected', 'level_job_unexpected_output', 'level_job_estimate_uncertain',
-    'level_job_start_timeout', 'level_job_stop_unconfirmed', 'level_job_disconnected'))
+    'level_job_start_timeout', 'level_job_stop_unconfirmed', 'level_job_disconnected',
+    'output_run_command_rejected', 'output_run_start_timeout', 'output_run_stop_unconfirmed',
+    'output_run_disconnected', 'output_run_communication_timeout'))
 
 
 def safe_close_reason(error):

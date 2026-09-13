@@ -255,23 +255,28 @@ class ControlLimitTests(unittest.TestCase):
         self.assert_old_off_ack_is_inert(True)
 
     def test_late_first_off_ack_uses_execute_order_not_creation_time(self):
-        # FILL was queued/offered first, but the priority OFF executes first.
-        # All events share one wall timestamp, so timestamps/row ids cannot
-        # establish whether that OFF closes the subsequently authorized FILL.
+        # Normal dispatch now serializes offers. Retain the lower-level defense
+        # against previously delivered frames claiming out of order: creation
+        # timestamps/row ids do not prove whether an OFF closes a later grant.
         fill_id, off_id = 'a' * 32, 'b' * 32
         self.store.enqueue('FILL', fill_id)
         self.assertEqual(self.store.ws_offer(self.session)['id'], fill_id)
         self.store.enqueue('FILL_OFF', off_id)
-        self.assertEqual(self.store.ws_offer(self.session)['id'], off_id)
+        self.assertIsNone(self.store.ws_offer(self.session))
+        self.store.db.execute("UPDATE commands SET status='delivered' WHERE id=?", (off_id,))
+        self.store.db.commit()
         self.store.ws_claim(self.session, off_id)
         self.store.ws_claim(self.session, fill_id)
         self.store.ws_touch(self.session, dict(self.initial, fill='1', state='FILLING'))
         previous_simulation = copy.deepcopy(self.store.simulation)
+        activity_tick = self.store.ws_activity_tick
+        self.advance(1)
         self.store.ws_touch(self.session, self.initial,
                             dict(id=off_id, status='succeeded', result='OK FILL_OFF'))
         self.assertEqual(self.store.control_runs['fill']['command_id'], fill_id)
         self.assertEqual(self.store.status['fill'], '1')
         self.assertEqual(self.store.simulation, previous_simulation)
+        self.assertEqual(self.store.ws_activity_tick, activity_tick)
         self.assertEqual(self.store.db.execute('SELECT status FROM commands WHERE id=?', (off_id,)).fetchone()['status'], 'succeeded')
         self.until(1180)
         self.assertEqual(self.store.ws_offer(self.session)['command'], self.timeout_command())
@@ -368,9 +373,16 @@ class GracefulControlLimitTests(ControlLimitTests):
         self.assertEqual(self.store.ws_claim(self.session, offer['id'])['type'], 'expired')
         self.start()
 
-    def test_fresh_output_off_ack_after_deadline_can_confirm_before_timeout_claim(self):
+    def test_output_off_waits_for_timeout_receipt_before_execution(self):
         offer = self.timeout_offer('drain')
-        off_id = self.grant('DRAIN_OFF')
+        self.number += 1
+        off_id = format(self.number, '032x')
+        self.store.enqueue('DRAIN_OFF', off_id)
+        self.assertIsNone(self.store.ws_offer(self.session))
+        self.store.ws_claim(self.session, offer['id'])
+        self.ack(offer['id'], drain='0', state='IDLE', reason='drain_timeout')
+        self.assertEqual(self.store.ws_offer(self.session)['id'], off_id)
+        self.assertEqual(self.store.ws_claim(self.session, off_id)['type'], 'execute')
         self.ack(off_id, drain='0', state='IDLE', reason='drain_stopped')
         self.assertIsNone(self.store.control_timeout)
         self.assertEqual(self.store.ws_claim(self.session, offer['id'])['type'], 'expired')

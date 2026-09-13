@@ -1,38 +1,74 @@
 <!doctype html>
 <html lang="zh-CN">
 <head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="theme-color" content="#123d39"><title>水序 · 自动换水</title>
-<link rel="stylesheet" href="./style.css"><script src="./app.js" defer></script>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#081f32">
+  <title>龟缸水路 · 水序</title>
+  <link rel="stylesheet" href="./aquarium.css">
+  <script type="module" src="./aquarium.js"></script>
 </head>
 <body>
-<header><a class="brand" href="./"><span class="mark">≈</span> 水序 <small>WATER CONTROL</small></a><div class="header-links"><span class="site">自动换水控制台</span><a href="./aquarium.html">龟缸三维界面 ↗</a></div></header>
-<main>
-<section class="intro"><div><p class="eyebrow">A LITTLE CARE, EVERY DAY</p><h1>让每一次换水，<br>井然有序。</h1><p class="muted">查看设备状态，手动控制补水与冲水。</p></div><div class="water-art" aria-hidden="true"><span>水</span><i></i><i></i><i></i></div></section>
-<section id="login-panel" class="card login"><div><p class="eyebrow">WELCOME BACK</p><h2>连接你的控制台</h2><p class="muted">输入管理密钥，查看设备并进行操作。</p></div><form id="login-form"><label for="key">管理密钥</label><div class="input-row"><input id="key" type="password" autocomplete="current-password" required placeholder="输入管理密钥"><button type="submit">登录</button></div></form></section>
-<div id="console" hidden>
-<div class="toolbar"><span id="connection" class="badge">正在获取状态</span><span id="last-seen" class="muted"></span><button id="refresh" class="ghost">刷新</button><button id="logout" class="ghost">退出</button></div>
-<section class="card connection-card" aria-labelledby="connection-title">
-<div class="section-head"><h2 id="connection-title">连接与流量</h2><span id="sync-status" class="muted">每 2 秒自动更新</span></div>
-<p id="connection-detail" class="muted" role="status">正在获取连接信息。</p>
-<div class="connection-metrics"><div><span>本次状态开始</span><strong id="connection-since">—</strong></div><div><span>状态持续时间</span><strong id="connection-duration">—</strong></div><div><span>距最近通信</span><strong id="connection-age">—</strong></div></div>
-<div class="network-grid"><div class="traffic-panel"><h3>设备估算流量</h3><dl class="traffic-metrics"><div><dt>累计已上报</dt><dd id="traffic-total">—</dd></div><div><dt>本次设备运行</dt><dd id="traffic-boot">—</dd></div><div><dt>最近统计段</dt><dd id="traffic-interval">—</dd></div></dl><p id="traffic-updated" class="muted">尚未收到流量统计。</p><p class="caption">新版设备默认每 5 分钟上报，旧版约每分钟；包含设备通信及估算开销；与运营商实际计费可能不同。重连会继续累计，历史统计由服务器保存。</p></div>
-<div class="connection-history"><h3>在线 / 离线记录</h3><p id="connection-empty" class="muted">等待首次连接。</p><div class="connection-events-wrap"><table id="connection-events-table" hidden><thead><tr><th>时间</th><th>状态</th><th>说明</th></tr></thead><tbody id="connection-events"></tbody></table></div><p class="caption">最近 60 次状态变化。服务连接中断时，设备是否在线暂时无法确认。</p></div></div>
-</section>
-<div class="grid">
-<section class="card device"><div class="section-head"><h2>设备概况</h2><span id="version" class="muted">尚无设备数据</span></div><div class="state-row"><div><p class="muted">当前状态</p><h3 id="state">等待设备连接</h3><p id="reason" class="muted">设备通过 4G 接入后，状态会自动更新。</p></div><div class="state-icon" aria-hidden="true">≈</div></div><div class="metrics"><div><span>控制方式</span><strong id="need-fill">未知</strong></div><div><span>补水输出</span><strong id="fill">未知</strong></div><div><span>排水输出</span><strong id="drain">未知</strong></div><div><span>累计启动轮次</span><strong id="cycle">—</strong></div></div><div id="protection" class="note">等待保护状态</div><p class="caption">当前先使用手动开关。输出状态来自设备的软件记录。</p></section>
-<section class="card controls"><p class="eyebrow">CONTROL</p><h2>补水与冲水</h2><p id="control-hint" class="muted">设备在线且配置就绪后可操作。</p>
-<div class="manual-actions">
-<button id="fill-button" class="action water-switch" data-command="FILL" data-output="fill" role="switch" aria-label="补水" aria-describedby="fill-hint" aria-checked="false" disabled><span>补水</span><small id="fill-hint">状态未知</small><i class="switch-track" aria-hidden="true"></i></button>
-<button id="drain-button" class="action water-switch" data-command="DRAIN" data-output="drain" role="switch" aria-label="冲水" aria-describedby="drain-hint" aria-checked="false" disabled><span>冲水</span><small id="drain-hint">状态未知</small><i class="switch-track" aria-hidden="true"></i></button>
-</div>
-<div class="control-bottom"><button id="stop" class="danger" data-command="STOP" disabled>停止全部输出</button><button id="reset" class="ghost" data-command="RESET" disabled>故障复位</button></div>
-<p class="caption">手动开关无需水位传感器。0.8.0 起两路可同时开启、分别关闭；每路从开启时计时，任一路超时或远程通信中断会关闭全部输出。开关状态以设备回报为准。</p></section>
-</div>
-<section class="card history"><div class="section-head"><h2>操作记录</h2><span class="muted">最近 60 条</span></div><p id="empty" class="muted">还没有操作记录。</p><div class="table-wrap"><table id="history-table" hidden><thead><tr><th>提交时间</th><th>操作</th><th>结果</th><th>设备回执 / 说明</th></tr></thead><tbody id="history"></tbody></table></div></section>
-</div>
-<p id="message" role="status" aria-live="polite"></p>
-<footer><span>水序 · WATER AUTO EXCHANGE</span><span>用细致的控制，照顾一缸日常。</span></footer>
-</main>
-<dialog id="confirm"><form method="dialog"><p class="eyebrow">CONFIRM ACTION</p><h2 id="confirm-title">确认操作</h2><p id="confirm-body"></p><div class="dialog-actions"><button value="cancel" class="ghost">取消</button><button value="ok">确认执行</button></div></form></dialog>
-</body></html>
+  <header class="topbar">
+    <a class="brand" href="./" aria-label="水序龟缸首页"><span class="brand-icon" aria-hidden="true">◈</span><span>水序 <small>龟缸水路</small></span></a>
+    <nav class="top-menu" aria-label="控制台菜单">
+      <button id="menu-device" data-panel="device-dialog" aria-haspopup="dialog" aria-controls="device-dialog" aria-expanded="false" disabled>设备状态</button>
+      <button id="menu-history" data-panel="history-dialog" aria-haspopup="dialog" aria-controls="history-dialog" aria-expanded="false" disabled>历史记录</button>
+      <button id="menu-calibration" data-panel="calibration-dialog" aria-haspopup="dialog" aria-controls="calibration-dialog" aria-expanded="false" disabled>校准</button>
+    </nav>
+    <button id="header-connection" class="connection-pill unknown" data-panel="device-dialog" aria-haspopup="dialog" aria-controls="device-dialog" aria-expanded="false" disabled>正在连接</button>
+  </header>
+  <main>
+    <section id="login-panel" class="login-panel" aria-labelledby="login-title">
+      <div class="eyebrow">WELCOME BACK</div><h1 id="login-title">连接你的龟缸</h1><p>登录后查看三维鱼缸，手动控制补水与冲水。</p>
+      <form id="login-form"><label for="key">管理密钥</label><div class="login-row"><input id="key" type="password" autocomplete="current-password" required placeholder="输入管理密钥"><button type="submit">进入控制台 ↗</button></div></form>
+    </section>
+    <div id="console" hidden>
+      <div class="dashboard-grid">
+        <section class="tank-card" aria-labelledby="tank-title">
+          <div class="card-top"><div><span class="eyebrow">YOUR AQUARIUM</span><h1 id="tank-title">龟缸全景</h1></div><span id="scene-status" class="scene-tag">场景示意</span></div>
+          <div class="scene-toolbar"><span id="flow-caption">常态自循环 · 示意</span><div class="view-buttons" role="group" aria-label="鱼缸观察视角"><button data-view="top" aria-pressed="false">俯视</button><button data-view="front" aria-pressed="false">正面</button><button data-view="perspective" aria-pressed="true">45°</button></div></div>
+          <div class="tank-stage"><canvas id="tank-canvas" aria-label="按实物还原的三维龟缸，左侧两只红耳巴西龟水区，右侧陆地、小池及鹅卵石水道"></canvas><div id="scene-fallback" class="scene-fallback" hidden>当前浏览器无法绘制三维场景，控制与状态仍可使用。</div><span class="stage-ornament">左侧龟缸 · 右侧陆地 · 喷花未启用</span></div>
+          <div class="level-row"><div class="level-reading"><span class="overline">模拟水位</span><strong id="level-value">未校准</strong></div><div class="level-summary"><small id="level-detail">当前水面仅作场景示意</small><div class="level-track" aria-hidden="true"><i id="level-fill"></i></div></div></div>
+        </section>
+        <section class="control-card" aria-labelledby="control-title">
+          <div class="card-top"><div><span class="eyebrow">MANUAL CONTROL</span><h2 id="control-title">水路控制</h2></div><span class="control-tag">手动开关</span></div>
+          <p id="control-hint" class="control-hint">设备在线且就绪后可操作。</p>
+          <div class="switch-list">
+            <div class="output-control"><button id="fill-button" class="water-switch fill-switch" role="switch" aria-label="补水" aria-checked="false" aria-describedby="fill-detail" data-command="FILL" data-output="fill" disabled><span class="switch-icon" aria-hidden="true">↘</span><span class="switch-copy"><strong>补水</strong><small id="fill-detail">状态未知</small></span><span class="switch-control" aria-hidden="true"></span></button><div class="run-progress"><div><span>补水运行</span><b id="fill-progress-text">— / 120 秒</b></div><div class="progress-track"><i id="fill-progress"></i></div></div></div>
+            <div class="output-control"><button id="drain-button" class="water-switch drain-switch" role="switch" aria-label="冲水排出" aria-checked="false" aria-describedby="drain-detail" data-command="DRAIN" data-output="drain" disabled><span class="switch-icon" aria-hidden="true">↗</span><span class="switch-copy"><strong>冲水 · 排出</strong><small id="drain-detail">状态未知</small></span><span class="switch-control" aria-hidden="true"></span></button><div class="run-progress"><div><span>排水运行</span><b id="drain-progress-text">— / 120 秒</b></div><div class="progress-track drain-progress"><i id="drain-progress"></i></div></div></div>
+          </div>
+          <button id="stop" data-command="STOP" class="stop-button" disabled>■ &nbsp;停止全部输出</button>
+          <p id="command-feedback" class="feedback" role="status" aria-live="polite"></p>
+          <p class="control-foot">每路限时 120 秒 · 开关以设备回执为准</p>
+        </section>
+      </div>
+    </div>
+    <p id="message" class="toast" role="status" aria-live="polite"></p>
+  </main>
+
+  <dialog id="device-dialog" class="menu-dialog" aria-labelledby="device-title">
+    <div class="dialog-head"><div><span class="eyebrow">DEVICE</span><h2 id="device-title">设备状态</h2></div><button id="close-device" class="close-button" data-close="device-dialog" aria-label="关闭设备状态">×</button></div>
+    <div class="dialog-body">
+      <div class="device-overview"><strong id="hero-status">正在获取状态</strong><span id="hero-seen">等待设备上报</span></div>
+      <div class="detail-grid"><div><span>当前状态</span><strong id="device-state">等待连接</strong></div><div><span>控制模式</span><strong id="device-mode">—</strong></div><div><span>补水输出</span><strong id="fill-state">未知</strong></div><div><span>排水输出</span><strong id="drain-state">未知</strong></div><div><span>最近通信</span><strong id="last-seen">—</strong></div><div><span>本次连接持续</span><strong id="online-duration">—</strong></div><div><span>设备固件</span><strong id="version">—</strong></div><div><span>网页同步</span><strong id="sync-status">每 2 秒自动同步</strong></div></div>
+      <p id="device-reason" class="detail-reason">等待设备状态。</p><p class="explanation">运行进度从首次收到开启状态起估算，可能晚于实际启动。0.8.0 手动模式支持两路同时开启、独立关闭；任一路 120 秒到期会故障锁定并关闭全部。</p>
+      <div class="detail-grid traffic-grid"><div><span>累计已上报流量</span><strong id="traffic-total">—</strong></div><div><span>最近一次运行流量</span><strong id="traffic-boot">—</strong></div><div><span>最近统计段</span><strong id="traffic-interval">—</strong></div><div><span>最近流量上报</span><strong id="traffic-reported">—</strong></div></div><p class="explanation traffic-note">设备库估算，非运营商账单；掉电前尚未上报的流量可能缺失。</p>
+      <p class="explanation">缸内水路按照片呈现常态自循环，不计入补水或排水量。循环与喷花没有接入设备反馈，场景动画只作示意。</p>
+      <p id="device-feedback" class="feedback panel-message" role="status" aria-live="polite"></p><div class="dialog-actions"><button id="reset" data-command="RESET" class="reset-button" disabled>故障复位</button><button id="logout" class="text-button" hidden>退出登录</button></div>
+    </div>
+  </dialog>
+  <dialog id="history-dialog" class="menu-dialog history-dialog" aria-labelledby="history-title">
+    <div class="dialog-head"><div><span class="eyebrow">LOGBOOK</span><h2 id="history-title">历史记录</h2></div><button id="close-history" class="close-button" data-close="history-dialog" aria-label="关闭历史记录">×</button></div>
+    <div class="dialog-body"><p class="explanation">操作和连接变化各保留最近 60 条，自动同步更新。</p><p id="history-message" class="feedback panel-message" role="status" aria-live="polite"></p><div class="history-tabs" role="tablist" aria-label="历史类型"><button id="tab-commands" role="tab" aria-selected="true" aria-controls="command-panel">操作记录</button><button id="tab-connection" role="tab" aria-selected="false" aria-controls="connection-panel">在线 / 离线</button></div><div id="command-panel" role="tabpanel" aria-labelledby="tab-commands"><div class="table-wrap"><table><thead><tr><th>时间</th><th>操作</th><th>状态</th><th>设备回执 / 说明</th></tr></thead><tbody id="commands-list"></tbody></table></div><p id="commands-empty" class="empty">暂无操作记录。</p></div><div id="connection-panel" role="tabpanel" aria-labelledby="tab-connection" hidden><div class="table-wrap"><table><thead><tr><th>时间</th><th>设备</th><th>说明</th></tr></thead><tbody id="connection-list"></tbody></table></div><p id="connection-empty" class="empty">暂无连接记录。</p></div></div>
+  </dialog>
+  <dialog id="calibration-dialog" class="menu-dialog" aria-labelledby="calibration-title">
+    <div class="dialog-head"><div><span class="eyebrow">SIMULATED LEVEL</span><h2 id="calibration-title">水位校准</h2></div><button id="close-calibration" class="close-button" data-close="calibration-dialog" aria-label="关闭校准">×</button></div>
+    <div class="dialog-body calibration"><p id="model-note" class="explanation">没有真实液位传感器。根据已知水位和历史用时校准后，页面会显示模拟水位。</p><p class="explanation">填写空缸到满缸、满缸到空缸所需的总时间。它们只影响模拟速率，不改变设备的 120 秒保护。</p>
+      <form id="calibration-form"><div class="calibration-fields"><label>空 → 满用时（秒）<input id="fill-seconds" type="number" min="1" max="86400" step="1" required placeholder="例如 300"></label><label>满 → 空用时（秒）<input id="drain-seconds" type="number" min="1" max="86400" step="1" required placeholder="例如 240"></label></div><div class="anchor-row"><label>此刻的已知水位（%）<input id="anchor-level" type="number" min="0" max="100" step="1" required value="100"></label><div class="anchor-presets"><button type="button" data-anchor="100">此刻满水</button><button type="button" data-anchor="0">此刻空水</button></div></div><button id="save-calibration" class="save-button" type="submit" disabled>保存校准并开始同步</button></form>
+      <p id="calibration-message" class="feedback panel-message" role="status" aria-live="polite"></p><p class="explanation">仅在设备在线且两路均关闭时可校准；工作中失联后需按现场水位重新校准。</p>
+    </div>
+  </dialog>
+  <dialog id="confirm" class="confirm-dialog"><form method="dialog"><h2>确认故障复位？</h2><p>请先确认现场故障原因已经排除。复位后输出仍保持关闭。</p><div class="dialog-actions"><button value="cancel" class="reset-button">取消</button><button value="ok" class="save-button">确认复位</button></div></form></dialog>
+</body>
+</html>

@@ -63,7 +63,8 @@ for attempt in $(seq 1 30); do
 done
 curl -fsS http://127.0.0.1:8790/water/api/health >/dev/null
 install -d -m 755 "$root/www/water"
-for name in index.html health.json style.css app.js aquarium.html aquarium.css aquarium.js aquarium-scene.js; do install -m 644 "deploy/www/$name" "$root/www/water/$name"; done
+for name in index.html health.json aquarium.html aquarium.css aquarium.js aquarium-scene.js; do install -m 644 "deploy/www/$name" "$root/www/water/$name"; done
+rm -f -- "$root/www/water/app.js" "$root/www/water/style.css"
 install -d -m 755 "$root/www/water/vendor"
 for name in three.module.js THREE-LICENSE.txt; do install -m 644 "deploy/www/vendor/$name" "$root/www/water/vendor/$name"; done
 install -m 644 deploy/nginx-water.conf "$root/config/nginx-water.conf"

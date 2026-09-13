@@ -9,15 +9,21 @@ const connectionReasons={connected:'设备已连接',connection_closed:'连接�
 const errors={login_required:'请先登录。',invalid_key:'管理密钥不正确。',try_later:'尝试过于频繁，请稍后再试。',device_offline:'设备已离线，命令未提交。',device_not_ready:'设备尚未就绪。',command_pending:'上一条命令尚在等待回执。',firmware_upgrade_required:'需要 0.8.0 手动模式才能独立关闭输出。',simulation_requires_idle:'校准时设备须在线，且补水、排水均已关闭。',invalid_simulation:'请填写 0–100% 的当前水位，以及 1–86400 秒的补水、排水用时。'};
 const supportedManual=['0.7.0','0.7.1','0.7.2','0.7.3','0.7.4','0.7.5','0.7.6','0.7.7','0.8.0'];
 const refreshInterval=2000;
-let scene=null,snapshot=null,lastSnapshot=null,signedIn=false,lastSuccess=0,refreshRequest=null,authEpoch=0,busy=false,submittedId=null,formLoaded=false;
+let scene=null,snapshot=null,lastSnapshot=null,signedIn=false,lastSuccess=0,refreshRequest=null,authEpoch=0,busy=false,submittedId=null,formLoaded=false,refreshEnabled=true;
 
 try{scene=createAquarium($('tank-canvas'));}catch(error){$('scene-fallback').hidden=false;$('tank-canvas').hidden=true;}
 
 function timeLabel(seconds){return Number.isFinite(seconds)?new Date(seconds*1000).toLocaleString('zh-CN',{hour12:false}):'尚无记录';}
 function durationLabel(seconds){if(!Number.isFinite(seconds))return '—';const s=Math.max(0,Math.floor(seconds));if(s<60)return s+' 秒';if(s<3600)return Math.floor(s/60)+' 分 '+s%60+' 秒';if(s<86400)return Math.floor(s/3600)+' 时 '+Math.floor(s%3600/60)+' 分';return Math.floor(s/86400)+' 天 '+Math.floor(s%86400/3600)+' 时';}
+function bytesLabel(value){if(!Number.isFinite(value))return '尚未上报';const units=['B','KiB','MiB','GiB'];let unit=0;while(value>=1024&&unit<units.length-1){value/=1024;unit++;}return value.toFixed(unit?1:0)+' '+units[unit];}
 function serverNow(data){return data?.server_time+(Date.now()-lastSuccess)/1000;}
-function setMessage(value){$('message').textContent=value;}
-function setFeedback(value){$('command-feedback').textContent=value;}
+const retryNotice='状态同步中断，正在自动重试。';
+function setMessage(value){$('message').textContent=value;const panel=document.querySelector('.menu-dialog[open] .panel-message');if(panel)panel.textContent=value;}
+function setFeedback(value){$('command-feedback').textContent=value;$('device-feedback').textContent=value;}
+function clearRetryNotice(){for(const node of [$('message'),...document.querySelectorAll('.panel-message')])if(node.textContent===retryNotice)node.textContent='';}
+function closePanels(){document.querySelectorAll('.menu-dialog[open]').forEach(dialog=>dialog.close());if($('confirm').open)$('confirm').close();}
+function updateMenus(){document.querySelectorAll('[data-panel]').forEach(button=>{button.disabled=!signedIn;});}
+function openPanel(id){if(!signedIn)return;const dialog=$(id);if(dialog.open)return;closePanels();document.querySelectorAll('[data-panel]').forEach(button=>button.setAttribute('aria-expanded',String(button.dataset.panel===id)));dialog.showModal();}
 async function api(path,body,signal=AbortSignal.timeout(6000)){
   const response=await fetch('./api/'+path,{method:body===undefined?'GET':'POST',credentials:'same-origin',cache:'no-store',headers:body===undefined?{}:{'Content-Type':'application/json'},body:body===undefined?undefined:JSON.stringify(body),signal});
   let data;try{data=await response.json();}catch{throw new Error('服务暂时不可用，请稍后重试。');}
@@ -25,13 +31,16 @@ async function api(path,body,signal=AbortSignal.timeout(6000)){
   return data;
 }
 function cancelRefresh(){authEpoch++;refreshRequest?.abort();refreshRequest=null;}
-function showLogin(){cancelRefresh();signedIn=false;snapshot=null;lastSnapshot=null;submittedId=null;lastSuccess=0;formLoaded=false;$('console').hidden=true;$('login-panel').hidden=false;$('logout').hidden=true;$('header-connection').textContent='未登录';$('header-connection').className='connection-pill';$('hero-status').textContent='登录后查看设备';$('hero-seen').textContent='';}
+function showLogin(){cancelRefresh();refreshEnabled=false;signedIn=false;snapshot=null;lastSnapshot=null;submittedId=null;lastSuccess=0;formLoaded=false;closePanels();updateMenus();$('console').hidden=true;$('login-panel').hidden=false;$('logout').hidden=true;$('header-connection').textContent='未登录';$('header-connection').className='connection-pill';$('header-connection').removeAttribute('title');$('header-connection').setAttribute('aria-label','未登录');$('hero-status').textContent='登录后查看设备';$('hero-seen').textContent='';}
 function setConnection(data,serviceOk=true){
   const connection=$('header-connection');
-  const online=serviceOk&&data?.online===true;
-  connection.textContent=!serviceOk?'服务连接中断':online?'● 设备在线':'○ 设备离线';
-  connection.className='connection-pill '+(!serviceOk?'unknown':online?'online':'offline');
-  $('hero-status').textContent=!serviceOk?'设备状态未知':online?'设备运行正常':'设备暂时离线';
+  const online=serviceOk&&data?.online===true,device=data?.device;
+  const healthy=online&&device&&device.ready==='1'&&device.outputs_known==='1'&&device.overflow==='0'&&!['FAULT','UNCONFIGURED'].includes(device.state);
+  const detail=!serviceOk?'服务连接中断，设备状态未知':!online?'设备离线':!device?'等待设备状态':healthy?'设备在线，运行正常':device.state==='FAULT'?'故障锁定 · '+(reasonNames[device.reason]||device.reason):device.overflow==='1'?'超高水位触发':device.outputs_known!=='1'?'输出状态未知':device.ready!=='1'?'设备尚未就绪':'设备状态异常';
+  connection.textContent=!serviceOk?'状态未知':healthy?'设备正常':'设备异常';
+  connection.className='connection-pill '+(!serviceOk?'unknown':healthy?'online':'offline');
+  connection.title=detail;connection.setAttribute('aria-label',connection.textContent+'，'+detail+'，查看设备状态');
+  $('hero-status').textContent=detail;
   $('hero-seen').textContent='最近通信 · '+timeLabel(data?.last_seen);
   $('last-seen').textContent=data?.last_seen?timeLabel(data.last_seen):'—';
   $('online-duration').textContent=serviceOk&&data?.online&&data.connection?.since?durationLabel(serverNow(data)-data.connection.since):'—';
@@ -80,12 +89,13 @@ function renderProgress(data){
 }
 function renderLevel(data){
   const sim=data.simulation||{},device=data.device,calibrated=sim.calibrated===true;
-  const reliable=calibrated&&!sim.uncertain;
   const level=calibrated?Math.max(0,Math.min(100,Number(sim.level)||0)):65;
   scene?.setLevel(level);
-  $('level-fill').style.height=level+'%';
+  const known=data.online&&device?.outputs_known==='1';
+  scene?.setFlow?.({fill:known&&device.fill==='1',drain:known&&device.drain==='1',circulation:true});
+  $('level-fill').style.width=level+'%';
   $('level-value').textContent=!calibrated?'未校准':Math.round(level)+'%';
-  $('level-detail').textContent=!calibrated?'当前水面仅作场景示意':sim.uncertain?'最后一次可靠估算，需重新校准':data.online?'按设备输出状态推算':'设备离线，估算已暂停';
+  $('level-detail').textContent=!calibrated?'示意水面 · 请先校准':sim.uncertain?'估算不确定 · 需校准':data.online?'按输出状态推算':'设备离线 · 模拟暂停';
   $('scene-status').textContent=!calibrated?'场景示意':sim.uncertain?'估算不确定':data.online?'模拟同步中':'模拟已暂停';
   $('model-note').textContent=!calibrated?'没有水位传感器。填写历史满缸与空缸用时，并按现场已知水位校准，才能开始估算。':sim.uncertain?'工作期间通信中断或服务重启，实际停止时刻无法确认。请到现场核实并重新校准；旧估算不会继续推进。':'水位由补水、排水开启时长及校准速率推算，双路同时开启时按净变化计算。这里不是实测水位，也不决定设备的关断。';
   $('save-calibration').disabled=!(data.online&&device?.outputs_known==='1'&&device.fill==='0'&&device.drain==='0');
@@ -109,6 +119,10 @@ function render(data){
   $('device-state').textContent=device?(stateNames[device.state]||device.state):'等待设备连接';
   $('device-mode').textContent=device?.control_mode==='manual'?'手动控制':device?.control_mode==='automatic'?'自动模式':'模式未知';
   $('version').textContent=device?'v'+device.version:'—';
+  const traffic=data.traffic||{};
+  $('traffic-total').textContent=bytesLabel(traffic.total_bytes);$('traffic-boot').textContent=bytesLabel(traffic.boot_bytes);
+  $('traffic-interval').textContent=traffic.available?bytesLabel(traffic.interval_bytes)+' / '+durationLabel(traffic.interval_seconds):'尚未上报';
+  $('traffic-reported').textContent=timeLabel(traffic.last_report_at);
   $('device-reason').textContent=device?(data.online?'':'上次上报 · ')+(reasonNames[device.reason]||device.reason):'设备通过 4G 接入后，这里会自动更新。';
   const completed=data.commands.find(item=>item.id===submittedId);
   if(completed&&!['queued','delivered'].includes(completed.status)){
@@ -118,26 +132,26 @@ function render(data){
   renderControls();renderProgress(data);renderLevel(data);renderHistory(data);
 }
 async function refresh(){
-  if(refreshRequest||document.hidden)return;
+  if(refreshRequest||document.hidden||!refreshEnabled)return;
   const request=new AbortController(),epoch=authEpoch;
   refreshRequest=request;
   const timeout=setTimeout(()=>request.abort(),6000);
   try{
     const data=await api('status',undefined,request.signal);
     if(epoch!==authEpoch)return;
-    signedIn=true;lastSuccess=Date.now();$('login-panel').hidden=true;$('console').hidden=false;$('logout').hidden=false;
+    signedIn=true;lastSuccess=Date.now();updateMenus();$('login-panel').hidden=true;$('console').hidden=false;$('logout').hidden=false;
     render(data);$('sync-status').textContent='已同步 '+new Date(lastSuccess).toLocaleTimeString('zh-CN',{hour12:false});
-    if($('message').textContent==='状态同步中断，正在自动重试。')setMessage('');
+    clearRetryNotice();
   }catch(error){
     if(epoch!==authEpoch)return;
     if(error.status===401){showLogin();return;}
-    if(signedIn){snapshot=null;setConnection(lastSnapshot,false);renderControls();$('save-calibration').disabled=true;$('sync-status').textContent='同步中断 · 自动重试';$('scene-status').textContent='服务连接中断';}
-    setMessage('状态同步中断，正在自动重试。');
+    if(signedIn){snapshot=null;setConnection(lastSnapshot,false);renderControls();scene?.setFlow?.({fill:false,drain:false,circulation:true});$('save-calibration').disabled=true;$('sync-status').textContent='同步中断 · 自动重试';$('scene-status').textContent='服务连接中断';}
+    setMessage(retryNotice);
   }finally{clearTimeout(timeout);if(refreshRequest===request)refreshRequest=null;}
 }
 function updateClock(){if(!signedIn||!lastSnapshot)return;setConnection(lastSnapshot,snapshot!==null&&Date.now()-lastSuccess<=10000);if(snapshot){renderProgress(snapshot);renderControls();}}
 
-$('login-form').addEventListener('submit',async event=>{event.preventDefault();const button=event.target.querySelector('button');button.disabled=true;try{await api('login',{key:$('key').value});cancelRefresh();$('key').value='';setMessage('');await refresh();}catch(error){setMessage(error.message);}finally{button.disabled=false;}});
+$('login-form').addEventListener('submit',async event=>{event.preventDefault();const button=event.target.querySelector('button');button.disabled=true;try{await api('login',{key:$('key').value});cancelRefresh();refreshEnabled=true;$('key').value='';setMessage('');await refresh();}catch(error){setMessage(error.message);}finally{button.disabled=false;}});
 $('logout').addEventListener('click',async()=>{try{await api('logout',{});showLogin();setMessage('已退出。');}catch(error){setMessage(error.message);}});
 async function confirmReset(){const dialog=$('confirm');dialog.returnValue='cancel';dialog.showModal();return new Promise(resolve=>dialog.addEventListener('close',()=>resolve(dialog.returnValue==='ok'),{once:true}));}
 for(const button of document.querySelectorAll('[data-command]'))button.addEventListener('click',async()=>{
@@ -154,9 +168,12 @@ for(const button of document.querySelectorAll('[data-anchor]'))button.addEventLi
 $('calibration-form').addEventListener('submit',async event=>{
   event.preventDefault();const button=$('save-calibration');button.disabled=true;
   try{await api('simulation',{level:Number($('anchor-level').value),fill_seconds:Number($('fill-seconds').value),drain_seconds:Number($('drain-seconds').value)});setMessage('模拟水位已校准。请以现场实际水位为准。');await refresh();}
-  catch(error){setMessage(error.message);}finally{button.disabled=false;}
+  catch(error){setMessage(error.message);}finally{const device=snapshot?.device;button.disabled=!(snapshot?.online&&Date.now()-lastSuccess<=10000&&device?.outputs_known==='1'&&device.fill==='0'&&device.drain==='0');}
 });
-$('history-toggle').addEventListener('click',()=>{const expanded=$('history-toggle').getAttribute('aria-expanded')==='true';$('history-toggle').setAttribute('aria-expanded',String(!expanded));$('history-content').hidden=expanded;$('history-toggle').innerHTML=expanded?'展开记录 <span aria-hidden="true">＋</span>':'收起记录 <span aria-hidden="true">－</span>';});
+for(const button of document.querySelectorAll('[data-panel]'))button.addEventListener('click',()=>openPanel(button.dataset.panel));
+for(const button of document.querySelectorAll('[data-view]'))button.addEventListener('click',()=>{scene?.setView?.(button.dataset.view);document.querySelectorAll('[data-view]').forEach(item=>item.setAttribute('aria-pressed',String(item===button)));});
+for(const button of document.querySelectorAll('[data-close]'))button.addEventListener('click',()=>$(button.dataset.close).close());
+for(const dialog of document.querySelectorAll('.menu-dialog'))dialog.addEventListener('close',()=>{document.querySelectorAll('[data-panel]').forEach(button=>{if(button.dataset.panel===dialog.id)button.setAttribute('aria-expanded','false');});});
 for(const [button,panel,otherButton,otherPanel] of [['tab-commands','command-panel','tab-connection','connection-panel'],['tab-connection','connection-panel','tab-commands','command-panel']])$(button).addEventListener('click',()=>{$(button).setAttribute('aria-selected','true');$(otherButton).setAttribute('aria-selected','false');$(panel).hidden=false;$(otherPanel).hidden=true;});
 setInterval(()=>{updateClock();refresh();},refreshInterval);
 document.addEventListener('visibilitychange',()=>{if(!document.hidden)refresh();});

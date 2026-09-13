@@ -250,8 +250,13 @@ export function createAquarium(canvas) {
   }
   // The return hose is a visual route only; its pump is not connected to the controls.
   tube([[3.57,1.16,-.87],[3.66,1.5,-1.15],[3.82,2.1,-1.99],[3.8,3.58,-2.0],[3.5,3.93,-2.05],[3.12,3.83,-2.25]],.046,greenMat,30);
-  const clearHoseMat=material(0xb6c4ac,{transparent:true,opacity:.54,roughness:.4});
-  tube([[-5.2,.43,-.55],[-5.42,.51,-1.34],[-5.55,1.72,-1.84],[-5.53,2.7,-2.1]],.045,clearHoseMat,28);
+  // Separate controlled routes: white intake drains upward; green hose fills beside it.
+  const drainHoseMat=material(0xeeeede,{transparent:true,opacity:.76,roughness:.4});
+  const drainPipe=tube([[-5.2,.43,-.55],[-5.42,.51,-1.34],[-5.55,1.72,-1.84],[-5.53,2.7,-2.1]],.045,drainHoseMat,28);
+  drainPipe.mesh.name='drain-pipe';
+  const fillOutlet=new THREE.Vector3(-5.02,1.28,-1.48);
+  const fillPipe=tube([[-5.12,2.72,-1.86],[-5.1,2.08,-1.83],[-5.06,1.56,-1.57],fillOutlet.toArray()],.052,greenMat,28);
+  fillPipe.mesh.name='fill-pipe';
   const filterMat=material(0x464f45);
   box(.72,.23,.42,-5.14,.47,-.62,filterMat);
   for(let i=0;i<8;i++)box(.026,.008,.37,-5.44+i*.085,.592,-.62,frameEdgeMat);
@@ -285,8 +290,14 @@ export function createAquarium(canvas) {
     ring.rotation.x=-Math.PI/2;habitat.add(ring);ripples.push(ring);
   }
   const flowParticles=[];
+  const flowMats={
+    fill:new THREE.MeshBasicMaterial({color:0xabffee,transparent:true,opacity:.86,depthWrite:false}),
+    drain:new THREE.MeshBasicMaterial({color:0xffdeb0,transparent:true,opacity:.86,depthWrite:false})
+  };
   for(const kind of ['fill','drain'])for(let i=0;i<8;i++) {
-    const drop=new THREE.Mesh(new THREE.SphereGeometry(.035,6,5),motionMat);habitat.add(drop);flowParticles.push({drop,kind,phase:i/8});
+    const drop=new THREE.Mesh(new THREE.SphereGeometry(.035,6,5),flowMats[kind]);drop.name=kind+'-flow-'+i;
+    if(kind==='drain')drop.scale.setScalar(1.5);
+    habitat.add(drop);flowParticles.push({drop,kind,phase:i/8});
   }
 
   const turtleSkin=material(0x777c43,{roughness:.84}),turtlePale=material(0xb2a265),turtleShell=material(0x4a5532,{roughness:.68});
@@ -403,8 +414,8 @@ export function createAquarium(canvas) {
     });
     flowParticles.forEach(({drop,kind,phase})=>{
       const p=(t*.65+phase)%1;drop.visible=Boolean(flow[kind])&&!prefersReducedMotion.matches;
-      if(kind==='fill')drop.position.set(-5.48,waterY+.05+(1-p)*.72,-1.63);
-      else drop.position.set(-5.23+Math.sin(p*4)*.025,Math.max(.37,waterY-.05-p*.62),-.6);
+      if(kind==='fill')drop.position.set(fillOutlet.x,THREE.MathUtils.lerp(fillOutlet.y,waterY+.018,p),fillOutlet.z);
+      else drainPipe.curve.getPoint(p,drop.position);
     });
     turtleAnimator.update(dt,level,waterY,prefersReducedMotion.matches);
     renderer.render(scene,camera);

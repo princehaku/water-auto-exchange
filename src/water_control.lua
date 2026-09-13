@@ -334,15 +334,6 @@ function M.new(config, dependencies)
         local token = generation
         local ok, err = pcall(function()
             local t = sample() -- Recheck raw overflow even between periodic polls.
-            -- Apply an expired run's OFF before accepting an explicit new ON
-            -- arriving in the same event turn; never roll its timer forward
-            -- while leaving the physical output continuously energized.
-            local sampled = engine:status()
-            if sampled.state == "IDLE" and (sampled.reason == "fill_timeout" or sampled.reason == "drain_timeout")
-                and (actual.fill or actual.drain) then
-                apply(token)
-                if token ~= generation then accepted, reason = false, "command_cancelled"; return end
-            end
             accepted, reason = engine[method](engine, t, web_controlled)
             -- A fresh remote output gets one initial communication lease.
             -- Opening/repeating another route never renews an existing lease.
@@ -398,20 +389,13 @@ function M.new(config, dependencies)
         -- Generation invalidation prevents a queued callback from reopening a
         -- physical output after the server's time limit closes everything.
         local timer_ok, detail = cancel()
-        remote_deadline = nil
-        if name == "communication" then engine:fault("communication_timeout")
-        else engine:timeout(name) end
-        local outputs_ok, outputs_error = off_all()
-        if not timer_ok or not outputs_ok then
-            running = false
-            return fault("stop:" .. clean(detail or "") .. ";" .. outputs_error)
-        end
+        fault(name .. "_timeout")
+        if not timer_ok then running = false; return fault("stop:" .. clean(detail)) end
         if running then
             local ok, err = pcall(schedule)
             if not ok then running = false; cancel(); return fault(err) end
         end
         local s = self.status()
-        emit_status()
         if not s.outputs_known or s.fill or s.drain then return false, s.reason end
         return true, s.reason
     end

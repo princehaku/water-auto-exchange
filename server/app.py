@@ -85,6 +85,7 @@ class Store:
               id TEXT PRIMARY KEY, total INTEGER NOT NULL, interval_bytes INTEGER NOT NULL,
               interval_seconds INTEGER NOT NULL, updated REAL NOT NULL);
             CREATE TABLE IF NOT EXISTS aquarium_simulation (id INTEGER PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS level_job (id INTEGER PRIMARY KEY, value TEXT NOT NULL);
         ''')
         # Restart never resurrects commands or claims that old telemetry is live.
         self.db.execute("UPDATE commands SET status='uncertain', result='server_restarted' WHERE status IN ('queued','delivered')")
@@ -94,6 +95,17 @@ class Store:
         self.ws_gateway = None
         self.ws_grants = {}
         self.ws_grant_sequence = 0
+        self.ws_ping_sequence = 0
+        self.estimate_tick = None
+        self._job_runtime = {}
+        self._job_ticking = False
+        self._job_saved_second = None
+        saved_job = self.db.execute('SELECT value FROM level_job WHERE id=1').fetchone()
+        self.level_job = json.loads(saved_job['value']) if saved_job else None
+        if self.level_job and self.level_job['status'] == 'running':
+            self.level_job.update(status='failed', phase='done', reason='server_restarted',
+                                  updated_at=self.clock(), finished_at=self.clock())
+            self.save_level_job(True)
         self.web_limits = False
         self.control_runs = dict(fill=None, drain=None)
         self.control_timeout = None
@@ -114,6 +126,8 @@ class Store:
         # volume history. Do not invent liters for their existing estimate.
         self.simulation.setdefault('capacity_liters', None)
         self.simulation.setdefault('calibrated_at', None)
+        self.simulation.setdefault('integrated_at', self.simulation['observed_at'])
+        self.simulation.setdefault('estimate_basis', 'reported_outputs')
         for key in ('fill', 'drain'):
             self.simulation.setdefault(key + '_last_known_on',
                                        self.simulation[key + '_on'] if self.simulation['observed_known'] else None)
@@ -157,6 +171,239 @@ class Store:
                         (json.dumps(self.simulation),))
         self.db.commit()
 
+    def freeze_estimate(self):
+        self.simulation['uncertain'] = True
+        self.simulation['fill_since'] = self.simulation['drain_since'] = None
+        self.save_simulation()
+
+    def estimate_gap(self):
+        return self.control_clock() - self.estimate_tick if self.estimate_tick is not None else None
+
+    def integrate_estimate(self, maximum_gap=12):
+        sim, now = self.simulation, self.clock()
+        elapsed = self.estimate_gap()
+        if elapsed is None and sim.get('integrated_at') is not None:
+            elapsed = now - sim['integrated_at']
+        active = sim['fill_on'] or sim['drain_on']
+        if elapsed is not None and active and (elapsed < 0 or elapsed > maximum_gap):
+            sim['uncertain'] = True
+        if sim['observed_known'] and not sim['uncertain'] and sim['level'] is not None and elapsed is not None and elapsed > 0:
+            delta = (int(sim['fill_on']) * 100 / sim['fill_seconds']
+                     - int(sim['drain_on']) * 100 / sim['drain_seconds']) * elapsed
+            sim['level'] = min(100, max(0, sim['level'] + delta))
+            sim['updated_at'] = now
+            if sim['capacity_liters'] is not None:
+                for key in ('fill', 'drain'):
+                    if sim[key + '_on']:
+                        liters = sim['capacity_liters'] * elapsed / sim[key + '_seconds']
+                        sim[key + '_run_liters'] += liters
+                        sim[key + '_total_liters'] += liters
+        sim['integrated_at'] = now
+        self.estimate_tick = self.control_clock()
+
+    def save_level_job(self, force=False):
+        if self.level_job is None:
+            return
+        second = int(self.clock())
+        if not force and second == self._job_saved_second:
+            return
+        self._job_saved_second = second
+        self.db.execute('INSERT OR REPLACE INTO level_job VALUES(1,?)', (json.dumps(self.level_job),))
+        self.db.commit()
+
+    def job_running(self):
+        return self.level_job is not None and self.level_job['status'] == 'running'
+
+    def job_refresh(self):
+        job, runtime = self.level_job, self._job_runtime
+        if not job:
+            return None
+        if job['status'] == 'running':
+            current = max(0, runtime.get('stop_tick', self.control_clock()) - runtime['on_tick']) if runtime.get('on_tick') is not None else 0
+            job['round_elapsed_seconds'] = current
+            job['elapsed_seconds'] = runtime.get('completed_seconds', 0) + current
+            job['current_level'] = self.simulation['level']
+            job['remaining_seconds'] = self.job_remaining()
+            job['progress'] = min(100, 100 * job['elapsed_seconds'] / job['total_seconds'])
+            capacity = self.simulation['capacity_liters']
+            job['estimated_liters'] = capacity * job['elapsed_seconds'] / self.simulation[job['direction'] + '_seconds'] if capacity is not None else None
+            job['updated_at'] = self.clock()
+            job['round_remaining_seconds'] = max(0, runtime.get('stop_at', self.control_clock()) - self.control_clock()) if job['phase'] == 'active' else None
+            self.save_level_job()
+        return dict(job)
+
+    def job_remaining(self):
+        job = self.level_job
+        difference = job['target_level'] - self.simulation['level']
+        remaining = difference if job['direction'] == 'fill' else -difference
+        return max(0, remaining * self.simulation[job['direction'] + '_seconds'] / 100)
+
+    def job_finish(self, state, reason):
+        if not self.job_running():
+            return
+        self.job_refresh()
+        self.level_job.update(status=state, phase='done', reason=reason, finished_at=self.clock(), updated_at=self.clock(), round_remaining_seconds=None)
+        # Revoke offers which have not been authorized yet. Already executed
+        # commands retain their receipt path and their independent soft timer.
+        for key in ('on_id', 'off_id'):
+            command_id = self._job_runtime.get(key)
+            if command_id and command_id not in self.ws_grants:
+                self.db.execute("UPDATE commands SET status='cancelled', result='level_job_ended', finished=? WHERE id=? AND status IN ('queued','delivered')", (self.clock(), command_id))
+        self.save_level_job(True)
+
+    def job_command(self, command, ttl=8):
+        command_id = secrets.token_hex(16)
+        self.db.execute('INSERT INTO commands VALUES(?,?,?,?,?,?,?)',
+                        (command_id, command, self.clock(), self.clock() + ttl, 'queued', None, None))
+        self.db.commit()
+        return command_id
+
+    def job_start_round(self):
+        job, runtime = self.level_job, self._job_runtime
+        job.update(phase='starting', round=job['round'] + 1, reason='running')
+        runtime.update(on_tick=None, stop_at=None, off_id=None, start_until=self.control_clock() + 8)
+        runtime.pop('stop_tick', None)
+        runtime['on_id'] = self.job_command(job['direction'].upper())
+        self.save_level_job(True)
+
+    def start_level_job(self, value):
+        target = value.get('target_level') if isinstance(value, dict) else None
+        if type(target) not in (int, float) or not math.isfinite(target) or not 0 <= target <= 100:
+            raise Problem(400, 'invalid_level_target')
+        with self.lock:
+            if self.job_running():
+                raise Problem(409, 'level_job_active')
+            self.expire()
+            status = self.status or {}
+            if not self.web_limits or self.ws_gateway is None:
+                raise Problem(409, 'level_job_requires_web')
+            if not self.online() or status.get('outputs_known') != '1' or status.get('fill') != '0' or status.get('drain') != '0' or status.get('state') not in ('IDLE', 'DONE') or status.get('ready') != '1' or status.get('overflow') != '0' or self.control_timeout or self.control_uncertain or any(self.control_runs.values()):
+                raise Problem(409, 'level_job_requires_idle')
+            if self.simulation['level'] is None or self.simulation['uncertain']:
+                raise Problem(409, 'level_job_requires_calibration')
+            if self.db.execute("SELECT 1 FROM commands WHERE status IN ('queued','delivered')").fetchone():
+                raise Problem(409, 'command_pending')
+            difference = target - self.simulation['level']
+            if abs(difference) < 0.000001:
+                raise Problem(409, 'level_target_reached')
+            direction = 'fill' if difference > 0 else 'drain'
+            seconds = abs(difference) * self.simulation[direction + '_seconds'] / 100
+            limit = 170 if direction == 'fill' else 290
+            self.level_job = dict(id=secrets.token_hex(16), status='running', phase='starting', direction=direction,
+                                  target_level=float(target), start_level=self.simulation['level'], current_level=self.simulation['level'],
+                                  round=0, elapsed_seconds=0, round_elapsed_seconds=0, round_limit_seconds=limit,
+                                  total_seconds=seconds, remaining_seconds=seconds, estimated_rounds=math.ceil(seconds / limit),
+                                  estimated_liters=0 if self.simulation['capacity_liters'] is not None else None,
+                                  progress=0, estimated=True, created_at=self.clock(), updated_at=self.clock(), finished_at=None, reason='running')
+            self._job_runtime = dict(session=self.ws_gateway, completed_seconds=0, cancel_reason=None)
+            self.job_start_round()
+            return self.job_refresh()
+
+    def job_request_stop(self, cancel_reason=None):
+        job, runtime = self.level_job, self._job_runtime
+        if cancel_reason:
+            runtime['cancel_reason'] = cancel_reason
+            for key in ('on_id', 'off_id'):
+                command_id = runtime.get(key)
+                if command_id and command_id not in self.ws_grants:
+                    self.db.execute("UPDATE commands SET status='cancelled', result='level_job_cancelled', finished=? WHERE id=? AND status IN ('queued','delivered')", (self.clock(), command_id))
+        job.update(phase='stopping', reason=cancel_reason or 'round_stopping')
+        runtime['off_id'] = self.job_command('STOP' if cancel_reason else job['direction'].upper() + '_OFF', ttl=5)
+        runtime['stop_until'] = self.control_clock() + 5
+        self.save_level_job(True)
+
+    def cancel_level_job(self):
+        with self.lock:
+            if self.job_running() and not self._job_runtime.get('cancel_reason'):
+                self.job_request_stop('cancelled_by_user')
+            return self.job_refresh()
+
+    def job_observe(self, status, ack=None):
+        if not self.job_running():
+            return
+        job, runtime = self.level_job, self._job_runtime
+        if status['state'] == 'FAULT':
+            self.job_finish('failed', 'device_fault')
+            return
+        if status['outputs_known'] != '1':
+            self.job_finish('failed', 'output_unknown')
+            return
+        if job['phase'] == 'waiting' and (status['ready'] != '1' or status['overflow'] != '0'):
+            self.job_finish('failed', 'device_not_ready')
+            return
+        if ack and ack.get('id') in (runtime.get('on_id'), runtime.get('off_id')) and ack.get('status') != 'succeeded':
+            self.job_finish('failed', 'command_rejected')
+            self.control_abort('level_job_command_rejected')
+        direction = job['direction']
+        other = 'drain' if direction == 'fill' else 'fill'
+        if status[other] != '0':
+            self.job_finish('failed', 'unexpected_output')
+            self.control_abort('level_job_unexpected_output')
+        if job['phase'] == 'stopping' and status['fill'] == status['drain'] == '0' and runtime.get('off_id') in self.ws_grants:
+            runtime.setdefault('stop_tick', self.control_clock())
+        if job['phase'] == 'starting' and status[direction] == '1' and runtime['on_id'] in self.ws_grants:
+            runtime['on_tick'] = self.control_clock()
+            grant = self.control_runs[direction]
+            runtime['stop_at'] = min(runtime['on_tick'] + min(job['round_limit_seconds'], self.job_remaining()), grant['until'] - 10)
+            job['phase'] = 'active'
+            self.save_level_job(True)
+        elif job['phase'] == 'active' and status[direction] == '0':
+            self.job_finish('failed', 'unexpected_output_off')
+        elif job['phase'] == 'stopping' and ack and ack.get('id') == runtime['off_id'] and status['fill'] == status['drain'] == '0' and status['state'] in ('IDLE', 'DONE'):
+            self.job_refresh()
+            runtime['completed_seconds'] = job['elapsed_seconds']
+            runtime['on_tick'] = None
+            if runtime.get('cancel_reason'):
+                self.job_finish('cancelled', runtime['cancel_reason'])
+            elif self.job_remaining() <= 0.00001:
+                self.job_finish('completed', 'target_reached')
+            else:
+                job.update(phase='waiting', reason='between_rounds')
+                runtime['wait_until'] = self.control_clock() + 2
+                self.save_level_job(True)
+
+    def job_tick(self):
+        if not self.job_running() or self._job_ticking:
+            return
+        self._job_ticking = True
+        try:
+            job, runtime = self.level_job, self._job_runtime
+            if runtime.get('session') != self.ws_gateway:
+                self.job_finish('failed', 'device_disconnected')
+                return
+            if not self.online():
+                self.job_finish('failed', 'device_disconnected')
+                self.control_abort('level_job_disconnected')
+            active = self.simulation['fill_on'] or self.simulation['drain_on']
+            gap = self.estimate_gap()
+            if active and gap is not None and gap > 5:
+                self.freeze_estimate()
+            if self.simulation['uncertain']:
+                self.job_finish('failed', 'estimate_uncertain')
+                self.control_abort('level_job_estimate_uncertain')
+            now = self.control_clock()
+            if job['phase'] == 'starting' and now >= runtime['start_until']:
+                self.job_finish('failed', 'start_timeout')
+                self.control_abort('level_job_start_timeout')
+            elif job['phase'] == 'active' and (now >= runtime['stop_at'] or self.job_remaining() <= 0.00001):
+                self.job_request_stop()
+            elif job['phase'] == 'stopping' and now >= runtime['stop_until']:
+                self.job_finish('failed', 'stop_unconfirmed')
+                self.control_abort('level_job_stop_unconfirmed')
+            elif job['phase'] == 'waiting' and now >= runtime['wait_until']:
+                status = self.status or {}
+                if status.get('outputs_known') != '1' or status.get('fill') != '0' or status.get('drain') != '0' or status.get('state') not in ('IDLE', 'DONE'):
+                    self.job_finish('failed', 'output_unknown')
+                elif status.get('ready') != '1' or status.get('overflow') != '0':
+                    self.job_finish('failed', 'device_not_ready')
+                elif self.job_remaining() <= 0.00001:
+                    self.job_finish('completed', 'target_reached')
+                else:
+                    self.job_start_round()
+            self.job_refresh()
+        finally:
+            self._job_ticking = False
+
     def control_abort(self, reason):
         self.control_uncertain = True
         if self.ws_gateway:
@@ -189,9 +436,9 @@ class Store:
         ack_grant = self.ws_grants.get(ack.get('id')) if ack else None
         timeout = self.control_timeout
         normal_timeout_closed = False
-        if timeout and all_off and status['version'] == '0.8.3' and status['state'] in ('IDLE', 'DONE'):
+        if timeout and all_off and status['version'] in ('0.8.2', '0.8.3') and status['state'] in ('IDLE', 'DONE'):
             timeout_grant = self.ws_grants.get(timeout['id'])
-            expected_reason = timeout['key'] + '_timeout'
+            expected_reason = 'stopped' if status['version'] == '0.8.2' else timeout['key'] + '_timeout'
             # An old in-flight OFF must not acknowledge the new timeout.
             # A current execute receipt proves ordering directly; unsolicited
             # status additionally needs the expected timeout completion reason.
@@ -199,14 +446,14 @@ class Store:
                 (ack_grant and ack.get('status') == 'succeeded'
                  and ack_grant['sequence'] > timeout['grant_sequence']
                  and (ack['id'] == timeout['id'] or ack_row['command'] in ('STOP', 'FILL_OFF', 'DRAIN_OFF')))
-                or (timeout_grant and ack is None and status['reason'] == expected_reason))
+                or (status['version'] == '0.8.3' and timeout_grant and ack is None and status['reason'] == expected_reason))
         if timeout and all_off and (status['state'] == 'FAULT' or normal_timeout_closed):
             # 0.8.3 completes normal time limits without faulting. Earlier
             # firmware, and actual faults on any version, retain their latch.
-            self.db.execute("UPDATE commands SET status=?, result=?, finished=? WHERE command IN ('FILL_TIMEOUT','DRAIN_TIMEOUT') AND status IN ('queued','delivered') AND id<>?",
+            self.db.execute("UPDATE commands SET status=?, result=?, finished=? WHERE id=? AND status IN ('queued','delivered') AND id<>?",
                             ('succeeded' if normal_timeout_closed else 'cancelled',
                              'outputs_off_confirmed' if normal_timeout_closed else 'fault_confirmed',
-                             self.clock(), ack.get('id', '') if ack else ''))
+                             self.clock(), timeout['id'], ack.get('id', '') if ack else ''))
             self.control_runs = dict(fill=None, drain=None)
             self.control_timeout = None
             self.control_uncertain = False
@@ -232,6 +479,11 @@ class Store:
         with self.lock:
             if session is not None and session != self.ws_gateway:
                 raise Problem(409, 'stale_session')
+            try:
+                self.job_tick()
+            except Problem:
+                if session is not None:
+                    raise
             if not self.web_limits or self.ws_gateway is None:
                 return
             now = self.control_clock()
@@ -251,7 +503,7 @@ class Store:
             self.db.execute("UPDATE commands SET status='cancelled', result='superseded_by_timeout', finished=? WHERE status IN ('queued','delivered')", (self.clock(),))
             command_id = secrets.token_hex(16)
             self.db.execute('INSERT INTO commands VALUES(?,?,?,?,?,?,?)',
-                            (command_id, key.upper() + '_TIMEOUT', self.clock(),
+                            (command_id, 'STOP' if self.status['version'] == '0.8.2' else key.upper() + '_TIMEOUT', self.clock(),
                              self.clock() + 1, 'queued', None, None))
             self.control_timeout = dict(key=key, id=command_id, confirm_until=now + 1,
                                         grant_sequence=self.ws_grant_sequence)
@@ -281,26 +533,12 @@ class Store:
     def observe_outputs(self, status):
         """Integrate only spans supported by consecutive, fresh device reports."""
         sim, now = self.simulation, self.clock()
-        previous_at = sim['observed_at']
         known = status['outputs_known'] == '1'
         # An unknown endpoint cannot confirm how long the previous output ran.
         if not known and (sim['level'] is not None or sim['fill_on'] or sim['drain_on']):
             sim['uncertain'] = True
-        if sim['observed_known'] and previous_at is not None and not sim['uncertain']:
-            elapsed = max(0, now - previous_at)
-            if elapsed > 12 and (sim['fill_on'] or sim['drain_on']):
-                sim['uncertain'] = True
-            elif elapsed and sim['level'] is not None:
-                delta = (int(sim['fill_on']) * 100 / sim['fill_seconds']
-                         - int(sim['drain_on']) * 100 / sim['drain_seconds']) * elapsed
-                sim['level'] = min(100, max(0, sim['level'] + delta))
-                sim['updated_at'] = now
-                if sim['capacity_liters'] is not None:
-                    for key in ('fill', 'drain'):
-                        if sim[key + '_on']:
-                            liters = sim['capacity_liters'] * elapsed / sim[key + '_seconds']
-                            sim[key + '_run_liters'] += liters
-                            sim[key + '_total_liters'] += liters
+        self.integrate_estimate(5 if self.web_limits else 12)
+        sim['estimate_basis'] = 'reported_outputs'
         # Without a calibrated water history, confirmed all-OFF is enough to
         # establish a fresh timer baseline. A calibrated estimate stays frozen
         # until the user supplies a new observed water level.
@@ -336,8 +574,13 @@ class Store:
                                      or not 0.1 <= capacity <= 100000):
             raise Problem(400, 'invalid_simulation')
         with self.lock:
-            if not self.online() or not self.status or self.status['outputs_known'] != '1' or self.status['fill'] != '0' or self.status['drain'] != '0':
+            self.expire()
+            pending_on = self.db.execute("SELECT 1 FROM commands WHERE status IN ('queued','delivered') AND command IN ('FILL','DRAIN','START')").fetchone()
+            control_pending = self.control_timeout or any(self.control_runs.values()) or (self.web_limits and self.control_uncertain)
+            job_pending = self.job_running() and self.level_job['phase'] != 'waiting'
+            if not self.online() or not self.status or self.status['outputs_known'] != '1' or self.status['fill'] != '0' or self.status['drain'] != '0' or pending_on or control_pending or job_pending:
                 raise Problem(409, 'simulation_requires_idle')
+            self.job_finish('cancelled', 'calibration_changed')
             if 'capacity_liters' not in value:
                 capacity = self.simulation['capacity_liters']
             self.simulation.update(level=float(level), fill_seconds=float(fill_seconds),
@@ -346,6 +589,9 @@ class Store:
                                    fill_on=False, drain_on=False, fill_since=None, drain_since=None,
                                    capacity_liters=float(capacity) if capacity is not None else None,
                                    calibrated_at=self.clock())
+            self.simulation['integrated_at'] = self.clock()
+            self.simulation['estimate_basis'] = 'reported_outputs'
+            self.estimate_tick = self.control_clock()
             for key in ('fill', 'drain'):
                 self.simulation[key + '_last_known_on'] = False
                 self.simulation[key + '_run_liters'] = 0.0 if capacity is not None else None
@@ -357,7 +603,8 @@ class Store:
         sim = self.simulation
         online = self.online()
         active = sim['fill_on'] or sim['drain_on']
-        if active and sim['observed_at'] is not None and self.clock() - sim['observed_at'] > 12:
+        gap = self.estimate_gap() if self.web_limits else (self.clock() - sim['observed_at'] if sim['observed_at'] is not None else None)
+        if active and gap is not None and gap > (5 if self.web_limits else 12):
             sim['uncertain'] = True
             sim['observed_known'] = False
             sim['observed_at'] = None
@@ -373,6 +620,7 @@ class Store:
                     fill_seconds=sim['fill_seconds'], drain_seconds=sim['drain_seconds'],
                     updated_at=sim['updated_at'], calibrated_at=sim['calibrated_at'], uncertain=sim['uncertain'],
                     observed_at=sim['observed_at'], fill_on_since=sim['fill_since'],
+                    estimate_basis=sim['estimate_basis'], estimated_at=sim.get('integrated_at'),
                     drain_on_since=sim['drain_since'], capacity_liters=capacity,
                     volume_liters=capacity * sim['level'] / 100 if has_volume else None,
                     fill_rate_lpm=capacity * 60 / sim['fill_seconds'] if has_volume else None,
@@ -467,6 +715,7 @@ class Store:
                         traffic=self.traffic_snapshot(),
                         simulation=self.simulation_snapshot(),
                         control_limits=self.control_limits_snapshot(),
+                        level_job=self.job_refresh(),
                         commands=[dict(r) for r in self.db.execute('SELECT * FROM commands ORDER BY created DESC, rowid DESC LIMIT 60')])
 
     def enqueue(self, command, request_id):
@@ -500,12 +749,19 @@ class Store:
                     raise Problem(409, 'level_not_ready')
             if command == 'RESET' and s['state'] != 'FAULT':
                 raise Problem(409, 'not_faulted')
+            if command not in ('STOP', 'FILL_OFF', 'DRAIN_OFF'):
+                cancelable = set()
+                if self.job_running():
+                    cancelable = {value for key, value in self._job_runtime.items() if key in ('on_id', 'off_id') and value not in self.ws_grants}
+                pending = self.db.execute("SELECT id FROM commands WHERE status IN ('queued','delivered')").fetchall()
+                if any(row['id'] not in cancelable for row in pending):
+                    raise Problem(409, 'command_pending')
+            if self.job_running():
+                self.job_finish('cancelled', 'manual_override')
             if command == 'STOP':
-                self.db.execute("UPDATE commands SET status='cancelled', result='superseded_by_stop', finished=? WHERE status='queued' AND command NOT IN ('FILL_TIMEOUT','DRAIN_TIMEOUT')", (self.clock(),))
+                self.db.execute("UPDATE commands SET status='cancelled', result='superseded_by_stop', finished=? WHERE status='queued' AND id<>?", (self.clock(), self.control_timeout['id'] if self.control_timeout else ''))
             elif command in ('FILL_OFF', 'DRAIN_OFF'):
                 self.db.execute("UPDATE commands SET status='cancelled', result='superseded_by_output_off', finished=? WHERE status='queued' AND command=?", (self.clock(), command[:-4]))
-            elif self.db.execute("SELECT 1 FROM commands WHERE status IN ('queued','delivered')").fetchone():
-                raise Problem(409, 'command_pending')
             now = self.clock()
             self.db.execute('INSERT INTO commands VALUES (?,?,?,?,?,?,?)', (request_id, command, now, now + 8, 'queued', None, None))
             self.db.commit()
@@ -528,6 +784,7 @@ class Store:
             self.web_limits = False
             self.ws_grants = {}
             self.ws_grant_sequence = 0
+            self.ws_ping_sequence = 0
             self.control_runs = dict(fill=None, drain=None)
             self.control_timeout = None
             self.expire()
@@ -572,6 +829,7 @@ class Store:
             self.ws_gateway = self.gateway = secrets.token_hex(16)
             self.ws_grants = {}
             self.ws_grant_sequence = 0
+            self.ws_ping_sequence = 0
             self.web_limits = soft
             self.control_runs = dict(fill=None, drain=None)
             self.control_timeout = None
@@ -583,6 +841,32 @@ class Store:
             self.gateway_seen = self.seen
             self.connection_event(True, 'connected')
             return self.ws_gateway
+
+    def ws_ping(self, session, sequence):
+        """Extrapolate confirmed outputs during a continuous authorized lease.
+
+        A bare ping is not a fresh output report. observed_at and the actual
+        device snapshot retain their last report time and values.
+        """
+        with self.lock:
+            if session is None or session != self.ws_gateway:
+                raise Problem(409, 'stale_session')
+            if type(sequence) not in (int, float) or not 1 <= sequence <= 9007199254740991 or sequence % 1:
+                raise Problem(400, 'invalid_ping')
+            if sequence <= self.ws_ping_sequence:
+                self.control_tick(session)
+                return False
+            sim = self.simulation
+            active = sim['fill_on'] or sim['drain_on']
+            authorized = (self.web_limits and self.status and self.status['outputs_known'] == '1'
+                          and all(not sim[key + '_on'] or (self.control_runs[key] and self.control_runs[key]['observed_on']) for key in ('fill', 'drain')))
+            if active and authorized and sim['observed_known'] and not sim['uncertain']:
+                self.integrate_estimate(5)
+                sim['estimate_basis'] = 'confirmed_outputs_heartbeat_estimate'
+                self.save_simulation()
+            self.ws_ping_sequence = sequence
+            self.ws_touch(session)
+            return True
 
     def ws_touch(self, session, status=None, ack=None):
         with self.lock:
@@ -617,6 +901,8 @@ class Store:
             if ack is not None:
                 self.db.execute("UPDATE commands SET status=?, result=?, finished=? WHERE id=? AND status IN ('delivered','uncertain')", (ack['status'], ack['result'], self.clock(), ack['id']))
                 self.db.commit()
+            if status is not None:
+                self.job_observe(status, ack)
             self.seen = self.gateway_seen = self.clock()
             self.connection_event(True, 'connected')
 
@@ -626,7 +912,7 @@ class Store:
                 return None
             self.control_tick(session)
             self.expire()
-            row = self.db.execute("SELECT * FROM commands WHERE status='queued' ORDER BY " + COMMAND_PRIORITY + ", created LIMIT 1").fetchone()
+            row = self.db.execute("SELECT * FROM commands WHERE status='queued' ORDER BY CASE WHEN id=? THEN 0 ELSE 1 END, " + COMMAND_PRIORITY + ", created LIMIT 1", (self.control_timeout['id'] if self.control_timeout else '',)).fetchone()
             if not row:
                 return None
             self.db.execute("UPDATE commands SET status='delivered' WHERE id=?", (row['id'],))
@@ -653,6 +939,7 @@ class Store:
         with self.lock:
             if session != self.ws_gateway:
                 return
+            self.job_finish('failed', 'device_disconnected')
             self.db.execute("UPDATE commands SET status='uncertain', result='device_disconnected', finished=? WHERE status IN ('queued','delivered')", (self.clock(),))
             self.db.commit()
             self.ws_gateway = self.gateway = None
@@ -767,6 +1054,11 @@ class Handler(BaseHTTPRequestHandler):
             return self.respond(200, self.server.store.snapshot())
         if path == '/water/api/simulation' and post:
             return self.respond(200, self.server.store.configure_simulation(self.body()))
+        if path == '/water/api/level-job' and post:
+            return self.respond(202, self.server.store.start_level_job(self.body()))
+        if path == '/water/api/level-job/cancel' and post:
+            self.body()
+            return self.respond(200, self.server.store.cancel_level_job())
         if path == '/water/api/commands' and post:
             data = self.body()
             return self.respond(202, self.server.store.enqueue(data.get('command'), data.get('id')))

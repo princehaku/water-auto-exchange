@@ -12,7 +12,9 @@ SAFE_CLOSE_REASONS = frozenset((
     'invalid_status', 'invalid_state', 'invalid_control_mode', 'invalid_flag',
     'invalid_level_or_cycle', 'invalid_message', 'message_too_large',
     'invalid_claim', 'session_limit', 'unclaimed_ack', 'invalid_ack', 'invalid_type', 'invalid_traffic',
-    'control_state_uncertain', 'control_unowned_output', 'control_protocol_changed', 'control_stop_unconfirmed'))
+    'control_state_uncertain', 'control_unowned_output', 'control_protocol_changed', 'control_stop_unconfirmed',
+    'invalid_ping', 'level_job_command_rejected', 'level_job_unexpected_output', 'level_job_estimate_uncertain',
+    'level_job_start_timeout', 'level_job_stop_unconfirmed', 'level_job_disconnected'))
 
 
 def safe_close_reason(error):
@@ -99,7 +101,7 @@ def serve(handler):
                     authenticated = True
                     send(dict(type='ready', session=session, soft_limits=dict(store.soft_limits)))
                 elif kind == 'ping':
-                    store.ws_touch(session)
+                    store.ws_ping(session, message.get('seq'))
                     send(dict(type='pong', seq=message.get('seq')))
                 elif kind == 'status':
                     store.ws_touch(session, status=message.get('status'))

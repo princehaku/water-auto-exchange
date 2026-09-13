@@ -174,13 +174,11 @@ class WebSocketTests(unittest.TestCase):
         # reserved the deadline, and the socket owner ticks independently.
         self.now += 180
         timeout_offer = json.loads(client.recv())
-        self.assertEqual(timeout_offer['command'], 'FILL_TIMEOUT')
+        self.assertEqual(timeout_offer['command'], 'STOP')
         client.send(json.dumps(dict(type='claim', id=timeout_offer['id'])))
-        self.assertEqual(json.loads(client.recv())['command'], 'FILL_TIMEOUT')
-        # Legacy 0.8.2 still requires its fault latch. An IDLE result must not
-        # silently reinterpret that firmware's timeout contract as 0.8.3.
-        client.send(json.dumps(dict(type='ack', ack=dict(id=timeout_offer['id'], status='succeeded', result='OK'),
-                                    status=dict(status, reason='fill_timeout'))))
+        self.assertEqual(json.loads(client.recv())['command'], 'STOP')
+        # An old ordinary OFF status cannot stand in for the new STOP ACK.
+        client.send(json.dumps(dict(type='status', status=dict(status, reason='stopped'))))
         self.assertEqual(json.loads(client.recv())['type'], 'received')
         self.assertIsNotNone(self.store.control_timeout)
         self.now += 1
@@ -200,6 +198,54 @@ class WebSocketTests(unittest.TestCase):
                                                 need_fill='unknown', state='FILLING', fill='1'))))
         self.assertEqual(client.recv(), '')
         self.assertIsNone(self.store.ws_gateway)
+
+    def test_bare_082_pings_drive_thousand_second_job_without_browser(self):
+        status = dict(STATUS, version='0.8.2', control_mode='manual', need_fill='unknown')
+        client = self.connect(status=status)
+        self.store.configure_simulation(dict(level=100, fill_seconds=1000, drain_seconds=3000, capacity_liters=60))
+        self.store.start_level_job(dict(target_level=100 - 100 / 3))
+        pending, sequence = [], 0
+
+        def ping():
+            nonlocal sequence
+            sequence += 1
+            client.send(json.dumps(dict(type='ping', seq=sequence)))
+            while True:
+                message = json.loads(client.recv())
+                if message['type'] == 'offer':
+                    pending.append(message)
+                else:
+                    self.assertEqual(message, dict(type='pong', seq=sequence))
+                    return
+
+        def execute(command, **changes):
+            offer = pending.pop(0) if pending else json.loads(client.recv())
+            self.assertEqual(offer['command'], command)
+            client.send(json.dumps(dict(type='claim', id=offer['id'])))
+            self.assertEqual(json.loads(client.recv())['command'], command)
+            status.update(changes)
+            client.send(json.dumps(dict(type='ack', ack=dict(id=offer['id'], status='succeeded', result='OK ' + command), status=status)))
+            self.assertEqual(json.loads(client.recv())['type'], 'received')
+
+        for index, seconds in enumerate((290, 290, 290, 130)):
+            execute('DRAIN', drain='1', state='DRAINING', reason='manual_draining')
+            actual_observed_at = self.store.simulation['observed_at']
+            for _ in range(seconds):
+                self.now += 1
+                ping()
+            self.assertEqual(self.store.simulation['observed_at'], actual_observed_at)
+            execute('DRAIN_OFF', drain='0', state='IDLE', reason='stopped')
+            if index < 3:
+                self.assertEqual(self.store.level_job['phase'], 'waiting')
+                self.now += 2
+                ping()
+        job = self.store.snapshot()['level_job']
+        self.assertEqual(job['status'], 'completed')
+        self.assertEqual(job['round'], 4)
+        self.assertAlmostEqual(job['elapsed_seconds'], 1000)
+        self.assertAlmostEqual(job['estimated_liters'], 20)
+        self.assertAlmostEqual(job['current_level'], 100 - 100 / 3)
+        self.assertFalse(self.store.db.execute("SELECT 1 FROM commands WHERE command IN ('RESET','DRAIN_TIMEOUT')").fetchone())
 
     def test_graceful_limit_closes_outputs_and_accepts_manual_restart_without_reset(self):
         status = dict(STATUS, version='0.8.3', control_mode='manual', need_fill='unknown')
@@ -251,7 +297,7 @@ class WebSocketTests(unittest.TestCase):
         self.assertEqual(self.store.control_runs['fill']['command_id'], format(3, '032x'))
         self.assertEqual(self.store.simulation['observed_at'], observed)
         self.now += 179
-        self.assertEqual(json.loads(client.recv())['command'], 'FILL_TIMEOUT')
+        self.assertEqual(json.loads(client.recv())['command'], 'STOP')
 
     def concurrent_outputs_roundtrip(self, version):
         status=dict(STATUS,version=version,control_mode='manual',need_fill='unknown')

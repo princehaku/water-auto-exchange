@@ -300,18 +300,17 @@ test("STOP invalidates retained timer callbacks and monitoring never restarts ou
     equal(h.writes_since(after_stop), 0)
 end)
 
-test("drain and fill timeouts attempt both outputs OFF and permit another operation", function()
+test("drain and fill timeouts attempt both outputs OFF and remain latched", function()
     for _, filling in ipairs({ false, true }) do
         local h = fixture(); h.ready(filling)
         if filling then assert(h.controller.fill()) else assert(h.controller.start()) end
         local before = #h.events
         h.poll(1000)
-        equal(state(h, "IDLE").reason, filling and "fill_timeout" or "drain_timeout")
+        equal(state(h, "FAULT").reason, filling and "fill_timeout" or "drain_timeout")
         both_off_attempted(h, before)
-        equal(h.controller.status().ready,true)
-        h.poll(100); state(h, "IDLE")
-        assert(h.controller[filling and "fill" or "start"]())
-        state(h,filling and "FILLING" or "DRAINING",filling,not filling)
+        assert(h.controller.stop()); state(h, "FAULT")
+        equal(h.controller.start(), false)
+        h.poll(100); state(h, "FAULT")
     end
 end)
 
@@ -479,7 +478,7 @@ test("Air724 raw ticks advance five milliseconds each", function()
     h.tick = 20; h.poll(0); equal(h.controller.status().ready, true)
     assert(h.controller.start())
     h.tick = 219; h.poll(0); state(h, "DRAINING", false, true)
-    h.tick = 220; h.poll(0); equal(state(h, "IDLE").reason, "drain_timeout")
+    h.tick = 220; h.poll(0); equal(state(h, "FAULT").reason, "drain_timeout")
 end)
 
 test("signed tick boundary and complete 32-bit rollover preserve deadlines", function()
@@ -487,7 +486,7 @@ test("signed tick boundary and complete 32-bit rollover preserve deadlines", fun
         local h = fixture(); h.signed = true; h.tick = start_tick
         h.ready(false); assert(h.controller.start())
         h.poll(995); state(h, "DRAINING", false, true)
-        h.poll(5); equal(state(h, "IDLE").reason, "drain_timeout")
+        h.poll(5); equal(state(h, "FAULT").reason, "drain_timeout")
     end
 end)
 
@@ -523,8 +522,8 @@ end)
 test("logging failure cannot interrupt cleanup or sensor monitoring", function()
     local h = fixture(); h.on_emit = function() error("logger_down") end
     h.ready(false); assert(h.controller.start())
-    h.poll(1000); state(h, "IDLE")
-    assert(h.controller.start());state(h,"DRAINING",false,true)
+    h.poll(1000); state(h, "FAULT")
+    assert(h.controller.reset()); state(h, "IDLE")
     assert(h.controller.stop())
     h.poll(100); state(h, "IDLE")
 end)
@@ -667,7 +666,7 @@ test("board fill and drain timeouts execute LOW then close at 180 and 300 second
         assert(h.controller[name]())
         local before = #h.events
         h.poll(1)
-        local s = state(h, "IDLE")
+        local s = state(h, "FAULT")
         equal(s.reason, name .. "_timeout"); equal(s.outputs_known, true)
         equal(h.opened[23], false); equal(h.opened[5], false)
         local gpio, low = h.config.outputs[name].gpio, false
@@ -677,9 +676,9 @@ test("board fill and drain timeouts execute LOW then close at 180 and 300 second
             if e.gpio == gpio and e.kind == "close" then assert(low, "LOW must precede close") end
         end
         assert(low, "timeout must write LOW before releasing its output")
+        equal(h.controller[name](), false)
         h.poll(1000); equal(h.opened[23], false); equal(h.opened[5], false)
-        assert(h.controller[name]());equal(h.opened[gpio],true)
-        assert(h.controller.stop());state(h,"IDLE")
+        assert(h.controller.reset()); state(h, "IDLE")
     end
 end)
 
@@ -697,7 +696,7 @@ test("board independent deadlines survive both start orders and repeated ON", fu
         assert(h.controller[item.first]()); assert(h.controller[item.second]())
         local before = #h.events
         h.poll(1)
-        equal(state(h, "IDLE").reason, item.fault)
+        equal(state(h, "FAULT").reason, item.fault)
         both_off_attempted(h, before)
         for _, gpio in ipairs({23, 5}) do
             local low = false
@@ -708,8 +707,9 @@ test("board independent deadlines survive both start orders and repeated ON", fu
             end
             equal(h.opened[gpio], false)
         end
-        h.poll(1000); state(h, "IDLE")
-        equal(h.controller.status().ready,true)
+        equal(h.controller.fill(), false); equal(h.controller.drain(), false)
+        h.poll(1000); state(h, "FAULT")
+        assert(h.controller.reset()); state(h, "IDLE")
         assert(h.controller[item.second]()); assert(h.controller.stop())
     end
 end)
@@ -756,7 +756,7 @@ test("concurrent board timeout and partial OFF failure attempt to shut both outp
         assert(h.controller.fill());h.poll(60000);assert(h.controller.drain())
         if failure=="timeout" then
             h.poll(119999);state(h,"EXCHANGING",true,true)
-            h.poll(1);equal(state(h,"IDLE").reason,"fill_timeout")
+            h.poll(1);equal(state(h,"FAULT").reason,"fill_timeout")
         else
             if failure=="close" then h.on_close=function(gpio) if gpio==23 then return false end end
             else h.on_write=function(value,gpio) if gpio==23 and value==0 then return false end end end
@@ -764,10 +764,8 @@ test("concurrent board timeout and partial OFF failure attempt to shut both outp
             equal(h.controller.status().state,"FAULT");equal(h.controller.status().outputs_known,false)
         end
         equal(h.opened[5],false)
-        if failure=="timeout" then
-            assert(h.controller.fill());assert(h.controller.drain());assert(h.controller.stop())
-        else
-            equal(h.controller.fill(),false);equal(h.controller.drain(),false)
+        equal(h.controller.fill(),false);equal(h.controller.drain(),false)
+        if failure~="timeout" then
             h.on_close,h.on_write=nil,nil;assert(h.controller.stop())
             local ok,reason=h.controller.reset()
             equal(ok,false);equal(reason,"poller_stopped_restart_required")
@@ -814,7 +812,7 @@ test("Web leases bypass fixed local limits while fresh heartbeats continue", fun
         h.run(1000);state(h,"EXCHANGING",true,true);assert(h.controller.remote_heartbeat())
     end
     equal(h.levels[23],1);equal(h.levels[5],1)
-    assert(h.controller.remote_timeout("fill"));equal(state(h,"IDLE").reason,"fill_timeout")
+    assert(h.controller.remote_timeout("fill"));equal(state(h,"FAULT").reason,"fill_timeout")
     equal(h.opened[23],false);equal(h.opened[5],false)
 end)
 
@@ -858,7 +856,7 @@ test("local USB retains fixed timing and repeated remote ON cannot remove that l
         assert(h.controller.remote_command(name))
         local limit=h.config.timing[name.."_timeout_ms"]
         h.poll(limit-501);equal(h.controller.status()[name],true)
-        h.poll(1);equal(state(h,"IDLE").reason,name.."_timeout")
+        h.poll(1);equal(state(h,"FAULT").reason,name.."_timeout")
         equal(h.opened[h.config.outputs[name].gpio],false)
     end
 end)
@@ -868,7 +866,7 @@ test("server timeout closes both outputs LOW then release and invalidates stale 
         local h=board_fixture();assert(h.controller.init());h.poll(500)
         assert(h.controller.remote_command("fill"));assert(h.controller.remote_command("drain"))
         local _,stale=h.pending();local before=#h.events
-        assert(h.controller.remote_timeout(name));equal(state(h,"IDLE").reason,name.."_timeout")
+        assert(h.controller.remote_timeout(name));equal(state(h,"FAULT").reason,name.."_timeout")
         for _,gpio in ipairs({23,5}) do
             local low,closed
             for i=before+1,#h.events do
@@ -879,10 +877,9 @@ test("server timeout closes both outputs LOW then release and invalidates stale 
             assert(low and closed and low<closed)
         end
         before=#h.events;stale();equal(#h.events,before)
+        equal(h.controller.fill(),false);equal(h.controller.drain(),false)
+        assert(h.controller.reset());state(h,"IDLE")
         h.run(1000);state(h,"IDLE")
-        assert(h.controller.remote_command("fill"));assert(h.controller.remote_command("drain"))
-        state(h,"EXCHANGING",true,true)
-        assert(h.controller.stop());state(h,"IDLE")
     end
 end)
 
@@ -912,72 +909,7 @@ test("remote automatic cycles keep local phase limits and a five second communic
     end
     local h=fixture();h.ready(false);assert(h.controller.remote_command("start"))
     h.run(995);assert(h.controller.remote_heartbeat());h.run(5)
-    equal(state(h,"IDLE").reason,"drain_timeout")
-end)
-
-test("same-event ON after a local limit releases LOW before a fresh physical start",function()
-    for _,name in ipairs({"fill","drain"}) do
-        local h=board_fixture();assert(h.controller.init());h.poll(500)
-        assert(h.controller[name]());local before=#h.events
-        -- No poll is dispatched first: the command itself observes expiry.
-        h.elapse(h.config.timing[name.."_timeout_ms"]);assert(h.controller[name]())
-        local low,closed,reopened,high
-        for i=before+1,#h.events do
-            local e=h.events[i]
-            if e.gpio==h.config.outputs[name].gpio then
-                if e.kind=="write" and e.value==0 then low=i end
-                if e.kind=="close" then closed=i end
-                if e.kind=="output_setup" then reopened=i end
-                if e.kind=="write" and e.value==1 then high=i end
-            end
-        end
-        assert(low and closed and reopened and high and low<closed and closed<reopened and reopened<high)
-        equal(h.controller.status()[name],true)
-        h.poll(h.config.timing[name.."_timeout_ms"])
-        equal(state(h,"IDLE").reason,name.."_timeout")
-    end
-end)
-
-test("server operation limit never unlocks a prior communication or overflow fault",function()
-    for _,cause in ipairs({"communication_timeout","overflow"}) do
-        local cfg=dofile(root.."/src/water_config.lua")
-        if cause=="overflow" then cfg.inputs.overflow={enabled=true,gpio=11,active_level=1,pull="DOWN"} end
-        local h=fixture(cfg);assert(h.controller.init());h.poll(500)
-        assert(h.controller.remote_command("fill"))
-        if cause=="communication_timeout" then h.run(5000)
-        else h.sensor("overflow",true);h.poll(100) end
-        equal(state(h,"FAULT").reason,cause)
-        for _,name in ipairs({"fill","drain"}) do
-            assert(h.controller.remote_timeout(name))
-            equal(state(h,"FAULT").reason,cause)
-            equal(h.controller.fill(),false);equal(h.controller.remote_command("drain"),false)
-        end
-    end
-end)
-
-test("STOP during the expired run cleanup cancels the same-event replacement ON",function()
-    local h=board_fixture();assert(h.controller.init());h.poll(500);assert(h.controller.fill())
-    h.on_close=function(gpio)
-        if gpio==23 then h.on_close=nil;assert(h.controller.stop()) end
-    end
-    local before=#h.events;h.elapse(180000)
-    equal(h.controller.fill(),false);state(h,"IDLE")
-    equal(h.opened[23],false);equal(h.writes_since(before,23,1),0)
-    h.run(1000);state(h,"IDLE");equal(h.writes_since(before,23,1),0)
-end)
-
-test("a local operation limit with failed physical OFF still locks in fault",function()
-    for _,failure in ipairs({"write","close"}) do
-        local h=board_fixture();assert(h.controller.init());h.poll(500)
-        assert(h.controller.fill());assert(h.controller.drain())
-        if failure=="write" then h.on_write=function(value,gpio) if gpio==23 and value==0 then return false end end
-        else h.on_close=function(gpio) if gpio==23 then return false end end end
-        h.poll(180000)
-        equal(h.controller.status().state,"FAULT");equal(h.controller.status().outputs_known,false)
-        equal(h.opened[5],false);equal(h.controller.fill(),false);equal(h.controller.drain(),false)
-        local before=#h.events;h.controller.remote_timeout("drain")
-        equal(h.controller.status().state,"FAULT");equal(h.writes_since(before,5,1),0)
-    end
+    equal(state(h,"FAULT").reason,"drain_timeout")
 end)
 
 local failures = 0

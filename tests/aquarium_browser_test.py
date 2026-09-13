@@ -1,4 +1,5 @@
 """Real local HTTP + Edge integration for the compact 3D console; no physical IO."""
+import json
 import math
 import re
 import sys
@@ -11,6 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'build/debug-python'))
 sys.path.insert(0, str(ROOT))
 from playwright.sync_api import expect, sync_playwright
+import websocket
 from server.app import Handler, Server, Store
 
 
@@ -38,7 +40,7 @@ def assert_one_screen(page):
     assert max(metrics['rootWidth'], metrics['bodyWidth']) <= metrics['width'] + 1, metrics
     assert max(metrics['rootHeight'], metrics['bodyHeight']) <= metrics['height'] + 1, metrics
     for selector in ('#header-connection', '#menu-device', '#menu-history', '#menu-calibration',
-                     '#tank-canvas', '#level-value', '#fill-button', '#drain-button', '#stop',
+                     '#tank-canvas', '#level-value', '#fill-button', '#drain-button', '#stop', '#menu-level-job',
                      '#fill-progress-text', '#drain-progress-text', '#orbit-hint',
                      '#fill-countdown', '#drain-countdown',
                      '#volume-value', '#fill-rate', '#drain-rate', '#fill-volume',
@@ -587,7 +589,7 @@ def assert_logout_race(page):
 
 def assert_web_soft_limits(page, store, clock, output, version='0.8.2'):
     """Exercise versioned Web policies with simulated authenticated WS receipts."""
-    unlocked_timeout = version == '0.8.3'
+    unlocked_timeout = version in ('0.8.2', '0.8.3')
     image_prefix = 'aquarium-web-limits-' + version.replace('.', '')
     console_url = page.url
     # Leave a calibrated water estimate uncertain using an actual telemetry gap.
@@ -720,7 +722,10 @@ def assert_web_soft_limits(page, store, clock, output, version='0.8.2'):
                 expect(page.locator('#header-connection')).to_contain_text('设备正常')
                 expect(page.locator('#device-state')).to_have_text('待机')
                 expect(page.locator('#control-hint')).not_to_contain_text('故障锁定')
-                expect(page.locator('#control-hint')).to_contain_text('到时已关闭，可再次开启')
+                if version == '0.8.3':
+                    expect(page.locator('#control-hint')).to_contain_text('到时已关闭，可再次开启')
+                else:
+                    expect(page.locator('#control-hint')).to_contain_text('输出已关闭，可再次开启')
                 expect(page.locator('#fill-button')).to_be_enabled()
                 expect(page.locator('#drain-button')).to_be_enabled()
                 expect(page.locator('#reset')).to_be_disabled()
@@ -751,8 +756,10 @@ def assert_web_soft_limits(page, store, clock, output, version='0.8.2'):
             close_dialog(page, 'device')
             expect(page.locator('#fill-button')).to_be_enabled()
 
-        timeout_receipt('FILL_TIMEOUT', 'fill_timeout')
-        expect(page.locator('#device-reason')).to_contain_text('补水' if unlocked_timeout else '补水超时')
+        timeout_receipt('STOP' if version == '0.8.2' else 'FILL_TIMEOUT',
+                        'stopped' if version == '0.8.2' else 'fill_timeout')
+        if version == '0.8.3':
+            expect(page.locator('#device-reason')).to_contain_text('补水')
         if not unlocked_timeout:
             reset_fault()
         # A drain-only run gets its complete five-minute policy, independently
@@ -769,8 +776,10 @@ def assert_web_soft_limits(page, store, clock, output, version='0.8.2'):
         expect(page.locator('#drain-button')).to_have_attribute('aria-checked', 'true')
         assert len(command_requests) == manual_count
         assert store.snapshot()['control_limits']['timeout_pending'] == 'drain'
-        timeout_receipt('DRAIN_TIMEOUT', 'drain_timeout')
-        expect(page.locator('#device-reason')).to_contain_text('排水' if unlocked_timeout else '排水超时')
+        timeout_receipt('STOP' if version == '0.8.2' else 'DRAIN_TIMEOUT',
+                        'stopped' if version == '0.8.2' else 'drain_timeout')
+        if version == '0.8.3':
+            expect(page.locator('#device-reason')).to_contain_text('排水')
         if unlocked_timeout:
             # Confirmed normal timeout leaves the controls ready for a new,
             # explicitly requested run with a complete new policy deadline.
@@ -815,7 +824,394 @@ def assert_web_soft_limits(page, store, clock, output, version='0.8.2'):
         store.ws_close(session, 'peer_disconnected')
 
 
-def main(layout_only=False, estimates_only=False, countdowns_only=False, soft_limits_only=False):
+def assert_level_heartbeats(page, store, clock, server, output):
+    """Real 0.8.2 bare pings and acknowledged, bounded target-water rounds."""
+    client = None
+    inbox = []
+    seq = 0
+    executed = []
+    status = dict(store.status, control_mode='manual', state='IDLE', reason='ready',
+                  ready='1', fill='0', drain='0', outputs_known='1')
+
+    def receive(kind):
+        for index, message in enumerate(inbox):
+            if message['type'] == kind:
+                return inbox.pop(index)
+        for _ in range(10):
+            raw = client.recv()
+            assert raw, 'The local simulated device unexpectedly disconnected'
+            message = json.loads(raw)
+            if message['type'] == kind:
+                return message
+            inbox.append(message)
+        raise AssertionError(('Expected WS frame', kind, inbox))
+
+    def close_device():
+        nonlocal client
+        if client:
+            client.close()
+            client = None
+            for _ in range(100):
+                if store.ws_gateway is None:
+                    break
+                time.sleep(.01)
+            assert store.ws_gateway is None
+
+    def open_device(version='0.8.2'):
+        nonlocal client, seq
+        close_device()
+        store.gateway = None
+        store.gateway_seen = 0
+        inbox.clear()
+        seq = 0
+        status.update(version=version, state='IDLE', reason='ready', ready='1', fill='0', drain='0')
+        client = websocket.create_connection('ws://127.0.0.1:%d/water/api/device/ws' % server.server_port, timeout=3)
+        client.send(json.dumps(dict(type='auth', key=server.device_key, status=status)))
+        ready = receive('ready')
+        assert ready['soft_limits']['watchdog_ms'] == 5000
+        sync_status(page)
+        expect(page.locator('#version')).to_have_text('v' + version)
+
+    def calibrate(level):
+        open_dialog(page, 'calibration')
+        for field, value in [('anchor-level', level), ('fill-seconds', 3000),
+                             ('drain-seconds', 3000), ('capacity-liters', 60)]:
+            page.locator('#' + field).fill(str(value))
+        with page.expect_response('**/api/simulation') as response:
+            page.locator('#save-calibration').click()
+        assert response.value.ok, response.value.text()
+        close_dialog(page, 'calibration')
+        sync_status(page)
+        assert not store.snapshot()['simulation']['uncertain']
+
+    def claim(expected_command):
+        offer = receive('offer')
+        assert offer['command'] == expected_command, offer
+        client.send(json.dumps(dict(type='claim', id=offer['id'])))
+        execute = receive('execute')
+        assert execute['id'] == offer['id'] and execute['command'] == expected_command
+        executed.append((expected_command, clock[0], offer['id']))
+        return offer
+
+    def acknowledge(offer, **changes):
+        command = offer['command']
+        if command in ('FILL', 'DRAIN'):
+            status.update(state='FILLING' if command == 'FILL' else 'DRAINING',
+                          reason='manual_filling' if command == 'FILL' else 'manual_draining',
+                          fill='1' if command == 'FILL' else '0', drain='1' if command == 'DRAIN' else '0')
+        elif command in ('FILL_OFF', 'DRAIN_OFF', 'STOP'):
+            status.update(state='IDLE', ready='1', fill='0', drain='0', reason='stopped')
+        status.update(changes)
+        client.send(json.dumps(dict(type='ack', status=status,
+            ack=dict(id=offer['id'], status='succeeded', result='OK ' + command))))
+        receive('received')
+
+    def receipt(expected_command, **changes):
+        acknowledge(claim(expected_command), **changes)
+        sync_status(page)
+
+    def command(output_name, expected_command, **changes):
+        with page.expect_response('**/api/commands') as response:
+            page.locator('#' + output_name + '-button').click()
+        assert response.value.ok, response.value.text()
+        receipt(expected_command, **changes)
+
+    def ping(seconds=1):
+        nonlocal seq
+        clock[0] += seconds
+        seq += 1
+        message = dict(type='ping', seq=seq)
+        # Production 0.8.2 has no ping.status. Never inject fresh output reports
+        # here: only a genuine ON/OFF ACK can change the device's known output.
+        client.send(json.dumps(message))
+        assert receive('pong') == dict(type='pong', seq=seq)
+        snapshot = store.snapshot()
+        assert snapshot['online'], snapshot['connection']
+        return snapshot['simulation']
+
+    def advance(seconds):
+        for _ in range(seconds):
+            result = ping()
+            assert not result['uncertain'], result
+        return store.snapshot()
+
+    def expect_level(value, text):
+        sim = store.snapshot()['simulation']
+        assert math.isclose(sim['level'], value, abs_tol=1e-4), sim
+        expect(page.locator('#level-value')).to_have_text(text, timeout=6000)
+        bar = float(page.locator('#level-fill').evaluate('el => el.style.width').removesuffix('%'))
+        assert abs(bar - value) < .001, (bar, value)
+
+    def job():
+        return store.snapshot()['level_job']
+
+    def start_job(target):
+        open_dialog(page, 'level-job')
+        page.locator('#target-level').fill(str(target))
+        expect(page.locator('#start-level-job')).to_be_enabled()
+        with page.expect_response('**/api/level-job') as response:
+            page.locator('#start-level-job').click()
+        assert response.value.ok, response.value.text()
+        close_dialog(page, 'level-job')
+        assert job()['status'] == 'running', job()
+        return job()
+
+    def assert_no_restart(seconds=5):
+        before = len(executed)
+        for _ in range(seconds):
+            ping()
+        assert not any(frame['type'] == 'offer' for frame in inbox), inbox
+        assert len(executed) == before
+        assert status['fill'] == status['drain'] == '0'
+        assert job()['status'] != 'running', job()
+
+    def waiting_round():
+        """Reach the first ordinary OFF, retaining the active task's pause."""
+        calibrate(100)
+        start_job(60)
+        receipt('DRAIN')
+        advance(290)
+        receipt('DRAIN_OFF')
+        assert job()['phase'] == 'waiting', job()
+
+    def capture_layouts():
+        # WebSocket inactivity uses real monotonic time even when the Store's
+        # simulation clock is frozen. Keep the simulated device alive while
+        # screenshots render; no output telemetry or water time is added.
+        stop_heartbeat = threading.Event()
+        heartbeat_errors = []
+
+        def keep_alive():
+            while not stop_heartbeat.wait(.5):
+                try:
+                    ping(0)
+                except Exception as error:
+                    heartbeat_errors.append(error)
+                    return
+
+        heartbeat = threading.Thread(target=keep_alive, daemon=True)
+        heartbeat.start()
+        try:
+            for width, height, name in [(1440, 900, 'desktop'), (390, 844, 'mobile'), (360, 640, 'mobile-small')]:
+                page.set_viewport_size(dict(width=width, height=height))
+                assert_one_screen(page)
+                expect(page.locator('#menu-level-job')).to_be_visible()
+                expect(page.locator('#job-summary')).to_be_visible()
+                page.screenshot(path=str(output / ('level-job-082-' + name + '.png')), full_page=True)
+                open_dialog(page, 'level-job')
+                assert_dialog_bounds(page, 'level-job')
+                expect(page.locator('#job-round')).to_contain_text('1')
+                expect(page.locator('#job-target')).to_contain_text('80')
+                expect(page.locator('#cancel-level-job')).to_be_enabled()
+                expect(page.locator('#job-elapsed')).to_have_text('3 秒')
+                expect_number(page, '#job-volume', .06, .06)
+                page.screenshot(path=str(output / ('level-job-dialog-082-' + name + '.png')), full_page=True)
+                close_dialog(page, 'level-job')
+        finally:
+            stop_heartbeat.set()
+            heartbeat.join(timeout=5)
+        assert not heartbeat.is_alive() and not heartbeat_errors, heartbeat_errors
+
+    try:
+        open_device()
+        calibrate(100)
+        # Idle pings alone cannot invent a run, and an unacknowledged ON grant
+        # cannot turn a known OFF output into estimated moving water.
+        advance(20)
+        assert store.snapshot()['simulation']['level'] == 100
+        with page.expect_response('**/api/commands') as response:
+            page.locator('#drain-button').click()
+        assert response.value.ok
+        on = claim('DRAIN')
+        advance(3)
+        assert store.snapshot()['simulation']['level'] == 100
+        assert store.snapshot()['simulation']['drain_total_liters'] == 0
+        acknowledge(on)
+        for elapsed in range(1, 21):
+            sim = ping()
+            assert not sim['uncertain'], (elapsed, sim)
+            assert math.isclose(sim['level'], 100 - elapsed / 30, abs_tol=1e-7), (elapsed, sim)
+            if elapsed == 3:
+                # The ordinary two-second HTTP refresh must show a decimal
+                # change even without another device status frame.
+                expect_level(99.9, '99.9%')
+        sync_status(page)
+        expect_level(100 - 20 / 30, '99.3%')
+        assert math.isclose(store.snapshot()['simulation']['drain_total_liters'], .4, abs_tol=1e-7)
+        command('drain', 'DRAIN_OFF')
+
+        calibrate(100)
+        trace_start = len(executed)
+        start_job(66.6667)
+        sync_status(page)
+        open_dialog(page, 'calibration')
+        expect(page.locator('#save-calibration')).to_be_disabled()
+        close_dialog(page, 'calibration')
+        first_on = claim('DRAIN')
+        # The latest status still says OFF, but an already-issued ON may arrive
+        # late. Both the UI and the API must refuse a new calibration anchor.
+        sync_status(page)
+        pending_job_id = job()['id']
+        open_dialog(page, 'calibration')
+        expect(page.locator('#save-calibration')).to_be_disabled()
+        # Use the browser's authenticated fetch (including its loopback Secure
+        # cookie behavior), rather than Playwright's separate HTTP client.
+        response = page.evaluate("""async body => {
+          const response = await fetch('./api/simulation', {method:'POST', credentials:'same-origin',
+            headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
+          return {status:response.status, body:await response.json()};
+        }""", dict(level=90, fill_seconds=3000, drain_seconds=3000, capacity_liters=60))
+        assert response['status'] == 409 and response['body']['error'] == 'simulation_requires_idle', response
+        assert store.snapshot()['simulation']['level'] == 100
+        assert job()['id'] == pending_job_id and job()['status'] == 'running' and job()['phase'] == 'starting', job()
+        close_dialog(page, 'calibration')
+        acknowledge(first_on)
+        sync_status(page)
+        total_active = 0
+        previous_off = None
+        console_url = page.url
+        for round_number, seconds in enumerate((290, 290, 290, 130), 1):
+            if round_number > 1:
+                receipt('DRAIN')
+            started = clock[0]
+            if previous_off is not None:
+                assert math.isclose(started - previous_off, 2, abs_tol=1e-7)
+            assert job()['round'] == round_number and job()['phase'] == 'active', job()
+            if round_number == 2:
+                # The task belongs to the server; closing the web view neither
+                # pauses its timer nor removes the next acknowledged stop.
+                page.goto('about:blank')
+            for elapsed in range(1, seconds + 1):
+                sim = ping()
+                assert not sim['uncertain'], (round_number, elapsed, sim)
+                assert math.isclose(sim['level'], 100 - (total_active + elapsed) / 30, abs_tol=1e-6), sim
+            total_active += seconds
+            assert job()['phase'] == 'stopping', job()
+            if round_number == 2:
+                page.goto(console_url)
+                expect(page.locator('#console')).to_be_visible()
+            # A queued OFF is not physical confirmation: the UI must continue
+            # showing ON until the real simulated device ACK says both are OFF.
+            sync_status(page)
+            expect(page.locator('#drain-button')).to_have_attribute('aria-checked', 'true')
+            receipt('DRAIN_OFF')
+            previous_off = clock[0]
+            assert status['state'] == 'IDLE'
+            expect(page.locator('#reset')).to_be_disabled()
+            if round_number < 4:
+                assert job()['phase'] == 'waiting', job()
+                waiting_level = store.snapshot()['simulation']['level']
+                ping()
+                assert job()['phase'] == 'waiting' and job()['round'] == round_number, job()
+                assert store.snapshot()['simulation']['level'] == waiting_level
+                assert not any(frame['type'] == 'offer' for frame in inbox), inbox
+                ping()
+            else:
+                assert job()['status'] == 'completed' and job()['phase'] == 'done', job()
+
+        sync_status(page)
+        expect_level(100 - 1000 / 30, '66.7%')
+        sim = store.snapshot()['simulation']
+        assert math.isclose(sim['drain_total_liters'], 20, abs_tol=1e-6), sim
+        assert math.isclose(sim['drain_run_liters'], 2.6, abs_tol=1e-6), sim
+        assert math.isclose(sim['volume_liters'], 40, abs_tol=1e-6), sim
+        assert math.isclose(job()['elapsed_seconds'], 1000, abs_tol=1e-6), job()
+        assert math.isclose(job()['estimated_liters'], 20, abs_tol=1e-6), job()
+        open_dialog(page, 'level-job')
+        expect(page.locator('#job-state')).to_have_text('目标任务已完成')
+        expect(page.locator('#job-elapsed')).to_have_text('16 分 40 秒')
+        expect_number(page, '#job-volume', 20)
+        close_dialog(page, 'level-job')
+        assert [command for command, _, _ in executed[trace_start:]] == ['DRAIN', 'DRAIN_OFF'] * 4
+        assert_no_restart()
+
+        # A new fill task demonstrates that successful rounds never require
+        # RESET on the production firmware's FAULT-on-TIMEOUT protocol.
+        start_job(80)
+        receipt('FILL')
+        advance(3)
+        sync_status(page)
+        expect_level(100 - 1000 / 30 + .1, '66.8%')
+        capture_layouts()
+        with page.expect_response('**/api/commands') as response:
+            page.locator('#stop').click()
+        assert response.value.ok, response.value.text()
+        receipt('STOP')
+        assert job()['status'] == 'cancelled', job()
+        assert_no_restart()
+
+        # Explicit cancel stops the active output and cancels future rounds.
+        start_job(80)
+        receipt('FILL')
+        advance(3)
+        open_dialog(page, 'level-job')
+        with page.expect_response('**/api/level-job/cancel') as response:
+            page.locator('#cancel-level-job').click()
+        assert response.value.ok, response.value.text()
+        close_dialog(page, 'level-job')
+        receipt('STOP')
+        assert job()['status'] == 'cancelled', job()
+        assert_no_restart()
+
+        # An ordinary manual OFF is an interruption, never permission to
+        # schedule another automatic ON after the two-second gap.
+        start_job(80)
+        receipt('FILL')
+        advance(3)
+        sync_status(page)
+        command('fill', 'FILL_OFF')
+        assert job()['status'] == 'cancelled', job()
+        assert_no_restart()
+
+        # Recalibration is permitted during a confirmed-OFF inter-round gap;
+        # changing the anchor must cancel the task that used the old anchor.
+        waiting_round()
+        calibrate(90)
+        assert job()['status'] == 'cancelled', job()
+        assert_no_restart()
+        assert store.snapshot()['simulation']['level'] == 90
+
+        start_job(80)
+        receipt('DRAIN')
+        advance(3)
+        known_level = store.snapshot()['simulation']['level']
+        close_device()
+        assert job()['status'] in ('failed', 'cancelled'), job()
+        clock[0] += 6
+        open_device()
+        assert_no_restart()
+        assert store.snapshot()['simulation']['uncertain']
+        assert store.snapshot()['simulation']['level'] == known_level
+        sync_status(page)
+        expect(page.locator('#estimate-status')).to_contain_text('不确定')
+        calibrate(75)
+        command('fill', 'FILL')
+        advance(3)
+        sync_status(page)
+        expect_level(75.1, '75.1%')
+        command('fill', 'FILL_OFF')
+        assert not any(command in ('FILL_TIMEOUT', 'DRAIN_TIMEOUT', 'RESET') for command, _, _ in executed)
+
+        # A claimed grant and a confirmed ON are both required. A free-standing
+        # ON report with no authorized run closes the connection, never creating
+        # an estimated flow from otherwise well-formed bare pings.
+        open_device()
+        calibrate(75)
+        status.update(state='DRAINING', drain='1', reason='manual_draining')
+        client.send(json.dumps(dict(type='status', status=status)))
+        for _ in range(100):
+            if store.ws_gateway is None:
+                break
+            time.sleep(.01)
+        assert store.ws_gateway is None
+        assert store.snapshot()['simulation']['level'] == 75
+        assert store.snapshot()['simulation']['drain_total_liters'] == 0
+    finally:
+        close_device()
+
+
+def main(layout_only=False, estimates_only=False, countdowns_only=False, soft_limits_only=False,
+         level_heartbeats_only=False):
     # A controlled clock keeps simulated device connectivity stable during UI work.
     now = [time.time()]
     store = Store(':memory:', lambda: now[0])
@@ -883,6 +1279,17 @@ def main(layout_only=False, estimates_only=False, countdowns_only=False, soft_li
             assert page.evaluate("document.querySelector('#scene-fallback').hidden")
             expect(page.get_by_text('经典控制台', exact=False)).to_have_count(0)
 
+            if level_heartbeats_only:
+                assert_level_heartbeats(page, store, now, server, output)
+                assert not errors, errors
+                browser.close()
+                print('PASS level targets: real WS 0.8.2 bare pings only after confirmed ON, '
+                      'unacknowledged grants cannot invent water flow, 1000 seconds in 290/290/290/130 rounds, '
+                      'ordinary OFF ACKs with 2-second gaps, correct run/total liters and decimal updates, '
+                      'STOP/cancel/manual/recalibration/disconnection interruptions, no automatic restart, '
+                      'uncertainty survives reconnect until recalibration, desktop and two phone viewports')
+                return
+
             if soft_limits_only:
                 for version in ('0.8.2', '0.8.3'):
                     assert_web_soft_limits(page, store, now, output, version)
@@ -892,8 +1299,8 @@ def main(layout_only=False, estimates_only=False, countdowns_only=False, soft_li
                 print('PASS Web 0.8.2/0.8.3 soft limits: authenticated WS claim/receipt, independent 180/300 seconds, '
                       'uncertain water estimate with valid control timer, reload and closed-page persistence, '
                       'API outage hides clocks, server timeout pending without browser commands, '
-                      '0.8.3 confirmed IDLE and user-started new run without automatic RESET/ON, '
-                      'legacy timeout and other faults require RESET, desktop/phone layouts and logout race')
+                      '0.8.2 STOP / 0.8.3 timeout confirmed IDLE and user-started new run without automatic RESET/ON, '
+                      'other faults require RESET, desktop/phone layouts and logout race')
                 return
 
             # Both the default route and the old 3D bookmark reach this same console.
@@ -1098,6 +1505,9 @@ def main(layout_only=False, estimates_only=False, countdowns_only=False, soft_li
                 assert_web_soft_limits(page, store, now, output, version)
             report()
             sync_status(page)
+            assert_level_heartbeats(page, store, now, server, output)
+            report()
+            sync_status(page)
             store.gateway = None
             store.connection_event(False, 'peer_disconnected')
             expect(page.locator('#header-connection')).to_contain_text('设备异常', timeout=6000)
@@ -1116,6 +1526,8 @@ def main(layout_only=False, estimates_only=False, countdowns_only=False, soft_li
                   'optional capacity, liters/rates/run and calibration totals, net flow/ETA, '
                   'versioned independent protection countdowns, reload persistence, no web timer commands, '
                   '0.8.2/0.8.3 server limits, normal timeout recovery and fault/reset receipts independent of water estimates, '
+                  '0.8.2 bare heartbeats, 1000-second target task with four acknowledged bounded rounds, '
+                  'task stop/cancel/manual/calibration/disconnection handling and decimal level display, '
                   'independent run reset, uncertainty/recalibration, API recovery, logout race')
     finally:
         server.shutdown()
@@ -1126,4 +1538,5 @@ def main(layout_only=False, estimates_only=False, countdowns_only=False, soft_li
 
 if __name__ == '__main__':
     main(layout_only='--layout-only' in sys.argv, estimates_only='--estimates-only' in sys.argv,
-         countdowns_only='--countdowns-only' in sys.argv, soft_limits_only='--soft-limits-only' in sys.argv)
+         countdowns_only='--countdowns-only' in sys.argv, soft_limits_only='--soft-limits-only' in sys.argv,
+         level_heartbeats_only=any(flag in sys.argv for flag in ('--level-heartbeats-only', '--target-level-only')))

@@ -30,6 +30,9 @@ class ControlLimitTests(unittest.TestCase):
         self.store.db.close()
         self.temp.cleanup()
 
+    def timeout_command(self, direction='fill'):
+        return 'STOP' if self.version == '0.8.2' else direction.upper() + '_TIMEOUT'
+
     def advance(self, seconds):
         self.wall += seconds
         self.mono += seconds
@@ -67,7 +70,7 @@ class ControlLimitTests(unittest.TestCase):
         self.assertEqual(self.store.control_runs['fill']['since'], 1000)
         self.until(1180)
         offer = self.store.ws_offer(self.session)
-        self.assertEqual(offer['command'], 'FILL_TIMEOUT')
+        self.assertEqual(offer['command'], self.timeout_command())
         self.assertEqual(self.store.control_limits_snapshot()['timeout_pending'], 'fill')
 
     def test_rejected_start_with_confirmed_off_clears_grant(self):
@@ -100,14 +103,14 @@ class ControlLimitTests(unittest.TestCase):
         self.assertEqual(self.store.control_runs['fill']['since'], 1000)
         self.assertIsNone(self.store.control_runs['drain'])
         self.until(1180)
-        self.assertEqual(self.store.ws_offer(self.session)['command'], 'FILL_TIMEOUT')
+        self.assertEqual(self.store.ws_offer(self.session)['command'], self.timeout_command())
 
     def test_drain_gets_full_five_minutes_independent_of_browser(self):
         self.start('drain')
         self.until(1299.9)
         self.assertIsNone(self.store.ws_offer(self.session))
         self.until(1300)
-        self.assertEqual(self.store.ws_offer(self.session)['command'], 'DRAIN_TIMEOUT')
+        self.assertEqual(self.store.ws_offer(self.session)['command'], self.timeout_command('drain'))
 
     def test_water_calibration_uncertainty_does_not_pause_control(self):
         self.store.configure_simulation(dict(level=50, fill_seconds=200, drain_seconds=200))
@@ -116,7 +119,7 @@ class ControlLimitTests(unittest.TestCase):
         self.assertTrue(self.store.snapshot()['simulation']['uncertain'])
         self.assertFalse(self.store.snapshot()['control_limits']['uncertain'])
         self.until(1180)
-        self.assertEqual(self.store.ws_offer(self.session)['command'], 'FILL_TIMEOUT')
+        self.assertEqual(self.store.ws_offer(self.session)['command'], self.timeout_command())
 
     def test_timeout_revokes_delivered_open_grants_and_cannot_be_publicly_queued(self):
         self.start()
@@ -131,13 +134,13 @@ class ControlLimitTests(unittest.TestCase):
             self.assertEqual(caught.exception.message, 'invalid_command')
         # A normal STOP cannot cancel the fault-generating timeout command.
         self.store.enqueue('STOP', 'd' * 32)
-        self.assertEqual(self.store.ws_offer(self.session)['command'], 'FILL_TIMEOUT')
+        self.assertEqual(self.store.ws_offer(self.session)['command'], self.timeout_command())
 
     def test_unconfirmed_timeout_breaks_heartbeat_lease_and_requires_new_idle_session(self):
         self.start()
         self.until(1180)
         offer = self.store.ws_offer(self.session)
-        self.assertEqual(self.store.ws_claim(self.session, offer['id'])['command'], 'FILL_TIMEOUT')
+        self.assertEqual(self.store.ws_claim(self.session, offer['id'])['command'], self.timeout_command())
         self.advance(1)
         with self.assertRaises(Problem) as caught:
             self.store.ws_touch(self.session)
@@ -196,7 +199,7 @@ class ControlLimitTests(unittest.TestCase):
         self.assertEqual(self.wall - limits['fill_on_since'], 30)
         self.mono += 150
         self.store.control_tick(self.session)
-        self.assertEqual(self.store.ws_offer(self.session)['command'], 'FILL_TIMEOUT')
+        self.assertEqual(self.store.ws_offer(self.session)['command'], self.timeout_command())
         self.assertEqual(self.store.control_limits_snapshot()['fill_deadline'], self.wall)
 
     def test_old_firmware_keeps_firmware_owned_limits_and_new_http_gateway_is_rejected(self):
@@ -243,7 +246,7 @@ class ControlLimitTests(unittest.TestCase):
         self.assertEqual(self.store.simulation, previous_simulation)
         self.assertEqual(self.store.seen, old_seen)
         self.until(1180)
-        self.assertEqual(self.store.ws_offer(self.session)['command'], 'FILL_TIMEOUT')
+        self.assertEqual(self.store.ws_offer(self.session)['command'], self.timeout_command())
 
     def test_replayed_successful_off_ack_cannot_erase_new_unconfirmed_grant(self):
         self.assert_old_off_ack_is_inert(False)
@@ -271,7 +274,7 @@ class ControlLimitTests(unittest.TestCase):
         self.assertEqual(self.store.simulation, previous_simulation)
         self.assertEqual(self.store.db.execute('SELECT status FROM commands WHERE id=?', (off_id,)).fetchone()['status'], 'succeeded')
         self.until(1180)
-        self.assertEqual(self.store.ws_offer(self.session)['command'], 'FILL_TIMEOUT')
+        self.assertEqual(self.store.ws_offer(self.session)['command'], self.timeout_command())
 
     def test_expired_ack_cannot_replace_telemetry_or_erase_pending_deadline(self):
         command_id = self.grant('FILL')

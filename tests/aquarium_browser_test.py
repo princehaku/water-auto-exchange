@@ -40,7 +40,7 @@ def assert_one_screen(page):
     assert max(metrics['rootWidth'], metrics['bodyWidth']) <= metrics['width'] + 1, metrics
     assert max(metrics['rootHeight'], metrics['bodyHeight']) <= metrics['height'] + 1, metrics
     for selector in ('#header-connection', '#menu-device', '#menu-history', '#menu-calibration',
-                     '#tank-canvas', '#level-value', '#fill-button', '#drain-button', '#stop', '#menu-level-job',
+                     '#tank-canvas', '#level-value', '#fill-button', '#drain-button', '#menu-level-job',
                      '#fill-progress-text', '#drain-progress-text', '#orbit-hint',
                      '#fill-countdown', '#drain-countdown',
                      '#volume-value', '#fill-rate', '#drain-rate', '#fill-volume',
@@ -444,11 +444,11 @@ def assert_water_estimates(page, store, report, output):
         expect(page.locator('#level-value')).to_have_text(str(level) + '%')
         close_dialog(page, 'calibration')
         expect(page.locator('#message')).to_be_empty()
-        assert page.locator('#stop').evaluate("""button => {
+        assert page.locator('#menu-level-job').evaluate("""button => {
           const box = button.getBoundingClientRect();
           return document.elementFromPoint(box.x + box.width / 2, box.y + box.height / 2)
-            ?.closest('#stop') === button;
-        }"""), 'Calibration feedback must not cover the stop control after closing its dialog'
+            ?.closest('#menu-level-job') === button;
+        }"""), 'Calibration feedback must not cover the target control after closing its dialog'
 
     def expect_amounts(volume, fill_run, drain_run, fill_total, drain_total):
         expected = dict(volume_liters=volume, fill_run_liters=fill_run,
@@ -815,7 +815,7 @@ def assert_web_soft_limits(page, store, clock, output, version='0.8.2'):
         expect_countdown(page, 'fill', None)
         expect_countdown(page, 'drain', None)
         expect(page.locator('#fill-button')).to_be_disabled()
-        expect(page.locator('#stop')).to_be_disabled()
+        expect(page.locator('#drain-button')).to_be_disabled()
         page.screenshot(path=str(output / (image_prefix + '-offline-mobile.png')), full_page=True)
         assert_one_screen(page)
     finally:
@@ -1133,9 +1133,15 @@ def assert_level_heartbeats(page, store, clock, server, output):
         sync_status(page)
         expect_level(100 - 1000 / 30 + .1, '66.8%')
         capture_layouts()
-        with page.expect_response('**/api/commands') as response:
-            page.locator('#stop').click()
-        assert response.value.ok, response.value.text()
+        # STOP remains a backend command; the main view only has independent
+        # output switches and the target-task entry, with cancel in its dialog.
+        response = page.evaluate("""async () => {
+          const response = await fetch('./api/commands', {method:'POST', credentials:'same-origin',
+            headers:{'Content-Type':'application/json'},
+            body:JSON.stringify({command:'STOP',id:crypto.randomUUID().replaceAll('-','')})});
+          return {status:response.status, body:await response.json()};
+        }""")
+        assert response['status'] == 202, response
         receipt('STOP')
         assert job()['status'] == 'cancelled', job()
         assert_no_restart()
@@ -1512,7 +1518,7 @@ def main(layout_only=False, estimates_only=False, countdowns_only=False, soft_li
             store.connection_event(False, 'peer_disconnected')
             expect(page.locator('#header-connection')).to_contain_text('设备异常', timeout=6000)
             expect(page.locator('#fill-button')).to_be_disabled()
-            expect(page.locator('#stop')).to_be_disabled()
+            expect(page.locator('#drain-button')).to_be_disabled()
             open_dialog(page, 'device')
             expect(page.locator('#hero-status')).to_contain_text('离线')
             close_dialog(page, 'device')

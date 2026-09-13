@@ -97,7 +97,7 @@ function renderControls(){
     $(output+'-detail').textContent=!known?'状态未知':pendingFor(output)?'命令待设备确认':on?'已开启 · 点击独立关闭':'已关闭 · 点击开启';
     $(output+'-state').textContent=!known?'未知':snapshot?.online?(on?'开启':'关闭'):(on?'上次上报：开启':'上次上报：关闭');
   }
-  $('stop').disabled=!can('STOP');$('reset').disabled=!can('RESET');
+  $('reset').disabled=!can('RESET');
   const deviceOnline=snapshot?.online===true;
   $('control-hint').textContent=!snapshot?'浏览器与服务连接中断，控制暂不可用。':!deviceOnline?'设备离线，等待重新连接。':!device?'等待设备状态。':!supportedManual.includes(device.version)?'当前固件不支持此手动控制页面。':device.control_mode!=='manual'?'设备处于自动模式，此处仅显示状态。':device.state==='FAULT'?'故障锁定，请检查现场后复位。':snapshot.control_limits?.timeout_pending?'已达到软上限，服务端正在确认全部关闭。':webLimits(device)&&(snapshot.control_limits?.source!=='web'||snapshot.control_limits?.uncertain)?'服务端计时待确认，暂不能开启。':device.state==='UNCONFIGURED'?'输出尚未配置。':timedStopLabel(device)?timedStopLabel(device):concurrent(device)?'两路可同时开启，并可分别关闭。':['FILLING','DRAINING'].includes(device.state)?'当前固件两路互锁；先关闭当前输出。':'当前固件两路互锁；升级 0.8.0 可同时开启。';
   renderLevelJob();

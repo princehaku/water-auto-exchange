@@ -15,7 +15,7 @@ from server.app import Handler, Server, Store
 class StaticHandler(Handler):
     def do_GET(self):
         name = urlsplit(self.path).path.removeprefix('/water/') or 'index.html'
-        allowed = ('aquarium.html', 'aquarium.css', 'aquarium.js', 'aquarium-scene.js',
+        allowed = ('aquarium.html', 'aquarium.css', 'aquarium.js', 'aquarium-scene.js', 'aquarium-motion.js',
                    'vendor/three.module.js', 'index.html')
         if name not in allowed:
             return self.dispatch()
@@ -37,18 +37,18 @@ def assert_one_screen(page):
     assert max(metrics['rootHeight'], metrics['bodyHeight']) <= metrics['height'] + 1, metrics
     for selector in ('#header-connection', '#menu-device', '#menu-history', '#menu-calibration',
                      '#tank-canvas', '#level-value', '#fill-button', '#drain-button', '#stop',
-                     '#fill-progress-text', '#drain-progress-text',
-                     '[data-view="top"]', '[data-view="front"]', '[data-view="perspective"]'):
+                     '#fill-progress-text', '#drain-progress-text', '#orbit-hint'):
         box = page.locator(selector).bounding_box()
         assert box and box['width'] > 0 and box['height'] > 0, (selector, box)
         assert box['x'] >= -1 and box['x'] + box['width'] <= metrics['width'] + 1, (selector, box)
         assert box['y'] >= -1 and box['y'] + box['height'] <= metrics['height'] + 1, (selector, box)
     title = page.locator('#tank-title').bounding_box()
-    views = page.locator('.view-buttons').bounding_box()
-    assert title and views
-    overlap_width = min(title['x'] + title['width'], views['x'] + views['width']) - max(title['x'], views['x'])
-    overlap_height = min(title['y'] + title['height'], views['y'] + views['height']) - max(title['y'], views['y'])
-    assert overlap_width <= 1 or overlap_height <= 1, ('scene title overlaps view buttons', title, views)
+    hint = page.locator('#orbit-hint').bounding_box()
+    assert title and hint
+    overlap_width = min(title['x'] + title['width'], hint['x'] + hint['width']) - max(title['x'], hint['x'])
+    overlap_height = min(title['y'] + title['height'], hint['y'] + hint['height']) - max(title['y'], hint['y'])
+    assert overlap_width <= 1 or overlap_height <= 1, ('scene title overlaps gesture hint', title, hint)
+    expect(page.locator('[data-view]')).to_have_count(0)
 
 
 def assert_canvas_rendered(page):
@@ -74,6 +74,120 @@ def assert_canvas_rendered(page):
     })""")
     assert rendered, 'The visible scene canvas must render nonblack content'
     expect(page.locator('#scene-fallback')).to_be_hidden()
+
+
+def camera_sample(page, frames=1):
+    previous = page.evaluate('window.__testCamera?.frame || 0')
+    page.wait_for_function('frame => window.__testCamera?.frame >= frame', arg=previous + frames)
+    return page.evaluate('window.__testCamera')
+
+
+def direction_distance(first, second):
+    return sum((a - b) ** 2 for a, b in zip(first['direction'], second['direction'])) ** .5
+
+
+def mouse_orbit(page, horizontal=.18, vertical=-.10):
+    box = page.locator('#tank-canvas').bounding_box()
+    start_x, start_y = box['x'] + box['width'] * .43, box['y'] + box['height'] * .52
+    page.mouse.move(start_x, start_y)
+    page.mouse.down()
+    page.mouse.move(start_x + box['width'] * horizontal,
+                    start_y + box['height'] * vertical, steps=8)
+    page.mouse.up()
+    return camera_sample(page)
+
+
+def assert_orbit_controls(page, context, output):
+    canvas = page.locator('#tank-canvas')
+    expect(canvas).to_have_attribute('tabindex', '0')
+    expect(page.locator('#orbit-hint')).to_be_visible()
+    expect(page.locator('[data-view]')).to_have_count(0)
+    # Observe actual camera orientation rather than differences caused by turtles.
+    # The hook is confined to this disposable test page, and preserves any callback.
+    page.evaluate("""async () => {
+      const THREE = await import('./vendor/three.module.js');
+      const previous = THREE.Scene.prototype.onBeforeRender;
+      THREE.Scene.prototype.onBeforeRender = function(renderer, scene, camera, ...rest) {
+        previous?.call(this, renderer, scene, camera, ...rest);
+        window.__testCamera = {frame:(window.__testCamera?.frame || 0)+1,
+          direction:camera.getWorldDirection(new THREE.Vector3()).toArray(),
+          position:camera.position.toArray()};
+      };
+    }""")
+    initial = camera_sample(page)
+    assert all(abs(value) > .05 for value in initial['direction']), initial
+    assert_canvas_rendered(page)
+    page.screenshot(path=str(output / 'aquarium-orbit-default.png'), full_page=True)
+
+    dragged = mouse_orbit(page)
+    assert direction_distance(initial, dragged) > .03, ('mouse drag did not rotate camera', initial, dragged)
+    released = camera_sample(page, frames=12)
+    assert direction_distance(dragged, released) < .002, ('camera moved back after release', dragged, released)
+    page.screenshot(path=str(output / 'aquarium-orbit-dragged.png'), full_page=True)
+    canvas.dblclick()
+    double_click_reset = camera_sample(page, frames=3)
+    assert direction_distance(initial, double_click_reset) < .002, 'Double-click did not restore the default view'
+    released = mouse_orbit(page)
+    assert direction_distance(double_click_reset, released) > .03, 'Double-click reset left dragging unavailable'
+    page.set_viewport_size({'width': 1366, 'height': 768})
+    resized = camera_sample(page, frames=3)
+    assert direction_distance(released, resized) < .002, ('resize reset camera direction', released, resized)
+    assert_canvas_rendered(page)
+
+    # Cancel a real mouse pointer so setPointerCapture has an actual active pointer.
+    canvas.evaluate("el => el.addEventListener('pointerdown', event => {window.__testPointerId=event.pointerId;}, {once:true})")
+    box = canvas.bounding_box()
+    x, y = box['x'] + box['width'] * .4, box['y'] + box['height'] * .5
+    page.mouse.move(x, y)
+    page.mouse.down()
+    page.mouse.move(x + 35, y + 15, steps=3)
+    pointer_id = page.evaluate('window.__testPointerId')
+    canvas.dispatch_event('pointercancel', dict(pointerId=pointer_id, pointerType='mouse', isPrimary=True,
+                                              button=0, buttons=0, clientX=x + 35, clientY=y + 15))
+    cancelled = camera_sample(page)
+    page.mouse.move(x + 110, y + 30, steps=3)
+    page.mouse.up()
+    after_cancel = camera_sample(page, frames=3)
+    assert direction_distance(cancelled, after_cancel) < .002, 'Cancelled pointer kept rotating the camera'
+    redragged = mouse_orbit(page, horizontal=-.14, vertical=.06)
+    assert direction_distance(after_cancel, redragged) > .03, 'Pointer cancellation left orbit controls stuck'
+
+    canvas.focus()
+    page.keyboard.press('ArrowLeft')
+    keyboard_rotated = camera_sample(page)
+    assert direction_distance(redragged, keyboard_rotated) > .01, 'Arrow key did not rotate the camera'
+    page.keyboard.press('Home')
+    restored = camera_sample(page, frames=3)
+    assert direction_distance(initial, restored) < .002, ('Home did not restore the default view', initial, restored)
+
+    page.set_viewport_size({'width': 390, 'height': 844})
+    before_touch = camera_sample(page, frames=3)
+    assert direction_distance(restored, before_touch) < .002, 'Phone resize changed the selected view'
+    touch = context.new_cdp_session(page)
+    touch.send('Emulation.setTouchEmulationEnabled', {'enabled': True, 'maxTouchPoints': 1})
+    try:
+        box = canvas.bounding_box()
+        x, y = box['x'] + box['width'] * .38, box['y'] + box['height'] * .5
+        def touch_point(px, py):
+            return {'x': px, 'y': py, 'id': 0, 'radiusX': 1, 'radiusY': 1, 'force': 1}
+        touch.send('Input.dispatchTouchEvent', {'type': 'touchStart', 'touchPoints': [touch_point(x, y)]})
+        for step in range(1, 7):
+            touch.send('Input.dispatchTouchEvent', {'type': 'touchMove',
+                       'touchPoints': [touch_point(x + step * 12, y - step * 5)]})
+        touch.send('Input.dispatchTouchEvent', {'type': 'touchEnd', 'touchPoints': []})
+        touched = camera_sample(page)
+        assert direction_distance(before_touch, touched) > .03, 'Phone touch drag did not rotate camera'
+        assert direction_distance(touched, camera_sample(page, frames=8)) < .002, 'Phone view moved back after touch release'
+        assert_one_screen(page)
+        assert_canvas_rendered(page)
+        page.screenshot(path=str(output / 'aquarium-mobile-orbit.png'), full_page=True)
+    finally:
+        touch.send('Emulation.setTouchEmulationEnabled', {'enabled': False})
+        touch.detach()
+    canvas.focus()
+    page.keyboard.press('Home')
+    page.set_viewport_size({'width': 1440, 'height': 900})
+    assert direction_distance(initial, camera_sample(page, frames=3)) < .002
 
 
 def open_dialog(page, name, via_indicator=False):
@@ -195,12 +309,7 @@ def main(layout_only=False):
                            'traffic-interval', 'traffic-reported'):
                 assert page.locator('#' + detail).evaluate("el => el.closest('dialog')?.id") == 'device-dialog', detail
 
-            for view in ('top', 'front', 'perspective'):
-                page.locator('[data-view="' + view + '"]').click()
-                expect(page.locator('[data-view="' + view + '"]')).to_have_attribute('aria-pressed', 'true')
-                expect(page.locator('[data-view][aria-pressed="true"]')).to_have_count(1)
-                assert_canvas_rendered(page)
-                page.screenshot(path=str(output / ('aquarium-view-' + view + '.png')), full_page=True)
+            assert_orbit_controls(page, context, output)
 
             # These common desktop and phone sizes must show the scene and all controls.
             for width, height, name in ((1440, 900, 'desktop'), (1366, 768, 'laptop'),
@@ -224,8 +333,8 @@ def main(layout_only=False):
             if layout_only:
                 assert not errors, errors
                 browser.close()
-                print('PASS compact 3D layout: three rendered views, four viewports, '
-                      'no title/button overlap, modal bounds and phone history scrolling')
+                print('PASS compact 3D layout: default view, mouse/touch orbit, double-click reset, release/resize/cancel/keyboard, '
+                      'four viewports, modal bounds and phone history scrolling')
                 return
 
             page.set_viewport_size({'width': 1440, 'height': 900})
@@ -395,7 +504,7 @@ def main(layout_only=False):
             assert not errors, errors
             browser.close()
             print('PASS compact 3D browser: both entry URLs, desktop 1440/1366, phone 390/360, '
-                  'one-screen controls, rendered view switching, modal scrolling/close, automatic polling/receipts, '
+                  'one-screen controls, mouse/touch/keyboard orbit, modal scrolling/close, automatic polling/receipts, '
                   'concurrent outputs, legacy guards, fault/offline indicator, visible dialog feedback, '
                   'API recovery, logout race')
     finally:

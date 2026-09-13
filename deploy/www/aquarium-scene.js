@@ -1,4 +1,5 @@
 import * as THREE from './vendor/three.module.js';
+import {createTurtleAnimator} from './aquarium-motion.js';
 
 const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
 
@@ -158,7 +159,7 @@ export function createAquarium(canvas) {
     box(.28,.11,.28,x,.29+h,z,darkMat);
   }
   // A slimmer glass partition at the wet/dry transition is interrupted by the ramp.
-  glass(.025,.74,1.05,-2.12,1.65,1.6);
+  glass(.025,.74,.575,-2.12,1.65,1.8375);
   glass(.025,1.2,1.1,-2.12,1.88,-1.57);
 
   const channelPoints=[[-2.28,1.055,-.08],[-1.25,1.12,-.28],[.1,1.17,-.55],[1.25,1.2,-.45],[2.3,1.22,-.65],[3.07,1.23,-.55]];
@@ -198,7 +199,8 @@ export function createAquarium(canvas) {
     if(a>2.57&&a<3.74)continue;
     bank.push({p:[3.58+Math.cos(a)*1.13,1.2,-.58+Math.sin(a)*.91],s:[between(.25,.4),between(.15,.26),between(.24,.37)],r:[random()*.3,a,random()*.2],c:i%3===0?0xaaa599:0xc1bcaf});
   }
-  instances(stoneGeometry,rockMat,bank);
+  // Leave a real opening beside the stream for the access ramp and turning turtles.
+  instances(stoneGeometry,rockMat,bank.filter(item=>!(item.p[0]>-2.65&&item.p[0]<-1.15&&item.p[2]>.15&&item.p[2]<1.5)));
   const pebbles=[];
   const pebbleColors=[0xc3b999,0xeee1bc,0x8e8578,0x645e4e,0xb49c79,0x777d75,0x9b7460];
   for(let i=0;i<128;i++) {
@@ -225,11 +227,11 @@ export function createAquarium(canvas) {
   const rampShape=new THREE.Shape();
   rampShape.moveTo(-.5,0);rampShape.quadraticCurveTo(0,-.31,.5,0);rampShape.lineTo(.5,.065);rampShape.quadraticCurveTo(0,-.245,-.5,.065);rampShape.closePath();
   const ramp=new THREE.Mesh(new THREE.ExtrudeGeometry(rampShape,{depth:1.28,bevelEnabled:false,curveSegments:18}),orangeMat);
-  const orangeRampGroup=new THREE.Group();orangeRampGroup.position.set(-2.91,.69,1.33);orangeRampGroup.rotation.z=.46;habitat.add(orangeRampGroup);
+  const orangeRampGroup=new THREE.Group();orangeRampGroup.position.set(-2.91,.69,1.69);orangeRampGroup.scale.z=.78;orangeRampGroup.rotation.z=.46;habitat.add(orangeRampGroup);
   ramp.rotation.y=Math.PI/2;ramp.castShadow=ramp.receiveShadow=true;orangeRampGroup.add(ramp);
-  const rampGroup=new THREE.Group();rampGroup.position.set(-2.34,.78,.67);rampGroup.rotation.z=.56;habitat.add(rampGroup);
-  box(1.25,.085,.48,0,0,0,material(0x746458),rampGroup);
-  for(let i=0;i<11;i++)box(.034,.035,.47,-.57+i*.112,.06,0,frameEdgeMat,rampGroup);
+  const rampGroup=new THREE.Group();rampGroup.position.set(-2.34,.78,.72);rampGroup.rotation.z=.56;habitat.add(rampGroup);
+  box(1.25,.085,.85,0,0,0,material(0x746458),rampGroup);
+  for(let i=0;i<11;i++)box(.034,.035,.84,-.57+i*.112,.06,0,frameEdgeMat,rampGroup);
 
   // The bright green perimeter irrigation tube has static, unused spray nozzles.
   const perimeter=tube([[-5.98,2.78,-1.77],[-5.57,2.42,-1.93],[-4.62,2.15,-1.91],[-3.28,2.46,-1.96],[-2.04,2.8,-1.98],[.45,2.72,-1.98],[2.85,2.79,-1.98],[5.58,2.73,-1.96],[5.78,2.65,-1.7],[5.79,2.48,.2],[5.73,2.27,1.85]],.061);
@@ -321,18 +323,20 @@ export function createAquarium(canvas) {
   }
   turtle(-4.55,.65,.71,-.72);
   turtle(-3.36,-.82,.58,1.16);
+  const turtleAnimator=createTurtleAnimator(THREE,turtles);
 
-  let level=.65,targetLevel=.65,frameId=0,lastTime=0,lastRender=0,view='perspective';
+  let level=.65,targetLevel=.65,frameId=0,lastTime=0,lastRender=0;
   let flow={fill:false,drain:false,circulation:true};
   function setLevel(percent) { if(Number.isFinite(percent))targetLevel=clamp(percent/100,0,1); }
   function setFlow(value={}) {flow={...flow,...value};}
-  function setView(value) {if(['front','top','perspective'].includes(value)){view=value;resize();}}
-  function resize() {
+  const defaultAzimuth=Math.atan2(-5.4,15.6),defaultElevation=Math.atan2(12.8,Math.hypot(-5.4,15.6));
+  let azimuth=defaultAzimuth,elevation=defaultElevation;
+  let pointer=null;
+  function positionCamera() {
     const width=canvas.clientWidth,height=canvas.clientHeight;if(!width||!height)return;
-    renderer.setSize(width,height,false);camera.aspect=width/height;
     const target=new THREE.Vector3(0,1.83,0);
-    const direction=(view==='top'?new THREE.Vector3(0,1,.001):view==='front'?new THREE.Vector3(0,4.9,16):new THREE.Vector3(-5.4,height<170?9.2:12.8,15.6)).normalize();
-    const upReference=view==='top'?new THREE.Vector3(0,0,-1):new THREE.Vector3(0,1,0);
+    const direction=new THREE.Vector3(Math.sin(azimuth)*Math.cos(elevation),Math.sin(elevation),Math.cos(azimuth)*Math.cos(elevation));
+    const upReference=new THREE.Vector3(0,1,0);
     const right=new THREE.Vector3().crossVectors(upReference,direction).normalize();
     const up=new THREE.Vector3().crossVectors(direction,right);
     const vertical=Math.tan(THREE.MathUtils.degToRad(camera.fov/2)),horizontal=vertical*camera.aspect;
@@ -343,12 +347,44 @@ export function createAquarium(canvas) {
     }
     camera.up.copy(upReference);camera.position.copy(target).addScaledVector(direction,distance*1.035);camera.lookAt(target);camera.updateProjectionMatrix();
   }
+  function resize() {
+    const width=canvas.clientWidth,height=canvas.clientHeight;if(!width||!height)return;
+    renderer.setSize(width,height,false);camera.aspect=width/height;
+    positionCamera();
+  }
+  function rotate(dx,dy) {azimuth=(azimuth-dx*.007)%(Math.PI*2);elevation=clamp(elevation+dy*.006,.13,Math.PI/2-.055);positionCamera();}
+  function resetView() {azimuth=defaultAzimuth;elevation=defaultElevation;positionCamera();}
+  function endDrag() {
+    const id=pointer?.id;pointer=null;canvas.classList.remove('is-dragging');
+    if(id!==undefined&&canvas.hasPointerCapture(id))canvas.releasePointerCapture(id);
+  }
+  function pointerDown(event) {
+    if(pointer||!event.isPrimary||event.button!==0)return;
+    pointer={id:event.pointerId,x:event.clientX,y:event.clientY};
+    canvas.setPointerCapture(event.pointerId);canvas.classList.add('is-dragging');canvas.focus({preventScroll:true});
+  }
+  function pointerMove(event) {
+    if(pointer?.id!==event.pointerId)return;
+    rotate(event.clientX-pointer.x,event.clientY-pointer.y);pointer.x=event.clientX;pointer.y=event.clientY;
+  }
+  function pointerEnd(event) {if(pointer?.id===event.pointerId)endDrag();}
+  function keyDown(event) {
+    if(event.altKey||event.ctrlKey||event.metaKey)return;
+    const moves={ArrowLeft:[-16,0],ArrowRight:[16,0],ArrowUp:[0,-16],ArrowDown:[0,16]};
+    if(event.key==='Home'){event.preventDefault();resetView();}
+    else if(moves[event.key]){event.preventDefault();rotate(...moves[event.key]);}
+  }
+  function visibilityChanged() {lastTime=0;if(document.hidden)endDrag();}
+  canvas.addEventListener('pointerdown',pointerDown);canvas.addEventListener('pointermove',pointerMove);
+  for(const name of ['pointerup','pointercancel','lostpointercapture'])canvas.addEventListener(name,pointerEnd);
+  canvas.addEventListener('dblclick',resetView);canvas.addEventListener('keydown',keyDown);
+  window.addEventListener('blur',endDrag);document.addEventListener('visibilitychange',visibilityChanged);
   const observer=new ResizeObserver(resize);observer.observe(canvas);
   const prefersReducedMotion=window.matchMedia('(prefers-reduced-motion: reduce)');
   function draw(time) {
     frameId=requestAnimationFrame(draw);
     if(document.hidden||canvas.clientWidth===0||time-lastRender<32)return;
-    const dt=Math.min(.1,(time-lastTime)/1000||.033);lastTime=time;lastRender=time;
+    const dt=lastTime?Math.min(.1,(time-lastTime)/1000):.033;lastTime=time;lastRender=time;
     const t=prefersReducedMotion.matches?0:time*.001;
     level+=(targetLevel-level)*(1-Math.exp(-dt*3));
     // Only the left pool follows estimated water level; circulation never changes that estimate.
@@ -370,19 +406,16 @@ export function createAquarium(canvas) {
       if(kind==='fill')drop.position.set(-5.48,waterY+.05+(1-p)*.72,-1.63);
       else drop.position.set(-5.23+Math.sin(p*4)*.025,Math.max(.37,waterY-.05-p*.62),-.6);
     });
-    turtles.forEach((item,index)=>{
-      const swimming=level>.16;
-      item.group.position.y=swimming?Math.max(.38,waterY-item.size*.26)+Math.sin(t*(1.12+index*.17))*.014:.38;
-      item.group.position.x=item.x+(swimming?Math.sin(t*.28+index)*.13:0);
-      item.group.position.z=item.z+(swimming?Math.cos(t*.3+index)*.1:0);
-      item.group.rotation.y=item.heading+(swimming?Math.sin(t*.22+index)*.13:0);
-      item.feet.forEach((foot,i)=>foot.rotation.y=swimming?Math.sin(t*1.8+i*1.7+index)*.18:0);
-    });
+    turtleAnimator.update(dt,level,waterY,prefersReducedMotion.matches);
     renderer.render(scene,camera);
   }
   resize();draw(33);
-  return {setLevel,setFlow,setView,dispose(){
-    cancelAnimationFrame(frameId);observer.disconnect();
+  return {setLevel,setFlow,dispose(){
+    cancelAnimationFrame(frameId);observer.disconnect();endDrag();turtleAnimator.dispose();
+    canvas.removeEventListener('pointerdown',pointerDown);canvas.removeEventListener('pointermove',pointerMove);
+    for(const name of ['pointerup','pointercancel','lostpointercapture'])canvas.removeEventListener(name,pointerEnd);
+    canvas.removeEventListener('dblclick',resetView);canvas.removeEventListener('keydown',keyDown);
+    window.removeEventListener('blur',endDrag);document.removeEventListener('visibilitychange',visibilityChanged);
     const geometries=new Set(),materials=new Set();scene.traverse(object=>{if(object.geometry)geometries.add(object.geometry);if(object.material)(Array.isArray(object.material)?object.material:[object.material]).forEach(mat=>materials.add(mat));});
     geometries.forEach(geometry=>geometry.dispose());materials.forEach(mat=>mat.dispose());textures.forEach(map=>map.dispose());renderer.dispose();
   }};

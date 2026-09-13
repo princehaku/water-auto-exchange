@@ -11,7 +11,7 @@ cp -a "$root/deploy/www" "$backup/source"
 cp -a "$root/deploy/install.sh" "$backup/install.sh"
 cp -a "$root/docs/web-console.md" "$backup/web-console.md"
 tar -xzf "$root/web-update.tar.gz" -C "$backup/staged"
-files=(index.html health.json aquarium.html aquarium.css aquarium.js aquarium-scene.js vendor/three.module.js vendor/THREE-LICENSE.txt)
+files=(vendor/three.module.js vendor/THREE-LICENSE.txt aquarium-motion.js aquarium-scene.js aquarium.js aquarium.css aquarium.html index.html health.json)
 for name in "${files[@]}"; do test -f "$backup/staged/deploy/www/$name"; done
 cmp "$backup/staged/deploy/www/index.html" "$backup/staged/deploy/www/aquarium.html"
 rollback() {

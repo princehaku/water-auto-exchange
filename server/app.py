@@ -91,6 +91,7 @@ class Store:
               interval_seconds INTEGER NOT NULL, updated REAL NOT NULL);
             CREATE TABLE IF NOT EXISTS aquarium_simulation (id INTEGER PRIMARY KEY, value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS level_job (id INTEGER PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS level_job_requests (id TEXT PRIMARY KEY, request TEXT NOT NULL, value TEXT NOT NULL);
         ''')
         # Restart never resurrects commands or claims that old telemetry is live.
         self.db.execute("UPDATE commands SET status='uncertain', result='server_restarted' WHERE status IN ('queued','delivered')")
@@ -216,6 +217,10 @@ class Store:
             return
         self._job_saved_second = second
         self.db.execute('INSERT OR REPLACE INTO level_job VALUES(1,?)', (json.dumps(self.level_job),))
+        request = dict(mode=self.level_job.get('mode', 'target'),
+                       target_level=self.level_job['target_level'] if self.level_job.get('mode') != 'exchange' else None)
+        self.db.execute('INSERT OR REPLACE INTO level_job_requests VALUES(?,?,?)',
+                        (self.level_job['id'], json.dumps(request, sort_keys=True), json.dumps(self.level_job)))
         self.db.commit()
 
     def job_running(self):
@@ -232,18 +237,23 @@ class Store:
             job['current_level'] = self.simulation['level']
             job['remaining_seconds'] = self.job_remaining()
             job['progress'] = min(100, 100 * job['elapsed_seconds'] / job['total_seconds'])
-            capacity = self.simulation['capacity_liters']
-            job['estimated_liters'] = capacity * job['elapsed_seconds'] / self.simulation[job['direction'] + '_seconds'] if capacity is not None else None
+            capacity = job['capacity_liters']
+            job['estimated_liters'] = runtime.get('completed_liters', 0) + capacity * current / job[job['direction'] + '_seconds'] if capacity is not None else None
             job['updated_at'] = self.clock()
             job['round_remaining_seconds'] = max(0, runtime.get('stop_at', self.control_clock()) - self.control_clock()) if job['phase'] == 'active' else None
             self.save_level_job()
         return dict(job)
 
-    def job_remaining(self):
+    def job_stage_remaining(self):
         job = self.level_job
         difference = job['target_level'] - self.simulation['level']
         remaining = difference if job['direction'] == 'fill' else -difference
-        return max(0, remaining * self.simulation[job['direction'] + '_seconds'] / 100)
+        return max(0, remaining * job[job['direction'] + '_seconds'] / 100)
+
+    def job_remaining(self):
+        job = self.level_job
+        following = job['fill_seconds'] if job.get('mode') == 'exchange' and job['stage'] == 'drain' else 0
+        return self.job_stage_remaining() + following
 
     def job_finish(self, state, reason):
         if not self.job_running():
@@ -274,10 +284,22 @@ class Store:
         self.save_level_job(True)
 
     def start_level_job(self, value):
-        target = value.get('target_level') if isinstance(value, dict) else None
-        if type(target) not in (int, float) or not math.isfinite(target) or not 0 <= target <= 100:
+        if not isinstance(value, dict) or value.get('mode', 'target') not in ('target', 'exchange'):
+            raise Problem(400, 'invalid_level_job')
+        mode, request_id = value.get('mode', 'target'), value.get('id')
+        target = value.get('target_level') if mode == 'target' else None
+        if mode == 'target' and (type(target) not in (int, float) or not math.isfinite(target) or not 0 <= target <= 100):
             raise Problem(400, 'invalid_level_target')
+        if (request_id is not None or mode == 'exchange') and (not isinstance(request_id, str) or len(request_id) != 32 or any(c not in '0123456789abcdef' for c in request_id)):
+            raise Problem(400, 'invalid_level_job')
+        request = json.dumps(dict(mode=mode, target_level=float(target) if target is not None else None), sort_keys=True)
         with self.lock:
+            if request_id is not None:
+                previous = self.db.execute('SELECT request,value FROM level_job_requests WHERE id=?', (request_id,)).fetchone()
+                if previous:
+                    if previous['request'] != request:
+                        raise Problem(409, 'request_id_conflict')
+                    return self.job_refresh() if self.level_job and self.level_job['id'] == request_id else json.loads(previous['value'])
             if self.job_running():
                 raise Problem(409, 'level_job_active')
             if self.output_runner.running():
@@ -292,37 +314,63 @@ class Store:
                 raise Problem(409, 'level_job_requires_calibration')
             if self.db.execute("SELECT 1 FROM commands WHERE status IN ('queued','delivered')").fetchone():
                 raise Problem(409, 'command_pending')
+            if mode == 'exchange':
+                target = 0 if self.simulation['level'] > 0.000001 else 100
             difference = target - self.simulation['level']
             if abs(difference) < 0.000001:
                 raise Problem(409, 'level_target_reached')
             direction = 'fill' if difference > 0 else 'drain'
             seconds = abs(difference) * self.simulation[direction + '_seconds'] / 100
             limit = 170 if direction == 'fill' else 290
-            self.level_job = dict(id=secrets.token_hex(16), status='running', phase='starting', direction=direction,
+            rounds = math.ceil(seconds / limit)
+            if mode == 'exchange' and direction == 'drain':
+                seconds += self.simulation['fill_seconds']
+                rounds += math.ceil(self.simulation['fill_seconds'] / 170)
+            self.level_job = dict(id=request_id or secrets.token_hex(16), mode=mode, stage=direction,
+                                  status='running', phase='starting', direction=direction,
                                   target_level=float(target), start_level=self.simulation['level'], current_level=self.simulation['level'],
                                   round=0, elapsed_seconds=0, round_elapsed_seconds=0, round_limit_seconds=limit,
-                                  total_seconds=seconds, remaining_seconds=seconds, estimated_rounds=math.ceil(seconds / limit),
+                                  total_seconds=seconds, remaining_seconds=seconds, estimated_rounds=rounds,
+                                  fill_seconds=self.simulation['fill_seconds'], drain_seconds=self.simulation['drain_seconds'],
+                                  capacity_liters=self.simulation['capacity_liters'],
                                   estimated_liters=0 if self.simulation['capacity_liters'] is not None else None,
                                   progress=0, estimated=True, created_at=self.clock(), updated_at=self.clock(), finished_at=None, reason='running')
-            self._job_runtime = dict(session=self.ws_gateway, completed_seconds=0, cancel_reason=None)
+            self._job_runtime = dict(session=self.ws_gateway, completed_seconds=0, completed_liters=0, cancel_reason=None)
             self.job_start_round()
             return self.job_refresh()
 
-    def job_request_stop(self, cancel_reason=None):
+    def job_request_stop(self, cancel_reason=None, command_id=None):
         job, runtime = self.level_job, self._job_runtime
+        stopping = job['phase'] == 'stopping'
+        if stopping and cancel_reason and command_id is None:
+            # A late cancellation keeps the pending OFF receipt and its original
+            # deadline; it cannot grant another five seconds or start filling.
+            runtime['cancel_reason'] = cancel_reason
+            job['reason'] = cancel_reason
+            self.save_level_job(True)
+            return
         if cancel_reason:
             runtime['cancel_reason'] = cancel_reason
             for key in ('on_id', 'off_id'):
-                command_id = runtime.get(key)
-                if command_id and command_id not in self.ws_grants:
-                    self.db.execute("UPDATE commands SET status='cancelled', result='level_job_cancelled', finished=? WHERE id=? AND status IN ('queued','delivered')", (self.clock(), command_id))
+                old_command_id = runtime.get(key)
+                if old_command_id and old_command_id not in self.ws_grants:
+                    self.db.execute("UPDATE commands SET status='cancelled', result='level_job_cancelled', finished=? WHERE id=? AND status IN ('queued','delivered')", (self.clock(), old_command_id))
         job.update(phase='stopping', reason=cancel_reason or 'round_stopping')
-        runtime['off_id'] = self.job_command('STOP' if cancel_reason else job['direction'].upper() + '_OFF', ttl=5)
-        runtime['stop_until'] = self.control_clock() + 5
+        runtime['off_id'] = command_id or self.job_command('STOP' if cancel_reason else job['direction'].upper() + '_OFF', ttl=5)
+        runtime['stop_until'] = min(runtime['stop_until'], self.control_clock() + 5) if stopping else self.control_clock() + 5
         self.save_level_job(True)
 
-    def cancel_level_job(self):
+    def cancel_level_job(self, value=None):
+        if value is not None and not isinstance(value, dict):
+            raise Problem(400, 'invalid_level_job')
+        job_id = value.get('job_id') if value else None
+        if job_id is not None and (not isinstance(job_id, str) or len(job_id) != 32 or any(c not in '0123456789abcdef' for c in job_id)):
+            raise Problem(400, 'invalid_level_job')
         with self.lock:
+            if self.level_job and self.level_job.get('mode') == 'exchange' and job_id is None:
+                raise Problem(400, 'invalid_level_job')
+            if job_id is not None and (self.level_job is None or self.level_job['id'] != job_id):
+                raise Problem(409, 'level_job_changed')
             if self.job_running() and not self._job_runtime.get('cancel_reason'):
                 self.job_request_stop('cancelled_by_user')
             return self.job_refresh()
@@ -353,7 +401,7 @@ class Store:
         if job['phase'] == 'starting' and status[direction] == '1' and runtime['on_id'] in self.ws_grants:
             runtime['on_tick'] = self.control_clock()
             grant = self.control_runs[direction]
-            runtime['stop_at'] = min(runtime['on_tick'] + min(job['round_limit_seconds'], self.job_remaining()), grant['until'] - 10)
+            runtime['stop_at'] = min(runtime['on_tick'] + min(job['round_limit_seconds'], self.job_stage_remaining()), grant['until'] - 10)
             job['phase'] = 'active'
             self.save_level_job(True)
         elif job['phase'] == 'active' and status[direction] == '0':
@@ -361,13 +409,16 @@ class Store:
         elif job['phase'] == 'stopping' and ack and ack.get('id') == runtime['off_id'] and status['fill'] == status['drain'] == '0' and status['state'] in ('IDLE', 'DONE'):
             self.job_refresh()
             runtime['completed_seconds'] = job['elapsed_seconds']
+            runtime['completed_liters'] = job['estimated_liters']
             runtime['on_tick'] = None
             if runtime.get('cancel_reason'):
                 self.job_finish('cancelled', runtime['cancel_reason'])
             elif self.job_remaining() <= 0.00001:
                 self.job_finish('completed', 'target_reached')
             else:
-                job.update(phase='waiting', reason='between_rounds')
+                transition = job.get('mode') == 'exchange' and job['stage'] == 'drain' and self.job_stage_remaining() <= 0.00001
+                runtime['next_stage'] = 'fill' if transition else None
+                job.update(phase='waiting', reason='between_stages' if transition else 'between_rounds')
                 runtime['wait_until'] = self.control_clock() + 2
                 self.save_level_job(True)
 
@@ -394,7 +445,7 @@ class Store:
             if job['phase'] == 'starting' and now >= runtime['start_until']:
                 self.job_finish('failed', 'start_timeout')
                 self.control_abort('level_job_start_timeout')
-            elif job['phase'] == 'active' and (now >= runtime['stop_at'] or self.job_remaining() <= 0.00001):
+            elif job['phase'] == 'active' and (now >= runtime['stop_at'] or self.job_stage_remaining() <= 0.00001):
                 self.job_request_stop()
             elif job['phase'] == 'stopping' and now >= runtime['stop_until']:
                 self.job_finish('failed', 'stop_unconfirmed')
@@ -408,6 +459,8 @@ class Store:
                 elif self.job_remaining() <= 0.00001:
                     self.job_finish('completed', 'target_reached')
                 else:
+                    if runtime.pop('next_stage', None) == 'fill':
+                        job.update(stage='fill', direction='fill', target_level=100.0, round_limit_seconds=170)
                     self.job_start_round()
             self.job_refresh()
         finally:
@@ -586,7 +639,7 @@ class Store:
             self.expire()
             pending_on = self.db.execute("SELECT 1 FROM commands WHERE status IN ('queued','delivered') AND command IN ('FILL','DRAIN','START')").fetchone()
             control_pending = self.control_timeout or any(self.control_runs.values()) or (self.web_limits and self.control_uncertain)
-            job_pending = self.output_runner.running() or (self.job_running() and self.level_job['phase'] != 'waiting')
+            job_pending = self.output_runner.running() or (self.job_running() and (self.level_job['phase'] != 'waiting' or self.level_job.get('mode') == 'exchange'))
             if not self.online() or not self.status or self.status['outputs_known'] != '1' or self.status['fill'] != '0' or self.status['drain'] != '0' or pending_on or control_pending or job_pending:
                 raise Problem(409, 'simulation_requires_idle')
             self.job_finish('cancelled', 'calibration_changed')
@@ -742,6 +795,9 @@ class Store:
             if not self.online():
                 raise Problem(409, 'device_offline')
             s = self.status
+            exchange_cancel = self.job_running() and self.level_job.get('mode') == 'exchange'
+            if exchange_cancel and command not in ('STOP', 'FILL_OFF', 'DRAIN_OFF'):
+                raise Problem(409, 'level_job_active')
             if self.control_timeout and command not in ('STOP', 'FILL_OFF', 'DRAIN_OFF'):
                 raise Problem(409, 'control_timeout_pending')
             concurrent = s['version'] in ('0.8.0', '0.8.1', '0.8.2') and s.get('control_mode') == 'manual'
@@ -768,7 +824,7 @@ class Store:
                 pending = self.db.execute("SELECT id FROM commands WHERE status IN ('queued','delivered')").fetchall()
                 if any(row['id'] not in cancelable for row in pending):
                     raise Problem(409, 'command_pending')
-            if self.job_running():
+            if self.job_running() and not exchange_cancel:
                 self.job_finish('cancelled', 'manual_override')
             if command == 'STOP':
                 self.db.execute("UPDATE commands SET status='cancelled', result='superseded_by_stop', finished=? WHERE status='queued' AND id<>?", (self.clock(), self.control_timeout['id'] if self.control_timeout else ''))
@@ -776,6 +832,12 @@ class Store:
                 self.db.execute("UPDATE commands SET status='cancelled', result='superseded_by_output_off', finished=? WHERE status='queued' AND command=?", (self.clock(), command[:-4]))
             now = self.clock()
             self.db.execute('INSERT INTO commands VALUES (?,?,?,?,?,?,?)', (request_id, command, now, now + 8, 'queued', None, None))
+            if exchange_cancel:
+                # Any explicit manual OFF ends the entire sequence. Wait for
+                # all-OFF confirmation even when the requested route was idle.
+                if command != 'STOP':
+                    self.db.execute("UPDATE commands SET status='cancelled', result='exchange_stop_requested', finished=? WHERE id=?", (now, request_id))
+                self.job_request_stop('manual_override', command_id=request_id if command == 'STOP' else None)
             self.output_runner.manual_command(command, request_id)
             self.db.commit()
             return dict(self.db.execute('SELECT * FROM commands WHERE id=?', (request_id,)).fetchone())
@@ -1087,8 +1149,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == '/water/api/level-job' and post:
             return self.respond(202, self.server.store.start_level_job(self.body()))
         if path == '/water/api/level-job/cancel' and post:
-            self.body()
-            return self.respond(200, self.server.store.cancel_level_job())
+            return self.respond(200, self.server.store.cancel_level_job(self.body()))
         if path == '/water/api/output-run' and post:
             return self.respond(202, self.server.store.output_runner.start(self.body()))
         if path == '/water/api/output-run/cancel' and post:

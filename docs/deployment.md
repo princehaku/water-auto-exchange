@@ -1,5 +1,13 @@
 # Docker 部署
 
+## 2026-09-14：一键换水发布
+
+发布前本地`main`与`origin/main`一致，生产设备0.8.2在线IDLE、两路OFF，无活动目标/完整用时作业及待处理指令；Nginx、water/sms健康、磁盘空间及镜像缓存可用。本次完整部署更新Web与服务端，固件保持0.8.2。新增SQLite请求去重表兼容旧数据库，回滚旧镜像时保留数据。
+
+本地200项Python及完整浏览器回归通过；新增一键换水真实本地HTTP/WS联调验证排到估算0%后补至100%、跨轮、关闭网页继续、取消与三种屏幕布局。备份为`/apps/water-auto-exchange/backups/20260913T185849Z-274516`，容器healthy/restart=0，StartedAt为2026-09-13T18:59:01.52062482Z。公网9项静态与3个服务端源文件逐字节匹配本地；HTTPS登录/status/退出、999天会话、WSS诊断probe及water/sms健康通过。
+
+部署后设备重新连接，0.8.2/IDLE/双OFF，无活动任务，已保存校准保持fill60/drain400/capacity5、level100、uncertain=false。全程没有刷写实板、生产控制命令或校准写入，实际水流仍须现场验收。
+
 ## 当前部署（2026-09-08）
 
 所有本项目的服务代码、网页、配置、数据库、Docker 运行目录和备份集中在 `/apps/water-auto-exchange`。API 使用真实 Docker Engine 29.8.0 运行，容器名 `water-console`，Python 3.12，UID/GID 为 10001。原 systemd 应用服务已停用并归档。

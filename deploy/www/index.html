@@ -27,10 +27,6 @@
       <button id="startup-retry" class="text-button" type="button" hidden>重试连接 ↗</button>
       <noscript><p class="startup-message">请开启 JavaScript 后重新加载页面。</p></noscript>
     </section>
-    <section id="login-panel" class="login-panel" aria-labelledby="login-title" hidden>
-      <div class="eyebrow">WELCOME BACK</div><h1 id="login-title">连接你的龟缸</h1><p>登录后查看三维鱼缸，手动控制补水与冲水。</p>
-      <form id="login-form"><label for="key">管理密钥</label><div class="login-row"><input id="key" type="password" autocomplete="current-password" required placeholder="输入管理密钥"><button type="submit">进入控制台 ↗</button></div></form>
-    </section>
     <div id="console" hidden>
       <div class="dashboard-grid">
         <section class="tank-card" aria-labelledby="tank-title">
@@ -69,6 +65,7 @@
   <dialog id="device-dialog" class="menu-dialog" aria-labelledby="device-title">
     <div class="dialog-head"><div><span class="eyebrow">DEVICE</span><h2 id="device-title">设备状态</h2></div><button id="close-device" class="close-button" data-close="device-dialog" aria-label="关闭设备状态">×</button></div>
     <div class="dialog-body">
+      <div id="login-panel" hidden><form id="login-form"><label for="key">管理密钥</label><div class="login-row"><input id="key" type="password" autocomplete="current-password" required placeholder="输入管理密钥"><button type="submit">登录</button></div></form></div>
       <div class="device-overview"><strong id="hero-status">正在获取状态</strong><span id="hero-seen">等待设备上报</span></div>
       <div class="detail-grid"><div><span>当前状态</span><strong id="device-state">等待连接</strong></div><div><span>控制模式</span><strong id="device-mode">—</strong></div><div><span>补水输出</span><strong id="fill-state">未知</strong></div><div><span>排水输出</span><strong id="drain-state">未知</strong></div><div><span>最近通信</span><strong id="last-seen">—</strong></div><div><span>本次连接持续</span><strong id="online-duration">—</strong></div><div><span>设备固件</span><strong id="version">—</strong></div><div><span>网页同步</span><strong id="sync-status">每 2 秒自动同步</strong></div></div>
       <p id="device-reason" class="detail-reason">等待设备状态。</p><p class="explanation">自动与手动操作都按可信水位估算收尾：到 100% 停止补水，到 0% 停止冲水，已到边界时禁止继续同向开启。两路同时运行时，只关闭到界的对应输出，另一条可继续运行。两路默认每轮最多 60 秒，最后一轮按剩余时长缩短，确认关闭后等待 2 秒再续轮。每路仍有独立运行时长上限；关闭网页后服务端继续执行。停止以设备关断回执为准，水位未知或估算不确定时须按现场重新校准。</p><p id="device-timeout-note" class="explanation">等待设备确认当前保护时限。</p>

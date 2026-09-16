@@ -1234,12 +1234,19 @@ class Handler(BaseHTTPRequestHandler):
                     raise Problem(401, 'invalid_key')
                 token = self.server.store.create_admin_session(self.server.admin_key)
             return self.respond(200, dict(ok=True), 'water_session=' + token + '; Path=/water/api/; Secure; HttpOnly; SameSite=Strict; Max-Age=' + str(ADMIN_SESSION_TTL_SECONDS))
+        if path == '/water/api/status' and not post:
+            authenticated = False
+            try:
+                self.session()
+                authenticated = True
+            except Problem as error:
+                if error.code != 401:
+                    raise
+            return self.respond(200, dict(self.server.store.snapshot(), authenticated=authenticated))
         token = self.session()
         if path == '/water/api/logout' and post:
             self.server.store.revoke_admin_session(token)
             return self.respond(200, dict(ok=True), 'water_session=; Path=/water/api/; Secure; HttpOnly; SameSite=Strict; Max-Age=0')
-        if path == '/water/api/status' and not post:
-            return self.respond(200, self.server.store.snapshot())
         if path == '/water/api/simulation' and post:
             return self.respond(200, self.server.store.configure_simulation(self.body()))
         if path == '/water/api/level-job' and post:

@@ -1,6 +1,7 @@
 """One-click exchange over local HTTP and real 0.8.2 WebSocket receipts."""
 import json
 import math
+import os
 import threading
 import time
 
@@ -152,12 +153,13 @@ def main():
 
     try:
         with sync_playwright() as playwright:
-            browser = playwright.chromium.launch(channel='msedge', headless=True,
+            browser = playwright.chromium.launch(channel=os.environ.get('WATER_TEST_BROWSER', 'msedge'), headless=True,
                 args=['--enable-webgl', '--use-gl=angle', '--use-angle=swiftshader'])
             context = browser.new_context(viewport=dict(width=1440, height=900))
             page = context.new_page()
             page.on('pageerror', lambda error: errors.append(str(error)))
             page.goto(server.origin + '/water/')
+            open_dialog(page, 'device')
             page.locator('#key').fill(server.admin_key)
             page.locator('#login-form button[type="submit"]').click()
             expect(page.locator('#console')).to_be_visible()
@@ -193,7 +195,8 @@ def main():
             sync_status(page)
             expect(page.locator('#drain-button')).to_have_attribute('aria-checked', 'true')
             expect(page.locator('#fill-button')).to_be_disabled()
-            expect(page.locator('#menu-level-job')).to_be_disabled()
+            expect(page.locator('#menu-level-job')).to_be_enabled()
+            expect(page.locator('#start-level-job')).to_be_disabled()
             expect(page.locator('#exchange-button')).to_contain_text('停止换水')
             expect(page.locator('#job-summary')).to_be_visible()
             expect(page.locator('#job-summary')).to_contain_text('正在换水')

@@ -338,16 +338,50 @@ class HttpTests(unittest.TestCase):
             self.assertIn(attribute, cookie)
         return cookie.split(';')[0]
 
-    def test_health_public_status_private(self):
+    def test_health_and_status_are_public_without_credentials(self):
         self.assertEqual(self.request('health')[0], 200)
-        self.assertEqual(self.request('status')[0], 401)
+        code, data, headers = self.request('status')
+        self.assertEqual(code, 200)
+        self.assertFalse(data['authenticated'])
+        self.assertEqual(headers['Cache-Control'], 'no-store')
+        self.assertIsNone(headers.get('Set-Cookie'))
+        for field in ('device', 'connection', 'traffic', 'simulation', 'level_job', 'output_runs', 'commands'):
+            self.assertIn(field, data)
+        serialized = json.dumps(data)
+        for private in (self.server.admin_key, self.server.device_key, 'token_hash', 'admin_key_hash'):
+            self.assertNotIn(private, serialized)
 
     def test_session_login_logout(self):
         cookie = self.login()
-        self.assertEqual(self.request('status', headers={'Cookie': cookie})[0], 200)
+        self.assertTrue(self.request('status', headers={'Cookie': cookie})[1]['authenticated'])
         headers = {'Cookie': cookie, 'Origin': 'https://example.test'}
         self.assertEqual(self.request('logout', {}, headers)[0], 200)
-        self.assertEqual(self.request('status', headers={'Cookie': cookie})[0], 401)
+        code, data, _ = self.request('status', headers={'Cookie': cookie})
+        self.assertEqual(code, 200)
+        self.assertFalse(data['authenticated'])
+
+    def test_public_view_never_authorizes_any_mutation(self):
+        cookie = self.login()
+        self.request('logout', {}, {'Cookie': cookie, 'Origin': 'https://example.test'})
+        actions = [('commands', dict(command=command, id='d' * 32))
+                   for command in ('START', 'FILL', 'DRAIN', 'FILL_OFF', 'DRAIN_OFF', 'STOP', 'RESET')]
+        actions += [('simulation', dict(level=50, fill_seconds=60, drain_seconds=400)),
+                    ('level-job', dict(target_level=0, id='e' * 32)),
+                    ('level-job', dict(mode='exchange', id='e' * 32)),
+                    ('level-job/cancel', dict(job_id='e' * 32)),
+                    ('output-run', dict(direction='fill', id='e' * 32)),
+                    ('output-run/cancel', dict(direction='drain', run_id='e' * 32))]
+        before = list(self.store.db.execute('SELECT * FROM commands'))
+        for credential in (None, 'water_session=invalid', cookie):
+            headers = {'Origin': 'https://example.test'}
+            if credential:
+                headers['Cookie'] = credential
+            self.assertFalse(self.request('status', headers=headers)[1]['authenticated'])
+            for path, payload in actions:
+                with self.subTest(cookie=credential is not None, path=path, payload=payload):
+                    code, data, _ = self.request(path, payload, headers)
+                    self.assertEqual((code, data['error']), (401, 'login_required'))
+        self.assertEqual(before, list(self.store.db.execute('SELECT * FROM commands')))
 
     def test_simulation_calibration_requires_session_and_origin(self):
         payload = dict(level=100, fill_seconds=300, drain_seconds=240)

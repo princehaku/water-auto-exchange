@@ -10,7 +10,7 @@ const errors={login_required:'请先登录。',invalid_key:'管理密钥不正�
 const supportedManual=['0.7.0','0.7.1','0.7.2','0.7.3','0.7.4','0.7.5','0.7.6','0.7.7','0.8.0','0.8.1','0.8.2'];
 const refreshInterval=2000;
 const roundSeconds=60;
-let scene=null,snapshot=null,lastSnapshot=null,signedIn=false,lastSuccess=0,refreshRequest=null,authEpoch=0,busy=false,jobBusy=false,submittedId=null,observedExchangeId=null,formLoaded=false,refreshEnabled=true,startupPending=!!$('startup-splash');
+let scene=null,snapshot=null,lastSnapshot=null,signedIn=false,lastSuccess=0,refreshRequest=null,authEpoch=0,authBusy=false,busy=false,jobBusy=false,submittedId=null,observedExchangeId=null,formLoaded=false,startupPending=!!$('startup-splash');
 const outputBusy={fill:false,drain:false};
 Object.assign(errors,{invalid_output_run:'作业参数不正确，请刷新后重试。',output_run_active:'已有补排作业正在执行，请先结束对应作业。',output_run_requires_web:'完整用时作业需要 0.8.2 手动模式。',output_run_requires_idle:'本路须关闭并确认就绪后才能开始作业。',output_run_requires_calibration:'请先在校准中保存本路完整用时。',stale_output_run:'本路作业已变化，请等待同步后再操作。',request_id_conflict:'请求标识已使用，请刷新后重试。'});
 Object.assign(errors,{output_requires_calibration:'水位估算未校准或已不确定，请按现场水位重新校准。',output_stop_pending:'正在确认本路关闭，请稍候再操作。',fill_target_reached:'水位已达 100%，无需继续补水。',drain_target_reached:'水位已达 0%，无需继续冲水。'});
@@ -32,8 +32,8 @@ function setMessage(value){$('message').textContent=value;const panel=document.q
 function setFeedback(value){$('command-feedback').textContent=value;$('device-feedback').textContent=value;}
 function clearRetryNotice(){for(const node of [$('message'),...document.querySelectorAll('.panel-message')])if(node.textContent===retryNotice)node.textContent='';}
 function closePanels(){document.querySelectorAll('.menu-dialog[open]').forEach(dialog=>dialog.close());if($('confirm').open)$('confirm').close();}
-function updateMenus(){document.querySelectorAll('[data-panel]').forEach(button=>{button.disabled=!signedIn;});}
-function openPanel(id){if(!signedIn)return;const dialog=$(id);if(dialog.open)return;closePanels();document.querySelectorAll('[data-panel]').forEach(button=>button.setAttribute('aria-expanded',String(button.dataset.panel===id)));dialog.showModal();}
+function updateMenus(){document.querySelectorAll('[data-panel]').forEach(button=>{button.disabled=false;});$('login-panel').hidden=signedIn;$('logout').hidden=!signedIn;}
+function openPanel(id){const dialog=$(id);if(dialog.open)return;closePanels();document.querySelectorAll('[data-panel]').forEach(button=>button.setAttribute('aria-expanded',String(button.dataset.panel===id)));dialog.showModal();}
 async function api(path,body,signal=AbortSignal.timeout(6000)){
   const response=await fetch('./api/'+path,{method:body===undefined?'GET':'POST',credentials:'same-origin',cache:'no-store',headers:body===undefined?{}:{'Content-Type':'application/json'},body:body===undefined?undefined:JSON.stringify(body),signal});
   let data;try{data=await response.json();}catch{throw new Error('服务暂时不可用，请稍后重试。');}
@@ -43,7 +43,8 @@ async function api(path,body,signal=AbortSignal.timeout(6000)){
 function cancelRefresh(){authEpoch++;refreshRequest?.abort();refreshRequest=null;}
 function finishStartup(){startupPending=false;const splash=$('startup-splash');if(splash){splash.hidden=true;splash.setAttribute('aria-busy','false');$('app-header').hidden=false;}}
 function showStartup(){if(!$('startup-splash'))return;startupPending=true;$('startup-splash').hidden=false;$('startup-splash').setAttribute('aria-busy','true');$('startup-message').textContent='正在连接你的龟缸…';$('startup-retry').hidden=true;$('app-header').hidden=true;$('login-panel').hidden=true;$('console').hidden=true;}
-function showLogin(){cancelRefresh();refreshEnabled=false;signedIn=false;snapshot=null;lastSnapshot=null;submittedId=null;observedExchangeId=null;lastSuccess=0;formLoaded=false;jobBusy=false;outputBusy.fill=outputBusy.drain=false;closePanels();updateMenus();$('console').hidden=true;$('login-panel').hidden=false;$('logout').hidden=true;$('header-connection').textContent='未登录';$('header-connection').className='connection-pill';$('header-connection').removeAttribute('title');$('header-connection').setAttribute('aria-label','未登录');$('hero-status').textContent='登录后查看设备';$('hero-seen').textContent='';finishStartup();}
+function showGuest(){cancelRefresh();signedIn=false;submittedId=null;observedExchangeId=null;busy=jobBusy=false;outputBusy.fill=outputBusy.drain=false;for(const id of ['confirm','exchange-confirm'])if($(id)?.open)$(id).close('cancel');updateMenus();$('console').hidden=false;setFeedback('');renderControls();finishStartup();}
+function handleUnauthorized(error){if(error.status!==401)return false;showGuest();refresh();return true;}
 function setConnection(data,serviceOk=true){
   const connection=$('header-connection');
   const online=serviceOk&&data?.online===true,device=data?.device;
@@ -90,7 +91,7 @@ function displayedOutputRun(output,data){
 }
 function canStartOutput(output){
   const data=snapshot,device=data?.device,control=data?.control_limits;
-  if(!signedIn||!data?.online||Date.now()-lastSuccess>10000||!webLimits(device)||outputBusy[output]||jobBusy||busy)return false;
+  if(!signedIn||authBusy||!data?.online||Date.now()-lastSuccess>10000||!webLimits(device)||outputBusy[output]||jobBusy||busy)return false;
   if(data.level_job?.status==='running'||runningOutput(output)||calibratedDuration(output)===null||outputBoundaryReason(output))return false;
   if(device.ready!=='1'||device.outputs_known!=='1'||device.overflow!=='0'||device[output]!=='0'||!['IDLE','DONE','FILLING','DRAINING','EXCHANGING'].includes(device.state))return false;
   if(control?.source!=='web'||control.uncertain||control.timeout_pending||control[output+'_on_since']!=null||control[output+'_deadline']!=null)return false;
@@ -101,7 +102,7 @@ function canOutputAction(button){
   const output=button.dataset.output,run=runningOutput(output);
   if(webLimits(snapshot?.device)&&snapshot?.level_job?.status==='running')return false;
   if(!outputUsesRun(button))return can(switchCommand(button));
-  return run?!!snapshot&&signedIn&&Date.now()-lastSuccess<=10000&&!outputBusy[output]&&run.reason!=='cancelled_by_user':canStartOutput(output);
+  return run?!!snapshot&&signedIn&&!authBusy&&Date.now()-lastSuccess<=10000&&!outputBusy[output]&&run.reason!=='cancelled_by_user':canStartOutput(output);
 }
 function switchCommand(button){
   const output=button.dataset.output,device=snapshot?.device;
@@ -111,7 +112,7 @@ function switchCommand(button){
 }
 function can(command){
   const data=snapshot,device=data?.device;
-  if(!data?.online||!device||Date.now()-lastSuccess>10000)return false;
+  if(!signedIn||authBusy||!data?.online||!device||Date.now()-lastSuccess>10000)return false;
   if(command==='STOP')return true;
   if(busy||jobBusy)return false;
   if(command==='FILL_OFF'||command==='DRAIN_OFF')return concurrent(device);
@@ -124,7 +125,7 @@ function can(command){
 const calibrationWaitNotice='请先结束补排作业或一键换水，并等待输出关闭确认后校准；单个目标水位任务可在轮间全关时校准。';
 function canCalibrate(){
   const data=snapshot,device=data?.device,control=data?.control_limits;
-  if(!data?.online||Date.now()-lastSuccess>10000||device?.outputs_known!=='1'||device.fill!=='0'||device.drain!=='0')return false;
+  if(!signedIn||authBusy||!data?.online||Date.now()-lastSuccess>10000||device?.outputs_known!=='1'||device.fill!=='0'||device.drain!=='0')return false;
   if(hasOutputRuns(data)||outputBusy.fill||outputBusy.drain||jobBusy||data.level_job?.status==='running'&&data.level_job.mode==='exchange')return false;
   if((data.commands||[]).some(item=>['FILL','DRAIN','START'].includes(item.command)&&['queued','delivered'].includes(item.status)))return false;
   if(control?.source==='web'&&(control.uncertain||control.timeout_pending||['fill_on_since','drain_on_since','fill_deadline','drain_deadline'].some(key=>control[key]!=null)))return false;
@@ -132,8 +133,9 @@ function canCalibrate(){
 }
 function renderCalibrationStatus(){
   const ready=canCalibrate();$('save-calibration').disabled=!ready;
+  document.querySelectorAll('#calibration-form input,[data-anchor]').forEach(input=>input.disabled=!signedIn||authBusy);
   const message=$('calibration-message');
-  if(!ready&&snapshot?.online)message.textContent=calibrationWaitNotice;
+  if(signedIn&&!ready&&snapshot?.online)message.textContent=calibrationWaitNotice;
   else if(message.textContent===calibrationWaitNotice)message.textContent='';
 }
 function renderControls(){
@@ -264,7 +266,7 @@ function jobPreview(){
 }
 function jobStartReason(preview=jobPreview()){
   const data=snapshot,device=data?.device,sim=data?.simulation||{};
-  if(!signedIn||!data||Date.now()-lastSuccess>10000)return '状态同步中断，请等待重新同步。';
+  if(!data||Date.now()-lastSuccess>10000)return '状态同步中断，请等待重新同步。';
   if(data.level_job?.status==='running')return '任务正在执行；先停止当前任务才能设置新目标。';
   if(hasOutputRuns(data)||outputBusy.fill||outputBusy.drain)return '请先结束补水和排水作业，再设置目标水位任务。';
   if(busy||jobBusy)return '正在提交，请等待服务端确认。';
@@ -318,7 +320,7 @@ function renderExchangeConfirmation(){
   $('exchange-confirm-wait').textContent=preview?durationLabel(preview.wait):'—';
   $('exchange-confirm-reason').textContent=reason;
   $('exchange-confirm-reason').hidden=!reason;
-  $('confirm-exchange-start').disabled=!!reason;
+  $('confirm-exchange-start').disabled=!signedIn||authBusy||!!reason;
 }
 async function confirmExchange(){
   const dialog=$('exchange-confirm');
@@ -333,11 +335,11 @@ function renderLevelJob(){
   renderSceneStatus(data);
   if(active&&!exchange)$('target-level').value=String(job.target_level);
   const preview=jobPreview(),reason=jobStartReason(preview),summary=$('job-summary'),exchangeButton=$('exchange-button');
-  exchangeButton.disabled=active&&exchange?!signedIn||jobBusy||job.reason==='cancelled_by_user':!!exchangeStartReason();
+  exchangeButton.disabled=!signedIn||authBusy||(active&&exchange?jobBusy||job.reason==='cancelled_by_user':!!exchangeStartReason());
   exchangeButton.textContent=active&&exchange?(job.reason==='cancelled_by_user'?'正在停止…':'停止换水'):'一键换水';
   exchangeButton.classList.toggle('is-running',active&&exchange);
   exchangeButton.title=active&&exchange?'停止本次换水，并等待两路关闭确认。':exchangeStartReason()||'先按当前估算冲水至 0%，确认关闭后自动补水至 100%。';
-  $('menu-level-job').disabled=!signedIn||jobBusy||active&&exchange;
+  $('menu-level-job').disabled=false;
   $('level-job-title').textContent=active&&exchange?'一键换水':'按目标水位运行';
   $('exchange-workflow').hidden=!(active&&exchange);
   $('level-job-form').hidden=active&&exchange;
@@ -347,10 +349,10 @@ function renderLevelJob(){
   $('job-preview-time').textContent=Number.isFinite(secondsPreview)?durationLabel(Math.ceil(secondsPreview)):'—';
   $('job-preview-rounds').textContent=Number.isFinite(roundsPreview)?roundsPreview+' 轮':'—';
   $('job-disabled-reason').textContent=reason||'预计时间按累计开启时长计算，轮间等待另计。';
-  $('start-level-job').disabled=!!reason;
-  $('target-level').disabled=active||jobBusy;
-  document.querySelectorAll('[data-target-level]').forEach(button=>button.disabled=active||jobBusy);
-  $('cancel-level-job').disabled=!signedIn||!active||jobBusy||job.reason==='cancelled_by_user';
+  $('start-level-job').disabled=!signedIn||authBusy||!!reason;
+  $('target-level').disabled=!signedIn||authBusy||active||jobBusy;
+  document.querySelectorAll('[data-target-level]').forEach(button=>button.disabled=!signedIn||authBusy||active||jobBusy);
+  $('cancel-level-job').disabled=!signedIn||authBusy||!active||jobBusy||job.reason==='cancelled_by_user';
   $('cancel-level-job').textContent=active&&job.reason==='cancelled_by_user'?'正在确认关闭…':exchange?'停止换水':'停止目标任务';
   $('job-details').hidden=!job;
   summary.hidden=!active;$('control-hint').hidden=active;
@@ -412,29 +414,40 @@ function render(data){
   renderControls();renderProgress(data);renderLevel(data);renderHistory(data);
 }
 async function refresh(){
-  if(refreshRequest||document.hidden||!refreshEnabled)return;
+  if(refreshRequest||document.hidden||authBusy)return;
   const request=new AbortController(),epoch=authEpoch;
   refreshRequest=request;
   const timeout=setTimeout(()=>request.abort(),6000);
   try{
     const data=await api('status',undefined,request.signal);
     if(epoch!==authEpoch)return;
-    signedIn=true;lastSuccess=Date.now();updateMenus();$('login-panel').hidden=true;$('console').hidden=false;$('logout').hidden=false;
+    if(signedIn&&data.authenticated!==true)showGuest();
+    signedIn=data.authenticated===true;lastSuccess=Date.now();updateMenus();$('console').hidden=false;
     render(data);$('sync-status').textContent='已同步 '+new Date(lastSuccess).toLocaleTimeString('zh-CN',{hour12:false});
     clearRetryNotice();finishStartup();
   }catch(error){
     if(epoch!==authEpoch)return;
-    if(error.status===401){showLogin();return;}
+    if(error.status===401){showGuest();return;}
     if(startupPending){$('startup-message').textContent='连接暂时中断，正在自动重试…';$('startup-splash').setAttribute('aria-busy','false');$('startup-retry').hidden=false;return;}
-    if(signedIn){snapshot=null;setConnection(lastSnapshot,false);renderControls();renderProgress(lastSnapshot,false);renderWaterEstimate(lastSnapshot,false);scene?.setFlow?.({fill:false,drain:false,circulation:true});$('save-calibration').disabled=true;$('sync-status').textContent='同步中断 · 自动重试';$('scene-status').textContent='服务连接中断';$('level-detail').textContent='同步中断 · 保留上次估算';}
+    if(lastSnapshot){snapshot=null;setConnection(lastSnapshot,false);renderControls();renderProgress(lastSnapshot,false);renderWaterEstimate(lastSnapshot,false);scene?.setFlow?.({fill:false,drain:false,circulation:true});$('save-calibration').disabled=true;$('sync-status').textContent='同步中断 · 自动重试';$('scene-status').textContent='服务连接中断';$('level-detail').textContent='同步中断 · 保留上次估算';}
     setMessage(retryNotice);
   }finally{clearTimeout(timeout);if(refreshRequest===request)refreshRequest=null;}
 }
-function updateClock(){if(!signedIn||!lastSnapshot||document.hidden)return;setConnection(lastSnapshot,snapshot!==null&&Date.now()-lastSuccess<=10000);renderWaterEstimate(lastSnapshot,snapshot!==null);renderProgress(lastSnapshot,snapshot!==null);if(snapshot)renderControls();}
+function updateClock(){if(!lastSnapshot||document.hidden)return;setConnection(lastSnapshot,snapshot!==null&&Date.now()-lastSuccess<=10000);renderWaterEstimate(lastSnapshot,snapshot!==null);renderProgress(lastSnapshot,snapshot!==null);if(snapshot)renderControls();}
 
 $('startup-retry')?.addEventListener('click',()=>{if(refreshRequest)return;showStartup();refresh();});
-$('login-form').addEventListener('submit',async event=>{event.preventDefault();const button=event.target.querySelector('button');button.disabled=true;try{await api('login',{key:$('key').value});cancelRefresh();refreshEnabled=true;$('key').value='';setMessage('');showStartup();await refresh();}catch(error){setMessage(error.message);}finally{button.disabled=false;}});
-$('logout').addEventListener('click',async()=>{try{await api('logout',{});showLogin();setMessage('已退出。');}catch(error){setMessage(error.message);}});
+$('login-form').addEventListener('submit',async event=>{
+  event.preventDefault();if(authBusy)return;
+  cancelRefresh();const epoch=authEpoch,button=event.target.querySelector('button');authBusy=true;button.disabled=true;
+  try{await api('login',{key:$('key').value});if(epoch!==authEpoch)return;$('key').value='';setMessage('');closePanels();}
+  catch(error){if(epoch===authEpoch)setMessage(error.message);}
+  finally{if(epoch===authEpoch){authBusy=false;button.disabled=false;await refresh();}}
+});
+$('logout').addEventListener('click',async()=>{
+  if(authBusy)return;showGuest();const epoch=authEpoch;authBusy=true;closePanels();setMessage('');
+  try{await api('logout',{});}catch(error){if(epoch===authEpoch&&error.status!==401)setMessage(error.message);}
+  finally{if(epoch===authEpoch){authBusy=false;await refresh();}}
+});
 async function confirmReset(){const dialog=$('confirm');dialog.returnValue='cancel';dialog.showModal();return new Promise(resolve=>dialog.addEventListener('close',()=>resolve(dialog.returnValue==='ok'),{once:true}));}
 async function submitOutputRun(output){
   const button=$(output+'-button');if(!canOutputAction(button))return;
@@ -446,30 +459,32 @@ async function submitOutputRun(output){
     if(epoch!==authEpoch)return;
     setFeedback(name+(run?'停止请求已提交，等待本路关闭确认。':'作业已提交，等待设备回执。'));
     await refresh();
-  }catch(error){if(epoch===authEpoch){if(error.status===401){showLogin();return;}setFeedback(error.message+' 请等待同步后核实本路作业状态。');}}
+  }catch(error){if(epoch===authEpoch){if(handleUnauthorized(error))return;setFeedback(error.message+' 请等待同步后核实本路作业状态。');}}
   finally{if(epoch===authEpoch){outputBusy[output]=false;renderControls();}}
 }
 for(const button of document.querySelectorAll('[data-command]'))button.addEventListener('click',async()=>{
   if(button.dataset.output&&!canOutputAction(button))return;
   if(outputUsesRun(button)){await submitOutputRun(button.dataset.output);return;}
   const command=switchCommand(button);
-  if(!can(command)||command==='RESET'&&!await confirmReset()||!can(command)||switchCommand(button)!==command)return;
+  const epoch=authEpoch;
+  if(!can(command)||command==='RESET'&&!await confirmReset()||epoch!==authEpoch||!can(command)||switchCommand(button)!==command)return;
   busy=true;renderControls();
   try{
     const id=Array.from(crypto.getRandomValues(new Uint8Array(16)),value=>value.toString(16).padStart(2,'0')).join('');
-    submittedId=id;await api('commands',{command,id});setFeedback('命令已提交，等待设备回执。');await refresh();
-  }catch(error){setFeedback(error.message+' 如果提交时连接中断，请在操作记录中核实结果。');}
-  finally{busy=false;renderControls();}
+    submittedId=id;await api('commands',{command,id});if(epoch!==authEpoch)return;setFeedback('命令已提交，等待设备回执。');await refresh();
+  }catch(error){if(epoch===authEpoch&&!handleUnauthorized(error))setFeedback(error.message+' 如果提交时连接中断，请在操作记录中核实结果。');}
+  finally{if(epoch===authEpoch){busy=false;renderControls();}}
 });
-for(const button of document.querySelectorAll('[data-anchor]'))button.addEventListener('click',()=>{$('anchor-level').value=button.dataset.anchor;});
+for(const button of document.querySelectorAll('[data-anchor]'))button.addEventListener('click',()=>{if(signedIn&&!authBusy)$('anchor-level').value=button.dataset.anchor;});
 $('calibration-form').addEventListener('submit',async event=>{
-  event.preventDefault();if(!canCalibrate()){$('calibration-message').textContent=calibrationWaitNotice;return;}const button=$('save-calibration');button.disabled=true;
-  try{await api('simulation',{level:Number($('anchor-level').value),fill_seconds:Number($('fill-seconds').value),drain_seconds:Number($('drain-seconds').value),capacity_liters:$('capacity-liters').value.trim()===''?null:Number($('capacity-liters').value)});$('message').textContent='';$('calibration-message').textContent='模拟水位已校准，本次与累计水量已清零。请以现场实际水位为准。';await refresh();}
-  catch(error){setMessage(error.message);}finally{renderCalibrationStatus();}
+  event.preventDefault();if(!signedIn||authBusy)return;if(!canCalibrate()){$('calibration-message').textContent=calibrationWaitNotice;return;}const epoch=authEpoch,button=$('save-calibration');button.disabled=true;
+  try{await api('simulation',{level:Number($('anchor-level').value),fill_seconds:Number($('fill-seconds').value),drain_seconds:Number($('drain-seconds').value),capacity_liters:$('capacity-liters').value.trim()===''?null:Number($('capacity-liters').value)});if(epoch!==authEpoch)return;$('message').textContent='';$('calibration-message').textContent='模拟水位已校准，本次与累计水量已清零。请以现场实际水位为准。';await refresh();}
+  catch(error){if(epoch===authEpoch&&!handleUnauthorized(error))setMessage(error.message);}finally{if(epoch===authEpoch)renderCalibrationStatus();}
 });
-for(const button of document.querySelectorAll('[data-target-level]'))button.addEventListener('click',()=>{$('target-level').value=button.dataset.targetLevel;renderLevelJob();});
+for(const button of document.querySelectorAll('[data-target-level]'))button.addEventListener('click',()=>{if(signedIn&&!authBusy){$('target-level').value=button.dataset.targetLevel;renderLevelJob();}});
 $('target-level').addEventListener('input',renderLevelJob);
 async function submitLevelJob(cancel=false,exchange=false){
+  if(!signedIn||authBusy)return;
   const preview=jobPreview(),epoch=authEpoch,job=lastSnapshot?.level_job,isExchange=exchange||cancel&&job?.mode==='exchange';
   if(cancel?(!signedIn||job?.status!=='running'||jobBusy||job.reason==='cancelled_by_user'):!!(exchange?exchangeStartReason():jobStartReason(preview)))return;
   if(exchange&&!cancel&&(!await confirmExchange()||epoch!==authEpoch||exchangeStartReason()))return;
@@ -484,7 +499,7 @@ async function submitLevelJob(cancel=false,exchange=false){
     $('job-message').textContent=cancel?'停止请求已提交；两路关闭以设备回执为准。':taskName+'已提交；运行状态以设备回执为准。';
     if(isExchange)setFeedback($('job-message').textContent);
     await refresh();
-  }catch(error){if(epoch===authEpoch){if(error.status===401){showLogin();return;}$('job-message').textContent=error.message+' 若提交时连接中断，请等待同步后核实任务状态。';if(isExchange)setFeedback($('job-message').textContent);}}
+  }catch(error){if(epoch===authEpoch){if(handleUnauthorized(error))return;$('job-message').textContent=error.message+' 若提交时连接中断，请等待同步后核实任务状态。';if(isExchange)setFeedback($('job-message').textContent);}}
   finally{if(epoch===authEpoch){jobBusy=false;renderControls();}}
 }
 $('level-job-form').addEventListener('submit',event=>{event.preventDefault();submitLevelJob();});
@@ -492,7 +507,7 @@ $('cancel-level-job').addEventListener('click',()=>submitLevelJob(true));
 $('exchange-button').addEventListener('click',()=>submitLevelJob(lastSnapshot?.level_job?.status==='running'&&lastSnapshot.level_job.mode==='exchange',true));
 $('confirm-exchange-start')?.addEventListener('click',()=>{
   renderExchangeConfirmation();
-  if($('exchange-confirm')?.open&&!exchangeStartReason()&&exchangePreview())$('exchange-confirm').close('ok');
+  if(signedIn&&!authBusy&&$('exchange-confirm')?.open&&!exchangeStartReason()&&exchangePreview())$('exchange-confirm').close('ok');
 });
 for(const button of document.querySelectorAll('[data-panel]'))button.addEventListener('click',()=>openPanel(button.dataset.panel));
 for(const button of document.querySelectorAll('[data-close]'))button.addEventListener('click',()=>$(button.dataset.close).close());

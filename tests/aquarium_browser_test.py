@@ -1,6 +1,7 @@
 """Real local HTTP + Edge integration for the compact 3D console; no physical IO."""
 import json
 import math
+import os
 import re
 import sys
 import threading
@@ -596,12 +597,21 @@ def assert_logout_race(page):
     assert len(pending) == 1
     open_dialog(page, 'device')
     page.locator('#logout').click()
-    expect(page.locator('#login-panel')).to_be_visible()
     expect(page.locator('#device-dialog')).to_be_hidden()
+    expect(page.locator('#console')).to_be_visible()
+    expect(page.locator('#fill-button')).to_be_disabled()
     pending[0].fulfill(response=late_status)
+    page.wait_for_timeout(100)
+    for route in pending[1:]:
+        route.continue_()
+    page.unroute('**/api/status')
     page.wait_for_timeout(2200)
-    expect(page.locator('#console')).to_be_hidden()
-    assert len(pending) == 1
+    expect(page.locator('#console')).to_be_visible()
+    expect(page.locator('#fill-button')).to_be_disabled()
+    expect(page.locator('#message')).to_be_empty()
+    open_dialog(page, 'device')
+    expect(page.locator('#login-panel')).to_be_visible()
+    close_dialog(page, 'device')
 
 
 def assert_web_soft_limits(page, store, clock, output):
@@ -1401,6 +1411,7 @@ def assert_calibrated_runs(browser, output):
     try:
         open_device()
         page.goto(server.origin + '/water/')
+        open_dialog(page, 'device')
         page.locator('#key').fill(server.admin_key)
         page.locator('#login-form button[type="submit"]').click()
         expect(page.locator('#console')).to_be_visible()
@@ -1718,7 +1729,7 @@ def main(layout_only=False, estimates_only=False, countdowns_only=False, soft_li
     output.mkdir(parents=True, exist_ok=True)
     try:
         with sync_playwright() as p:
-            browser = p.chromium.launch(channel='msedge', headless=True,
+            browser = p.chromium.launch(channel=os.environ.get('WATER_TEST_BROWSER', 'msedge'), headless=True,
                 args=['--enable-webgl', '--use-gl=angle', '--use-angle=swiftshader'])
             if calibrated_runs_only:
                 assert_calibrated_runs(browser, output)
@@ -1729,6 +1740,7 @@ def main(layout_only=False, estimates_only=False, countdowns_only=False, soft_li
             errors = []
             page.on('pageerror', lambda error: errors.append(str(error)))
             page.goto(server.origin + '/water/')
+            open_dialog(page, 'device')
             page.locator('#key').fill('bad')
             page.locator('#login-form button[type="submit"]').click()
             expect(page.locator('#message')).to_contain_text('管理密钥不正确')

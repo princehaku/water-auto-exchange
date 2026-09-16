@@ -55,11 +55,11 @@ class AdminSessionTests(unittest.TestCase):
         except urllib.error.HTTPError as error:
             response = error
         with response:
-            response.read()
-            return response.status, response.headers
+            data = json.load(response)
+            return response.status, data, response.headers
 
     def login(self):
-        code, headers = self.request('login', {'key': self.admin_key})
+        code, _, headers = self.request('login', {'key': self.admin_key})
         self.assertEqual(code, 200)
         cookie = SimpleCookie(headers['Set-Cookie'])['water_session']
         self.assertEqual(int(cookie['max-age']), 86313600)
@@ -69,36 +69,38 @@ class AdminSessionTests(unittest.TestCase):
         self.assertEqual(cookie['path'], '/water/api/')
         return 'water_session=' + cookie.value
 
-    def status(self, cookie):
-        return self.request('status', cookie=cookie)[0]
+    def authenticated(self, cookie):
+        code, data, _ = self.request('status', cookie=cookie)
+        self.assertEqual(code, 200)
+        return data['authenticated']
 
     def test_session_expires_exactly_999_days_after_login(self):
         cookie = self.login()
         self.now += 999 * 86400 - 1
-        self.assertEqual(self.status(cookie), 200)
+        self.assertTrue(self.authenticated(cookie))
         self.now += 1
         # Reading status must not extend the fixed server expiry.
-        self.assertEqual(self.status(cookie), 401)
+        self.assertFalse(self.authenticated(cookie))
         self.now += 1
-        self.assertEqual(self.status(cookie), 401)
+        self.assertFalse(self.authenticated(cookie))
 
     def test_login_survives_server_and_database_reopen(self):
         cookie = self.login()
         self.now += 86400
         self.restart()
-        self.assertEqual(self.status(cookie), 200)
+        self.assertTrue(self.authenticated(cookie))
         self.now = 1000 + 999 * 86400
-        self.assertEqual(self.status(cookie), 401)
+        self.assertFalse(self.authenticated(cookie))
 
     def test_logout_stays_revoked_after_restart_without_revoking_other_login(self):
         first, second = self.login(), self.login()
-        code, headers = self.request('logout', {}, first)
+        code, _, headers = self.request('logout', {}, first)
         self.assertEqual(code, 200)
         self.assertEqual(SimpleCookie(headers['Set-Cookie'])['water_session']['max-age'], '0')
-        self.assertEqual(self.status(first), 401)
+        self.assertFalse(self.authenticated(first))
         self.restart()
-        self.assertEqual(self.status(first), 401)
-        self.assertEqual(self.status(second), 200)
+        self.assertFalse(self.authenticated(first))
+        self.assertTrue(self.authenticated(second))
 
     def test_database_digest_cannot_be_used_as_token(self):
         cookie = self.login()
@@ -107,28 +109,28 @@ class AdminSessionTests(unittest.TestCase):
         self.assertNotIn(token, row.values())
         self.assertNotIn(self.admin_key, row.values())
         self.assertEqual(row['token_hash'], hashlib.sha256(token.encode()).hexdigest())
-        self.assertEqual(self.status('water_session=' + row['token_hash']), 401)
-        self.assertEqual(self.status('water_session=unknown'), 401)
-        self.assertEqual(self.status(cookie), 200)
+        self.assertFalse(self.authenticated('water_session=' + row['token_hash']))
+        self.assertFalse(self.authenticated('water_session=unknown'))
+        self.assertTrue(self.authenticated(cookie))
 
     def test_changing_admin_key_permanently_revokes_old_sessions(self):
         cookie = self.login()
         old_key = self.admin_key
         self.admin_key = 'replacement-admin-key'
         self.restart()
-        self.assertEqual(self.status(cookie), 401)
-        self.assertEqual(self.status(self.login()), 200)
+        self.assertFalse(self.authenticated(cookie))
+        self.assertTrue(self.authenticated(self.login()))
         self.admin_key = old_key
         self.restart()
-        self.assertEqual(self.status(cookie), 401)
+        self.assertFalse(self.authenticated(cookie))
 
     def test_login_removes_expired_sessions(self):
         expired_cookie = self.login()
         self.now += 999 * 86400
         valid_cookie = self.login()
         self.assertEqual(self.store.db.execute('SELECT COUNT(*) FROM admin_sessions').fetchone()[0], 1)
-        self.assertEqual(self.status(expired_cookie), 401)
-        self.assertEqual(self.status(valid_cookie), 200)
+        self.assertFalse(self.authenticated(expired_cookie))
+        self.assertTrue(self.authenticated(valid_cookie))
 
 
 if __name__ == '__main__':

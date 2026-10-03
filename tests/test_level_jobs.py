@@ -153,7 +153,12 @@ class LevelJobTests(unittest.TestCase):
                 self.store.enqueue(command, 'f' * 32)
             self.assertEqual(self.store.level_job['status'], 'running')
         self.store.enqueue('FILL_OFF', 'f' * 32)
-        self.assertEqual(self.store.level_job['reason'], 'manual_override')
+        self.assertEqual(self.store.level_job['status'], 'running')
+        self.assertEqual(self.store.level_job['phase'], 'active')
+        self.assertIsNone(self.store._job_runtime['cancel_reason'])
+        off_id = self.offer('FILL_OFF')
+        self.ack(off_id, fill='0', drain='1', state='DRAINING')
+        self.assertEqual(self.store.level_job['status'], 'running')
 
     def test_recalibration_exclusion_and_restart_waits_for_verified_new_session(self):
         self.store.start_level_job(dict(target_level=50))
@@ -163,8 +168,13 @@ class LevelJobTests(unittest.TestCase):
         self.on()
         self.pulse(60)
         self.off()
+        with self.assertRaises(Problem) as caught:
+            self.store.configure_simulation(dict(level=90, fill_seconds=1000, drain_seconds=3000))
+        self.assertEqual(caught.exception.message, 'simulation_requires_idle')
+        self.assertEqual(self.store.level_job['status'], 'running')
+        self.store.cancel_level_job(dict(job_id=self.store.level_job['id']))
+        self.ack(self.offer('STOP'), fill='0', drain='0', state='IDLE')
         self.store.configure_simulation(dict(level=90, fill_seconds=1000, drain_seconds=3000))
-        self.assertEqual(self.store.level_job['reason'], 'calibration_changed')
         self.store.start_level_job(dict(target_level=40))
         self.store.db.close()
         self.store = Store(self.path, lambda: self.now)

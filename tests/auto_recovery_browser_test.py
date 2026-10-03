@@ -69,8 +69,12 @@ def main():
         body = request.post_data_json
         requests.append((request.url, body))
         assert request.url.endswith('/api/level-job/cancel'), (request.url, body)
-        assert body == {'job_id': snapshot['level_job']['id']}, body
-        snapshot['level_job'].update(status='cancelled', phase='done', reason='cancelled_by_user')
+        assert body == {'job_id': snapshot['level_job']['id'], 'intent':'manual_stop',
+                        'source':'web_ui', 'event':'click',
+                        'button':'exchange-stop-button' if snapshot['level_job']['mode']=='exchange'
+                        else 'cancel-level-job'}, body
+        snapshot['level_job'].update(status='cancelled', phase='done', reason='cancelled_by_user',
+                                     stop_origin='manual', stop_action='manual_stop')
         route.fulfill(status=200, content_type='application/json', body=json.dumps(snapshot['level_job']))
 
     def scene_route(route):
@@ -147,7 +151,7 @@ def main():
             sync_status(page)
             expect(page.locator('#job-summary-state')).to_have_text('等待设备恢复')
             expect(page.locator('#scene-status')).to_have_text('等待设备恢复')
-            expect(page.locator('#exchange-button')).to_be_enabled()
+            expect(page.locator('#exchange-stop-button')).to_be_enabled()
             expect(page.locator('#drain-detail')).to_contain_text('上次开启')
             block_controls(page)
             flow(page)
@@ -227,7 +231,7 @@ def main():
                 block_controls(page)
                 if mode == 'exchange':
                     with page.expect_response('**/api/level-job/cancel'):
-                        page.locator('#exchange-button').click()
+                        page.locator('#exchange-stop-button').click()
                 else:
                     open_dialog(page, 'level-job')
                     with page.expect_response('**/api/level-job/cancel'):
@@ -236,7 +240,7 @@ def main():
                 sync_status(page)
                 assert snapshot['level_job']['status'] == 'cancelled'
                 expect(page.locator('#job-summary')).to_be_hidden()
-                expect(page.locator('#job-reason')).to_have_text('已按你的要求停止任务。')
+                expect(page.locator('#job-reason')).to_have_text('人工停止已提交，已取消本次任务与自动恢复。')
             assert len(requests) == 2, requests
             assert all(url.endswith('/api/level-job/cancel') for url, _ in requests)
 

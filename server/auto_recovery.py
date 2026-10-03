@@ -200,6 +200,7 @@ class AutoRecovery:
         if job.get('capacity_liters') is not None:
             job['estimated_liters'] = sum(job['capacity_liters'] * r['used_min'][direction] / job[direction + '_seconds'] for direction in ('fill', 'drain'))
         job.update(phase='paused', reason=r['last_reason'], round_remaining_seconds=None)
+        s.job_stop_note('system', 'recovery_pause', r['last_reason'])
         s._job_runtime = dict(completed_seconds=job.get('elapsed_seconds', 0),
                               completed_liters=job.get('estimated_liters', 0), cancel_reason=None)
         self._wait_tick = s.control_clock()
@@ -250,6 +251,10 @@ class AutoRecovery:
             s.ws_close(s.ws_gateway, 'communication_timeout')
             return True
         if not self.waiting():
+            if s.level_job['phase'] == 'active' and status[s.level_job['direction']] == '0':
+                self.pause('unexpected_output_off', confirmed_off=True)
+                s.ws_close(s.ws_gateway, 'unexpected_output_off')
+                return True
             self.checkpoint(proven=True)
             return False
         if status['fill'] != '0' or status['drain'] != '0':
@@ -332,7 +337,7 @@ class AutoRecovery:
                 s.save_level_job()
                 return True
             if status['state'] == 'FAULT':
-                rt['reset_id'] = s.job_command('RESET')
+                rt['reset_id'] = s.job_command('RESET', reason='communication_recovery', action='recovery_reset')
                 rt['reset_until'] = now + 8
                 job.update(phase='resetting', reason='communication_reset')
                 s.save_level_job(True)
@@ -356,6 +361,6 @@ class AutoRecovery:
                 s.job_finish('completed', 'completed_with_uncertainty' if r['uncertain'] else 'target_reached')
                 return True
         s._job_runtime = dict(session=s.ws_gateway, completed_seconds=job['elapsed_seconds'],
-                              completed_liters=job['estimated_liters'], cancel_reason=None)
+                              completed_liters=job['estimated_liters'], cancel_reason=None, recovery_start=True)
         s.job_start_round()
         return True

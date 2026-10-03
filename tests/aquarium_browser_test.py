@@ -986,6 +986,23 @@ def assert_level_heartbeats(page, store, clock, server, output):
         assert job()['status'] == 'running', job()
         return job()
 
+    def stop_job():
+        """A trusted explicit STOP cancels continuation; ordinary OFF does not."""
+        sync_status(page)
+        current_id = job()['id']
+        open_dialog(page, 'level-job')
+        with page.expect_response('**/api/level-job/cancel') as response:
+            page.locator('#cancel-level-job').click()
+        assert response.value.ok, response.value.text()
+        value = response.value.json()
+        assert value['id'] == current_id and value['stop_origin'] == 'manual', value
+        assert value['stop_action'] == 'manual_stop' and value['stop_event'] == 'click', value
+        close_dialog(page, 'level-job')
+        if job()['status'] == 'running':
+            receipt('STOP')
+        assert job()['status'] == 'cancelled', job()
+        assert_no_restart()
+
     def assert_no_restart(seconds=5):
         before = len(executed)
         for _ in range(seconds):
@@ -1164,13 +1181,15 @@ def assert_level_heartbeats(page, store, clock, server, output):
         capture_layouts()
         # STOP remains a backend command; the main view only has independent
         # output switches and the target-task entry, with cancel in its dialog.
-        response = page.evaluate("""async () => {
+        response = page.evaluate("""async jobId => {
           const response = await fetch('./api/commands', {method:'POST', credentials:'same-origin',
             headers:{'Content-Type':'application/json'},
-            body:JSON.stringify({command:'STOP',id:crypto.randomUUID().replaceAll('-','')})});
+            body:JSON.stringify({command:'STOP',id:crypto.randomUUID().replaceAll('-',''),
+              job_id:jobId,intent:'manual_stop',source:'web_ui',event:'click',button:'cancel-level-job'})});
           return {status:response.status, body:await response.json()};
-        }""")
+        }""", job()['id'])
         assert response['status'] == 202, response
+        assert response['body']['origin'] == 'manual' and response['body']['action'] == 'manual_stop', response
         receipt('STOP')
         assert job()['status'] == 'cancelled', job()
         assert_no_restart()
@@ -1188,37 +1207,73 @@ def assert_level_heartbeats(page, store, clock, server, output):
         assert job()['status'] == 'cancelled', job()
         assert_no_restart()
 
-        # An ordinary manual OFF is an interruption, never permission to
-        # schedule another automatic ON after the two-second gap.
+        # An ordinary manual OFF closes this round without cancelling the
+        # automatic task. A confirmed two-second gap precedes continuation.
         start_job(80)
         receipt('FILL')
         advance(3)
         sync_status(page)
         command('fill', 'FILL_OFF')
-        assert job()['status'] == 'cancelled', job()
-        assert_no_restart()
+        assert job()['status'] == 'running' and job()['phase'] == 'waiting', job()
+        before_continue = job()['elapsed_seconds']
+        ping()
+        assert job()['phase'] == 'waiting', job()
+        ping()
+        receipt('FILL')
+        advance(1)
+        assert job()['elapsed_seconds'] > before_continue, job()
+        stop_job()
 
-        # Recalibration is permitted during a confirmed-OFF inter-round gap;
-        # changing the anchor must cancel the task that used the old anchor.
+        # Calibration cannot silently cancel an automatic task in its OFF gap.
+        # An explicit STOP is required before changing the water anchor.
         waiting_round()
+        sync_status(page)
+        open_dialog(page, 'calibration')
+        expect(page.locator('#save-calibration')).to_be_disabled()
+        expect(page.locator('#anchor-level')).to_be_disabled()
+        response = post_from_page(page, 'simulation', dict(level=90, fill_seconds=3000,
+                                   drain_seconds=3000, capacity_liters=60))
+        assert response['status'] == 409 and response['body']['error'] == 'simulation_requires_idle', response
+        assert job()['status'] == 'running' and job()['phase'] == 'waiting', job()
+        close_dialog(page, 'calibration')
+        stop_job()
         calibrate(90)
-        assert job()['status'] == 'cancelled', job()
-        assert_no_restart()
         assert store.snapshot()['simulation']['level'] == 90
 
         start_job(80)
         receipt('DRAIN')
         advance(3)
         known_level = store.snapshot()['simulation']['level']
+        disconnected_id = job()['id']
         close_device()
-        assert job()['status'] in ('failed', 'cancelled'), job()
+        assert job()['status'] == 'running' and job()['phase'] == 'paused', job()
         clock[0] += 6
         open_device()
-        assert_no_restart()
+        assert job()['id'] == disconnected_id and job()['phase'] == 'paused', job()
+        assert not any(frame['type'] == 'offer' for frame in inbox), inbox
+        ping(0)
+        for _ in range(4):
+            ping()
+            assert job()['phase'] == 'paused', job()
+            assert not any(frame['type'] == 'offer' for frame in inbox), inbox
+        ping()
+        assert job()['phase'] == 'recovering', job()
+        ping()
+        assert job()['phase'] == 'recovering', job()
+        ping()
+        assert job()['phase'] == 'starting', job()
+        receipt('DRAIN')
+        resumed = job()
+        assert resumed['status'] == 'running' and resumed['id'] == disconnected_id, resumed
+        assert resumed['recovery']['resumed'] and resumed['recovery']['uncertain'], resumed
         assert store.snapshot()['simulation']['uncertain']
         assert store.snapshot()['simulation']['level'] == known_level
         sync_status(page)
         expect(page.locator('#estimate-status')).to_contain_text('不确定')
+        history = page.locator('#commands-list tr')
+        expect(history.nth(0)).to_contain_text('系统续行开启')
+        expect(history.nth(0)).not_to_contain_text('系统轮间关断')
+        stop_job()
         calibrate(75)
         command('fill', 'FILL')
         advance(3)
@@ -1760,8 +1815,10 @@ def main(layout_only=False, estimates_only=False, countdowns_only=False, soft_li
                 print('PASS level targets: real WS 0.8.2 bare pings only after confirmed ON, '
                       'unacknowledged grants cannot invent water flow, 1000 seconds in sixteen 60-second rounds and a final 40 seconds, '
                       'ordinary OFF ACKs with 2-second gaps, correct run/total liters and decimal updates, '
-                      'STOP/cancel/manual/recalibration/disconnection interruptions, no automatic restart, '
-                      'uncertainty survives reconnect until recalibration, desktop and two phone viewports')
+                      'explicit manual STOP/cancel prevents continuation, ordinary OFF confirms then continues, '
+                      'active/waiting calibration refused until explicit STOP, disconnect pauses and stable reconnect resumes, '
+                      'correct system resume history, uncertainty survives until field recalibration, '
+                      'desktop and two phone viewports')
                 return
 
             if soft_limits_only:

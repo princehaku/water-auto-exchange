@@ -42,7 +42,7 @@ def main():
         expect(page.locator('#message')).to_be_empty()
 
     def locked(page):
-        for selector in ('#fill-button', '#drain-button', '#exchange-button', '#reset',
+        for selector in ('#fill-button', '#drain-button', '#exchange-button', '#exchange-stop-button', '#reset',
                          '#save-calibration', '#start-level-job', '#cancel-level-job',
                          '#target-level', '#anchor-level', '#capacity-liters',
                          '#fill-seconds', '#drain-seconds'):
@@ -84,7 +84,7 @@ def main():
 
             # Disabled UI and direct event dispatch must never submit a mutation.
             page.evaluate("""() => {
-              for (const id of ['fill-button','drain-button','reset','exchange-button','cancel-level-job'])
+              for (const id of ['fill-button','drain-button','reset','exchange-button','exchange-stop-button','cancel-level-job'])
                 document.getElementById(id).dispatchEvent(new MouseEvent('click'));
               for (const id of ['calibration-form','level-job-form'])
                 document.getElementById(id).dispatchEvent(new Event('submit', {cancelable:true}));

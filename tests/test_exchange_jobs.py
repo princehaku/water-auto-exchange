@@ -376,21 +376,25 @@ class ExchangeJobTests(unittest.TestCase):
             self.assertEqual(self.store.level_job['phase'], 'active')
         self.assert_no_fill_command()
 
-    def test_unrelated_manual_off_confirms_all_off_before_cancelling_exchange(self):
+    def test_unrelated_manual_off_does_not_cancel_exchange_or_emit_global_stop(self):
         self.start()
         self.on('drain')
         self.pulse(1)
         request = self.store.enqueue('FILL_OFF', 'b' * 32)
-        self.assertEqual((request['status'], request['result']), ('cancelled', 'exchange_stop_requested'))
+        self.assertEqual((request['status'], request['origin']), ('queued', 'manual'))
         self.assertEqual(self.store.level_job['status'], 'running')
-        self.assertEqual(self.store.level_job['phase'], 'stopping')
-        stop_id = self.offer('STOP')
+        self.assertEqual(self.store.level_job['phase'], 'active')
+        off_id = self.offer('FILL_OFF')
         self.assertIsNone(self.store.ws_offer(self.session))
-        self.assertEqual(self.store.enqueue('FILL_OFF', 'b' * 32), request)
-        self.ack(stop_id, fill='0', drain='0', state='IDLE')
-        self.assertEqual(self.store.level_job['status'], 'cancelled')
-        self.assertEqual(self.store.level_job['reason'], 'manual_override')
-        self.assertIsNone(self.store.control_runs['drain'])
+        repeated = self.store.enqueue('FILL_OFF', 'b' * 32)
+        self.assertEqual(repeated['status'], 'delivered')
+        for key in ('id', 'origin', 'origin_reason', 'job_id', 'action'):
+            self.assertEqual(repeated[key], request[key])
+        self.ack(off_id, fill='0', drain='1', state='DRAINING')
+        self.assertEqual(self.store.level_job['status'], 'running')
+        self.assertEqual(self.store.level_job['phase'], 'active')
+        self.assertIsNotNone(self.store.control_runs['drain'])
+        self.assertIsNone(self.store.db.execute("SELECT 1 FROM commands WHERE command='STOP'").fetchone())
         self.pulse(3)
         self.assert_no_fill_command()
         self.assertIsNone(self.store.ws_offer(self.session))
@@ -487,9 +491,11 @@ class ExchangeJobHTTPTests(unittest.TestCase):
                     self.assertEqual((job['id'], job['mode'], job['stage']), ('c' * 32, 'exchange', 'drain'))
                     self.assertAlmostEqual(job['total_seconds'], 360)
             with self.assertRaises(urllib.error.HTTPError) as caught:
-                request('level-job/cancel', dict(job_id='d' * 32))
+                request('level-job/cancel', dict(job_id='d' * 32, intent='manual_stop',
+                    source='web_ui', event='click', button='exchange-stop-button'))
             self.assertEqual(caught.exception.code, 409)
-            with request('level-job/cancel', dict(job_id=job['id'])) as response:
+            with request('level-job/cancel', dict(job_id=job['id'], intent='manual_stop',
+                    source='web_ui', event='click', button='exchange-stop-button')) as response:
                 self.assertEqual(response.status, 200)
                 self.assertEqual(json.load(response)['reason'], 'cancelled_by_user')
         finally:

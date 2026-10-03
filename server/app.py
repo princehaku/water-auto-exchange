@@ -24,11 +24,22 @@ COMMANDS = ('START', 'FILL', 'DRAIN', 'FILL_OFF', 'DRAIN_OFF', 'STOP', 'RESET')
 SOFT_LIMITS = dict(version=1, fill_seconds=180, drain_seconds=300, watchdog_ms=5000)
 COMMAND_PRIORITY = "CASE command WHEN 'STOP' THEN 0 WHEN 'FILL_OFF' THEN 1 WHEN 'DRAIN_OFF' THEN 1 ELSE 2 END"
 ADMIN_SESSION_TTL_SECONDS = 999 * 24 * 60 * 60
+MANUAL_STOP_BUTTONS = ('stop-exchange-button', 'exchange-stop-button', 'exchange-button', 'cancel-level-job')
 
 
 class Problem(Exception):
     def __init__(self, code, message):
         self.code, self.message = code, message
+
+
+def manual_stop_request(value):
+    """Validate an explicit client declaration; this is not proof of a person."""
+    if (not isinstance(value, dict) or value.get('intent') != 'manual_stop'
+            or value.get('source') != 'web_ui'
+            or value.get('event') not in ('click', 'keyboard_activation')
+            or value.get('button') not in MANUAL_STOP_BUTTONS):
+        raise Problem(400, 'manual_stop_intent_required')
+    return {key: value[key] for key in ('intent', 'source', 'event', 'button')}
 
 
 def validate_status(value):
@@ -94,6 +105,7 @@ class Store:
             CREATE TABLE IF NOT EXISTS aquarium_simulation (id INTEGER PRIMARY KEY, value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS level_job (id INTEGER PRIMARY KEY, value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS level_job_requests (id TEXT PRIMARY KEY, request TEXT NOT NULL, value TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS command_origins (id TEXT PRIMARY KEY, value TEXT NOT NULL);
         ''')
         # Restart never resurrects commands or claims that old telemetry is live.
         self.db.execute("UPDATE commands SET status='uncertain', result='server_restarted' WHERE status IN ('queued','delivered')")
@@ -279,7 +291,11 @@ class Store:
             job['updated_at'] = self.clock()
             job['round_remaining_seconds'] = max(0, runtime.get('stop_at', self.control_clock()) - self.control_clock()) if job['phase'] == 'active' else None
             self.save_level_job()
-        return dict(job)
+        result = dict(job)
+        result.setdefault('stop_origin', 'legacy_unknown')
+        result.setdefault('stop_action', None)
+        result.setdefault('stop_reason', None)
+        return result
 
     def job_stage_remaining(self):
         job = self.level_job
@@ -298,6 +314,8 @@ class Store:
         if not self.job_running():
             return
         self.job_refresh()
+        if state == 'failed':
+            self.job_stop_note('system', 'protection_stop', reason)
         self.level_job.update(status=state, phase='done', reason=reason, finished_at=self.clock(), updated_at=self.clock(), round_remaining_seconds=None)
         # Revoke offers which have not been authorized yet. Already executed
         # commands retain their receipt path and their independent soft timer.
@@ -307,10 +325,41 @@ class Store:
                 self.db.execute("UPDATE commands SET status='cancelled', result='level_job_ended', finished=? WHERE id=? AND status IN ('queued','delivered')", (self.clock(), command_id))
         self.save_level_job(True)
 
-    def job_command(self, command, ttl=8):
+    def record_command_origin(self, command_id, origin, reason=None, job_id=None, action=None, gesture=None):
+        if origin not in ('manual', 'system', 'legacy_unknown'):
+            raise Problem(400, 'invalid_command_origin')
+        value = dict(origin=origin, origin_reason=reason, job_id=job_id, action=action,
+                     source=None, event=None, button=None)
+        if gesture:
+            for key in ('source', 'event', 'button'):
+                value[key] = gesture.get(key)
+        # Command identity owns its first origin. Receipts and retries cannot
+        # retroactively turn a system stop into a manual request or vice versa.
+        self.db.execute('INSERT OR IGNORE INTO command_origins VALUES(?,?)', (command_id, json.dumps(value)))
+
+    def command_record(self, row):
+        value = dict(row)
+        saved = self.db.execute('SELECT value FROM command_origins WHERE id=?', (value['id'],)).fetchone()
+        value.update(json.loads(saved['value']) if saved else dict(origin='legacy_unknown', origin_reason=None,
+                     job_id=None, action=None, source=None, event=None, button=None))
+        return value
+
+    def job_stop_note(self, origin, action, reason, gesture=None):
+        if not self.level_job:
+            return
+        if self.level_job.get('stop_action') in ('manual_stop', 'legacy_stop_request'):
+            return
+        self.level_job.update(stop_origin=origin, stop_action=action, stop_reason=reason,
+                              stop_requested_at=self.clock(), stop_source=gesture.get('source') if gesture else None,
+                              stop_event=gesture.get('event') if gesture else None, stop_button=gesture.get('button') if gesture else None)
+
+    def job_command(self, command, ttl=8, origin='system', reason=None, job_id=None, action=None, gesture=None):
         command_id = secrets.token_hex(16)
         self.db.execute('INSERT INTO commands VALUES(?,?,?,?,?,?,?)',
                         (command_id, command, self.clock(), self.clock() + ttl, 'queued', None, None))
+        if job_id is None and self.job_running():
+            job_id = self.level_job['id']
+        self.record_command_origin(command_id, origin, reason or 'automatic_command', job_id, action or command.lower(), gesture)
         self.db.commit()
         return command_id
 
@@ -323,7 +372,8 @@ class Store:
             self.level_job['recovery']['authorized'] = False
             self.level_job['recovery']['startup_slop'] = 0
         runtime.pop('stop_tick', None)
-        runtime['on_id'] = self.job_command(job['direction'].upper())
+        runtime['on_id'] = self.job_command(job['direction'].upper(), reason='automatic_round_start',
+                                          action='recovery_resume' if runtime.pop('recovery_start', False) else 'round_start')
         self.save_level_job(True)
 
     def start_level_job(self, value):
@@ -378,15 +428,21 @@ class Store:
                                   capacity_liters=self.simulation['capacity_liters'],
                                   estimated_liters=0 if self.simulation['capacity_liters'] is not None else None,
                                   progress=0, estimated=True, created_at=self.clock(), updated_at=self.clock(), finished_at=None, reason='running')
+            self.level_job.update(stop_origin=None, stop_action=None, stop_reason=None, stop_requested_at=None)
             self._job_runtime = dict(session=self.ws_gateway, completed_seconds=0, completed_liters=0, cancel_reason=None)
             self.auto_recovery.initialize_new()
             self.job_start_round()
             return self.job_refresh()
 
-    def job_request_stop(self, cancel_reason=None, command_id=None):
+    def job_request_stop(self, cancel_reason=None, command_id=None, origin='system', action=None, gesture=None):
         job, runtime = self.level_job, self._job_runtime
+        if cancel_reason and origin not in ('manual', 'legacy_unknown'):
+            raise Problem(400, 'manual_stop_intent_required')
+        action = action or (('legacy_stop_request' if origin == 'legacy_unknown' else 'manual_stop') if cancel_reason else ('stage_complete' if self.job_stage_remaining() <= 0.00001 else 'round_stop'))
+        self.job_stop_note(origin, action, cancel_reason or action, gesture)
         if cancel_reason and self.auto_recovery.enabled():
             job['recovery']['cancel_reason'] = cancel_reason
+            self.save_level_job(True)
         if cancel_reason and self.auto_recovery.waiting():
             self.job_finish('cancelled', cancel_reason)
             return
@@ -405,14 +461,26 @@ class Store:
                 if old_command_id and old_command_id not in self.ws_grants:
                     self.db.execute("UPDATE commands SET status='cancelled', result='level_job_cancelled', finished=? WHERE id=? AND status IN ('queued','delivered')", (self.clock(), old_command_id))
         job.update(phase='stopping', reason=cancel_reason or 'round_stopping')
-        runtime['off_id'] = command_id or self.job_command('STOP' if cancel_reason else job['direction'].upper() + '_OFF', ttl=5)
+        runtime['off_id'] = command_id or self.job_command('STOP' if cancel_reason else job['direction'].upper() + '_OFF', ttl=5,
+                                                        origin=origin, reason=cancel_reason or action, action=action, gesture=gesture)
         runtime['stop_until'] = min(runtime['stop_until'], self.control_clock() + 5) if stopping else self.control_clock() + 5
         self.save_level_job(True)
 
-    def cancel_level_job(self, value=None):
+    def cancel_level_job(self, value=None, require_manual_intent=False):
         if value is not None and not isinstance(value, dict):
             raise Problem(400, 'invalid_level_job')
         job_id = value.get('job_id') if value else None
+        origin, action, gesture = 'manual', 'manual_stop', None
+        if require_manual_intent:
+            if isinstance(value, dict) and 'intent' in value:
+                gesture = manual_stop_request(value)
+            else:
+                # Old open pages must retain their STOP ability. Their request
+                # is an explicit cancellation, but its human intent was not
+                # recorded and must not be invented during compatibility.
+                origin, action = 'legacy_unknown', 'legacy_stop_request'
+        if require_manual_intent and job_id is None:
+            raise Problem(400, 'invalid_level_job')
         if job_id is not None and (not isinstance(job_id, str) or len(job_id) != 32 or any(c not in '0123456789abcdef' for c in job_id)):
             raise Problem(400, 'invalid_level_job')
         with self.lock:
@@ -421,7 +489,7 @@ class Store:
             if job_id is not None and (self.level_job is None or self.level_job['id'] != job_id):
                 raise Problem(409, 'level_job_changed')
             if self.job_running() and not self._job_runtime.get('cancel_reason'):
-                self.job_request_stop('cancelled_by_user')
+                self.job_request_stop('cancelled_by_user', origin=origin, action=action, gesture=gesture)
             return self.job_refresh()
 
     def job_observe(self, status, ack=None):
@@ -656,7 +724,7 @@ class Store:
                     # while removing its missing ACK from the dispatch barrier.
                     state = 'uncertain' if row['id'] in self.ws_grants else 'cancelled'
                     self.db.execute("UPDATE commands SET status=?, result='output_boundary_stop', finished=? WHERE id=?", (state, self.clock(), row['id']))
-                command_id = self.job_command(direction.upper() + '_OFF', ttl=5)
+                command_id = self.job_command(direction.upper() + '_OFF', ttl=5, reason=reason, action='boundary_stop')
                 self.boundary_stops[direction] = dict(id=command_id, until=now + 5, reason=reason, grant_sequence=self.ws_grant_sequence)
 
     def control_tick(self, session=None):
@@ -685,6 +753,7 @@ class Store:
             if not expired:
                 return
             _, key = min(expired)
+            output_run_id = self.output_runner.runs[key]['id'] if self.output_runner.running(key) else None
             self.output_runner.end_all('control_timeout')
             # Revoke every unexecuted grant before the stop offer, including
             # delivered commands that have not yet reached their claim.
@@ -693,8 +762,12 @@ class Store:
             self.db.execute('INSERT INTO commands VALUES(?,?,?,?,?,?,?)',
                             (command_id, 'STOP', self.clock(),
                              self.clock() + 1, 'queued', None, None))
+            self.record_command_origin(command_id, 'system', key + '_soft_limit',
+                                       self.level_job['id'] if self.job_running() else output_run_id, 'protection_stop')
             self.control_timeout = dict(key=key, id=command_id, confirm_until=now + 1,
                                         grant_sequence=self.ws_grant_sequence)
+            if self.job_running():
+                self.job_request_stop(command_id=command_id, action='protection_stop')
             self.db.commit()
 
     def control_limits_snapshot(self):
@@ -765,7 +838,7 @@ class Store:
             self.expire()
             pending_on = self.db.execute("SELECT 1 FROM commands WHERE status IN ('queued','delivered') AND command IN ('FILL','DRAIN','START')").fetchone()
             control_pending = self.control_timeout or any(self.control_runs.values()) or any(self.boundary_stops.values()) or (self.web_limits and self.control_uncertain)
-            job_pending = self.output_runner.running() or (self.job_running() and (self.level_job['phase'] != 'waiting' or self.level_job.get('mode') == 'exchange'))
+            job_pending = self.output_runner.running() or self.job_running()
             if not self.online() or not self.status or self.status['outputs_known'] != '1' or self.status['fill'] != '0' or self.status['drain'] != '0' or pending_on or control_pending or job_pending:
                 raise Problem(409, 'simulation_requires_idle')
             self.job_finish('cancelled', 'calibration_changed')
@@ -905,9 +978,12 @@ class Store:
                         control_limits=self.control_limits_snapshot(),
                         level_job=self.job_refresh(),
                         output_runs=self.output_runner.snapshot(),
-                        commands=[dict(r) for r in self.db.execute('SELECT * FROM commands ORDER BY created DESC, rowid DESC LIMIT 60')])
+                        commands=[self.command_record(r) for r in self.db.execute('SELECT * FROM commands ORDER BY created DESC, rowid DESC LIMIT 60')])
 
-    def enqueue(self, command, request_id):
+    def enqueue(self, command, request_id, origin='manual', reason=None, action=None,
+                job_id=None, intent=None, require_manual_intent=False):
+        if origin not in ('manual', 'system', 'legacy_unknown'):
+            raise Problem(400, 'invalid_command_origin')
         if command not in COMMANDS or not isinstance(request_id, str) or len(request_id) != 32 or any(c not in '0123456789abcdef' for c in request_id):
             raise Problem(400, 'invalid_command')
         with self.lock:
@@ -917,19 +993,47 @@ class Store:
             if previous:
                 if previous['command'] != command:
                     raise Problem(409, 'request_id_conflict')
-                return dict(previous)
+                return self.command_record(previous)
+            automatic = self.job_running()
+            gesture = None
+            if automatic:
+                if job_id is not None and job_id != self.level_job['id']:
+                    raise Problem(409, 'level_job_changed')
+                if command == 'STOP' and origin == 'manual' and require_manual_intent:
+                    if isinstance(intent, dict) and 'intent' in intent:
+                        gesture = manual_stop_request(intent)
+                        if not isinstance(intent.get('job_id'), str) or intent['job_id'] != self.level_job['id']:
+                            raise Problem(409, 'level_job_changed')
+                    else:
+                        origin, action = 'legacy_unknown', 'legacy_stop_request'
+                        if isinstance(intent, dict) and 'job_id' in intent and intent['job_id'] != self.level_job['id']:
+                            raise Problem(409, 'level_job_changed')
+                job_id = self.level_job['id']
+                if command not in ('STOP', 'FILL_OFF', 'DRAIN_OFF'):
+                    raise Problem(409, 'level_job_active')
+            action = action or ('manual_stop' if command == 'STOP' and origin == 'manual' else 'legacy_stop_request' if command == 'STOP' and origin == 'legacy_unknown' else 'protection_stop' if command == 'STOP' else 'manual_output_off' if command.endswith('_OFF') else 'manual_command')
+            if not automatic and command in ('FILL', 'DRAIN', 'FILL_OFF', 'DRAIN_OFF'):
+                direction = command.split('_')[0].lower()
+                if self.output_runner.running(direction):
+                    job_id = self.output_runner.runs[direction]['id']
+                    action = 'manual_switch'
+            elif not automatic and command == 'STOP':
+                run_ids = [run['id'] for run in self.output_runner.runs.values() if run and run['status'] == 'running']
+                if len(run_ids) == 1:
+                    job_id = run_ids[0]
             if not self.online():
-                if command == 'STOP' and self.auto_recovery.waiting():
+                if command == 'STOP' and self.auto_recovery.waiting() and origin in ('manual', 'legacy_unknown'):
+                    self.job_stop_note(origin, action, 'manual_override', gesture)
+                    if self.auto_recovery.enabled():
+                        self.level_job['recovery']['cancel_reason'] = 'manual_override'
                     self.job_finish('cancelled', 'manual_override')
                     now = self.clock()
                     self.db.execute('INSERT INTO commands VALUES (?,?,?,?,?,?,?)', (request_id, command, now, now, 'cancelled', 'offline_recovery_cancelled', now))
+                    self.record_command_origin(request_id, origin, reason or 'manual_override', job_id, action, gesture)
                     self.db.commit()
-                    return dict(self.db.execute('SELECT * FROM commands WHERE id=?', (request_id,)).fetchone())
+                    return self.command_record(self.db.execute('SELECT * FROM commands WHERE id=?', (request_id,)).fetchone())
                 raise Problem(409, 'device_offline')
             s = self.status
-            exchange_cancel = self.job_running() and self.level_job.get('mode') == 'exchange'
-            if exchange_cancel and command not in ('STOP', 'FILL_OFF', 'DRAIN_OFF'):
-                raise Problem(409, 'level_job_active')
             if self.web_limits and command in ('FILL', 'DRAIN'):
                 self.check_output_start(command.lower())
                 if self.boundary_stops[command.lower()]:
@@ -960,23 +1064,25 @@ class Store:
                 pending = self.db.execute("SELECT id FROM commands WHERE status IN ('queued','delivered')").fetchall()
                 if any(row['id'] not in cancelable for row in pending):
                     raise Problem(409, 'command_pending')
-            if self.job_running() and not exchange_cancel:
-                self.job_finish('cancelled', 'manual_override')
             if command == 'STOP':
                 self.db.execute("UPDATE commands SET status='cancelled', result='superseded_by_stop', finished=? WHERE status='queued' AND id<>?", (self.clock(), self.control_timeout['id'] if self.control_timeout else ''))
             elif command in ('FILL_OFF', 'DRAIN_OFF'):
                 self.db.execute("UPDATE commands SET status='cancelled', result='superseded_by_output_off', finished=? WHERE status='queued' AND command=?", (self.clock(), command[:-4]))
             now = self.clock()
             self.db.execute('INSERT INTO commands VALUES (?,?,?,?,?,?,?)', (request_id, command, now, now + 8, 'queued', None, None))
-            if exchange_cancel:
-                # Any explicit manual OFF ends the entire sequence. Wait for
-                # all-OFF confirmation even when the requested route was idle.
-                if command != 'STOP':
-                    self.db.execute("UPDATE commands SET status='cancelled', result='exchange_stop_requested', finished=? WHERE id=?", (now, request_id))
-                self.job_request_stop('manual_override', command_id=request_id if command == 'STOP' else None)
+            self.record_command_origin(request_id, origin, reason or action, job_id, action, gesture)
+            if automatic:
+                if command == 'STOP' and origin in ('manual', 'legacy_unknown'):
+                    self.job_request_stop('manual_override', command_id=request_id, origin=origin, action=action, gesture=gesture)
+                elif self.auto_recovery.waiting():
+                    # This route is already confirmed OFF in recovery. An OFF
+                    # request cannot turn a paused automatic job into a cancel.
+                    self.db.execute("UPDATE commands SET status='cancelled', result='automatic_already_off', finished=? WHERE id=?", (now, request_id))
+                elif command == 'STOP' or command == self.level_job['direction'].upper() + '_OFF':
+                    self.job_request_stop(command_id=request_id, origin=origin, action=action)
             self.output_runner.manual_command(command, request_id)
             self.db.commit()
-            return dict(self.db.execute('SELECT * FROM commands WHERE id=?', (request_id,)).fetchone())
+            return self.command_record(self.db.execute('SELECT * FROM commands WHERE id=?', (request_id,)).fetchone())
 
     def poll(self, gateway, status, ack=None):
         status = validate_status(status)
@@ -1326,14 +1432,15 @@ class Handler(BaseHTTPRequestHandler):
         if path == '/water/api/level-job' and post:
             return self.respond(202, self.server.store.start_level_job(self.body()))
         if path == '/water/api/level-job/cancel' and post:
-            return self.respond(200, self.server.store.cancel_level_job(self.body()))
+            return self.respond(200, self.server.store.cancel_level_job(self.body(), require_manual_intent=True))
         if path == '/water/api/output-run' and post:
             return self.respond(202, self.server.store.output_runner.start(self.body()))
         if path == '/water/api/output-run/cancel' and post:
             return self.respond(200, self.server.store.output_runner.cancel(self.body()))
         if path == '/water/api/commands' and post:
             data = self.body()
-            return self.respond(202, self.server.store.enqueue(data.get('command'), data.get('id')))
+            return self.respond(202, self.server.store.enqueue(data.get('command'), data.get('id'),
+                                                              intent=data, require_manual_intent=True))
         raise Problem(404, 'not_found')
 
     def dispatch(self):

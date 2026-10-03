@@ -120,13 +120,18 @@ def main():
 
     def click_exchange(page, cancel=False):
         with page.expect_response('**/api/level-job/cancel' if cancel else '**/api/level-job') as response:
-            page.locator('#exchange-button').click()
+            page.locator('#exchange-stop-button' if cancel else '#exchange-button').click()
             if not cancel:
                 expect(page.locator('#exchange-confirm')).to_be_visible()
                 page.locator('#confirm-exchange-start').click()
         assert response.value.ok, response.value.text()
         sync_status(page)
-        return response.value.json()
+        result = response.value.json()
+        if cancel:
+            assert result['stop_origin'] == 'manual' and result['stop_action'] == 'manual_stop', result
+            assert result['stop_source'] == 'web_ui' and result['stop_event'] == 'click', result
+            assert result['stop_button'] == 'exchange-stop-button', result
+        return result
 
     def click_manual(page, direction):
         with page.expect_response('**/api/output-run') as response:
@@ -140,7 +145,7 @@ def main():
                                     (360, 640, 'small')):
             page.set_viewport_size(dict(width=width, height=height))
             assert_one_screen(page)
-            exchange = page.locator('#exchange-button').bounding_box()
+            exchange = page.locator('#exchange-button:visible, #exchange-stop-button:visible').bounding_box()
             target = page.locator('#menu-level-job').bounding_box()
             manual = page.locator('#fill-button').bounding_box()
             assert exchange and target and manual
@@ -197,7 +202,7 @@ def main():
             expect(page.locator('#fill-button')).to_be_disabled()
             expect(page.locator('#menu-level-job')).to_be_enabled()
             expect(page.locator('#start-level-job')).to_be_disabled()
-            expect(page.locator('#exchange-button')).to_contain_text('停止换水')
+            expect(page.locator('#exchange-stop-button')).to_have_text('停止换水')
             expect(page.locator('#job-summary')).to_be_visible()
             expect(page.locator('#job-summary')).to_contain_text('正在换水')
             expect(page.locator('#scene-status')).to_contain_text('正在换水 · 冲水中')

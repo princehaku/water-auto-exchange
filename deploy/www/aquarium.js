@@ -15,7 +15,8 @@ const outputBusy={fill:false,drain:false};
 Object.assign(errors,{invalid_output_run:'作业参数不正确，请刷新后重试。',output_run_active:'已有补排作业正在执行，请先结束对应作业。',output_run_requires_web:'完整用时作业需要 0.8.2 手动模式。',output_run_requires_idle:'本路须关闭并确认就绪后才能开始作业。',output_run_requires_calibration:'请先在校准中保存本路完整用时。',stale_output_run:'本路作业已变化，请等待同步后再操作。',request_id_conflict:'请求标识已使用，请刷新后重试。'});
 Object.assign(errors,{output_requires_calibration:'水位估算未校准或已不确定，请按现场水位重新校准。',output_stop_pending:'正在确认本路关闭，请稍候再操作。',fill_target_reached:'水位已达 100%，无需继续补水。',drain_target_reached:'水位已达 0%，无需继续冲水。'});
 Object.assign(errors,{invalid_level_target:'目标水位须为 0–100%。',invalid_level_job:'任务参数不正确，请刷新后重试。',level_job_active:'已有水位任务正在执行，请先停止。',level_job_changed:'任务已变化，请等待同步后再操作。',level_job_requires_idle:'启动前设备须在线、就绪，且两路均已关闭。',level_job_requires_calibration:'水位估算尚未校准或已不确定，请按现场水位重新校准。',level_job_requires_web:'当前设备暂不支持目标水位任务。',level_target_reached:'当前估算已经达到目标水位。'});
-const jobReasons={done:'已按校准估算完成目标。',target_reached:'已达到预估目标水位。',cancelled_by_user:'已按你的要求停止任务。',manual_override:'手动操作已结束目标任务。',calibration_changed:'重新校准后，原目标任务已结束。',device_disconnected:'设备连接中断，目标任务已结束。',server_restarted:'服务重启，原目标任务未恢复。',output_unknown:'输出状态未知，目标任务已结束。',device_fault:'设备故障，目标任务已停止；请检查现场。',command_rejected:'设备拒绝指令，目标任务已结束。',start_timeout:'开启回执未确认，目标任务已结束。',stop_unconfirmed:'关断尚未确认，请检查设备状态。',estimate_uncertain:'水位估算不确定，请重新校准。'};
+const jobReasons={done:'已按校准估算完成目标。',target_reached:'已达到预估目标水位。',cancelled_by_user:'已收到停止请求，来源未记录。',manual_override:'已收到停止或覆盖请求，来源未记录。',calibration_changed:'重新校准后，原目标任务已结束。',device_disconnected:'设备连接中断，目标任务已结束。',server_restarted:'服务重启，原目标任务未恢复。',output_unknown:'输出状态未知，目标任务已结束。',device_fault:'设备故障，目标任务已停止；请检查现场。',command_rejected:'设备拒绝指令，目标任务已结束。',start_timeout:'开启回执未确认，目标任务已结束。',stop_unconfirmed:'关断尚未确认，请检查设备状态。',estimate_uncertain:'水位估算不确定，请重新校准。'};
+Object.assign(errors,{manual_stop_intent_required:'停止请求缺少本次人工操作记录，请重新点击停止按钮。'});
 Object.assign(jobReasons,{completed_with_uncertainty:'已完成保守续行；实际水位仍不确定，请到现场核实并重新校准。',recovery_wait_expired:'等待设备恢复超过 30 分钟，任务已结束；请检查设备并按现场水位校准。',recovery_limit_reached:'自动恢复已达到 5 次上限，任务已结束；请检查通信与现场水位。',recovery_reset_rejected:'通信故障复位未通过设备确认，任务已结束；请检查现场。',control_protocol_changed:'设备版本或控制模式变化，任务已结束；请重新确认设备状态。',unexpected_output:'设备输出与任务记录不符，任务已停止；请检查现场。',overflow:'设备报告超高水位，任务已停止；请先排除现场原因。'});
 const recoveryStates={paused:'等待设备恢复',recovering:'确认恢复状态',resetting:'恢复通信故障'};
 function recoveryState(job){return job?.status==='running'?recoveryStates[job.phase]||'':'';}
@@ -26,7 +27,7 @@ function recoveryNotice(job){
   const attempts=Number.isFinite(recovery?.attempts)?' 恢复 '+recovery.attempts+' / 5 次。':'';
   return detail+attempts+' 可随时停止，停止后不再恢复。';
 }
-function jobCompletion(job){return job?.reason==='completed_with_uncertainty'?jobReasons.completed_with_uncertainty:job?.mode==='exchange'&&job.status==='completed'?'已按校准估算完成冲水至 0% 和补水至 100%。':jobReasons[job?.reason]||'任务已结束，请以设备回执及现场水位为准。';}
+function jobCompletion(job){return ['cancelled_by_user','manual_override'].includes(job?.reason)&&job.stop_origin==='manual'&&job.stop_action==='manual_stop'?'人工停止已提交，已取消本次任务与自动恢复。':job?.reason==='manual_override'?'已收到停止或覆盖请求，来源未记录。':job?.reason==='completed_with_uncertainty'?jobReasons.completed_with_uncertainty:job?.mode==='exchange'&&job.status==='completed'?'已按校准估算完成冲水至 0% 和补水至 100%。':jobReasons[job?.reason]||'任务已结束，请以设备回执及现场水位为准。';}
 
 try{scene=createAquarium($('tank-canvas'));}catch(error){$('scene-fallback').hidden=false;$('tank-canvas').hidden=true;}
 
@@ -133,19 +134,19 @@ function can(command){
   if(webLimits(device)&&['FILL','DRAIN'].includes(command)&&outputBoundaryReason(command.toLowerCase()))return false;
   return ['FILL','DRAIN'].includes(command)&&supportedManual.includes(device.version)&&device.control_mode==='manual'&&device.ready==='1'&&device.outputs_known==='1'&&device.overflow==='0'&&(concurrent(device)?['IDLE','DONE','FILLING','DRAINING','EXCHANGING']:['IDLE','DONE']).includes(device.state);
 }
-const calibrationWaitNotice='请先结束补排作业或一键换水，并等待输出关闭确认后校准；单个目标水位任务可在轮间全关时校准。';
+const calibrationWaitNotice='请先明确停止当前自动任务或补排作业，并等待输出关闭确认后校准。';
 const recoveryCalibrationNotice='自动任务正在等待恢复；请先停止任务，再确认输出关闭并按现场水位校准。';
 function canCalibrate(){
   const data=snapshot,device=data?.device,control=data?.control_limits;
   if(!signedIn||authBusy||!data?.online||Date.now()-lastSuccess>10000||device?.outputs_known!=='1'||device.fill!=='0'||device.drain!=='0')return false;
-  if(hasOutputRuns(data)||outputBusy.fill||outputBusy.drain||jobBusy||data.level_job?.status==='running'&&data.level_job.mode==='exchange')return false;
+  if(hasOutputRuns(data)||outputBusy.fill||outputBusy.drain||jobBusy||data.level_job?.status==='running')return false;
   if((data.commands||[]).some(item=>['FILL','DRAIN','START'].includes(item.command)&&['queued','delivered'].includes(item.status)))return false;
   if(control?.source==='web'&&(control.uncertain||control.timeout_pending||['fill_on_since','drain_on_since','fill_deadline','drain_deadline'].some(key=>control[key]!=null)))return false;
   return !(data.level_job?.status==='running'&&['starting','active','stopping','paused','recovering','resetting'].includes(data.level_job.phase));
 }
 function renderCalibrationStatus(){
   const ready=canCalibrate();$('save-calibration').disabled=!ready;
-  document.querySelectorAll('#calibration-form input,[data-anchor]').forEach(input=>input.disabled=!signedIn||authBusy||!!recoveryState(lastSnapshot?.level_job));
+  document.querySelectorAll('#calibration-form input,[data-anchor]').forEach(input=>input.disabled=!signedIn||authBusy||lastSnapshot?.level_job?.status==='running');
   const message=$('calibration-message');
   if(signedIn&&!ready&&(snapshot?.online||recoveryState(lastSnapshot?.level_job)))message.textContent=recoveryState(lastSnapshot?.level_job)?recoveryCalibrationNotice:calibrationWaitNotice;
   else if([calibrationWaitNotice,recoveryCalibrationNotice].includes(message.textContent))message.textContent='';
@@ -349,11 +350,13 @@ function renderLevelJob(){
   const recovery=recoveryState(job),uncertain=job?.recovery?.uncertain===true;
   renderSceneStatus(data);
   if(active&&!exchange)$('target-level').value=String(job.target_level);
-  const preview=jobPreview(),reason=jobStartReason(preview),summary=$('job-summary'),exchangeButton=$('exchange-button');
-  exchangeButton.disabled=!signedIn||authBusy||(active&&exchange?jobBusy||job.reason==='cancelled_by_user':!!exchangeStartReason());
-  exchangeButton.textContent=active&&exchange?(job.reason==='cancelled_by_user'?'正在停止…':'停止换水'):'一键换水';
-  exchangeButton.classList.toggle('is-running',active&&exchange);
-  exchangeButton.title=active&&exchange?'永久取消本次换水与自动恢复；输出关闭以设备回执为准，设备离线时也可取消。':exchangeStartReason()||'先按当前估算冲水至 0%，确认关闭后自动补水至 100%；通信异常可暂停并恢复续行。';
+  const preview=jobPreview(),reason=jobStartReason(preview),summary=$('job-summary'),exchangeButton=$('exchange-button'),stopButton=$('exchange-stop-button');
+  exchangeButton.hidden=active&&exchange;
+  exchangeButton.disabled=!signedIn||authBusy||!!exchangeStartReason();
+  exchangeButton.title=exchangeStartReason()||'先按当前估算冲水至 0%，确认关闭后自动补水至 100%；通信异常可暂停并恢复续行。';
+  stopButton.hidden=!(active&&exchange);
+  stopButton.disabled=!signedIn||authBusy||!active||!exchange||jobBusy||job.reason==='cancelled_by_user';
+  stopButton.textContent=job?.reason==='cancelled_by_user'?'正在停止…':'停止换水';
   $('menu-level-job').disabled=false;
   $('level-job-title').textContent=active&&exchange?'一键换水':'按目标水位运行';
   $('exchange-workflow').hidden=!(active&&exchange);
@@ -400,10 +403,20 @@ function renderLevelJob(){
   summary.title=state+'，点击查看任务详情';summary.style.setProperty('--job-progress',progress+'%');
 }
 function addCells(parent,values){const row=document.createElement('tr');for(const value of values){const cell=document.createElement('td');cell.textContent=value;row.append(cell);}parent.append(row);}
+function commandOrigin(item){
+  if(item.origin==='manual')return item.action==='manual_stop'?'人工停止请求':'人工操作请求';
+  if(item.origin==='system'){
+    const reason=(item.origin_reason||'')+' '+(item.action||'');
+    if(['FILL','DRAIN','START'].includes(item.command))return item.action==='recovery_resume'?'系统续行开启':/round_start/.test(reason)?'系统分轮开启':'系统自动开启';
+    if(item.command==='RESET')return /recover/.test(reason)?'系统通信恢复':'系统复位请求';
+    return /timeout|limit|fault|unknown|disconnect|unconfirmed|protect|overflow/.test(reason)?'系统保护停止':/recover/.test(reason)?'系统恢复确认':/round|segment|waiting/.test(reason)?'系统轮间关断':/target|boundary|complete/.test(reason)?'系统目标收尾':'系统自动控制';
+  }
+  return '来源未记录';
+}
 function renderHistory(data){
   const commands=data.commands||[];
   $('commands-list').replaceChildren();
-  for(const item of commands)addCells($('commands-list'),[timeLabel(item.created),commandNames[item.command]||item.command,resultNames[item.status]||item.status,item.result||'—']);
+  for(const item of commands)addCells($('commands-list'),[timeLabel(item.created),commandOrigin(item),commandNames[item.command]||item.command,resultNames[item.status]||item.status,item.result||'—']);
   $('commands-empty').hidden=commands.length>0;
   const events=data.connection?.events||[];
   $('connection-list').replaceChildren();
@@ -499,17 +512,18 @@ $('calibration-form').addEventListener('submit',async event=>{
 });
 for(const button of document.querySelectorAll('[data-target-level]'))button.addEventListener('click',()=>{if(signedIn&&!authBusy){$('target-level').value=button.dataset.targetLevel;renderLevelJob();}});
 $('target-level').addEventListener('input',renderLevelJob);
-async function submitLevelJob(cancel=false,exchange=false){
+async function submitLevelJob(cancel=false,exchange=false,stopIntent=null){
   if(!signedIn||authBusy)return;
   const preview=jobPreview(),epoch=authEpoch,job=lastSnapshot?.level_job,isExchange=exchange||cancel&&job?.mode==='exchange';
   if(cancel?(!signedIn||job?.status!=='running'||jobBusy||job.reason==='cancelled_by_user'):!!(exchange?exchangeStartReason():jobStartReason(preview)))return;
+  if(cancel&&(!stopIntent||stopIntent.job_id!==job.id))return;
   if(exchange&&!cancel&&(!await confirmExchange()||epoch!==authEpoch||exchangeStartReason()))return;
   const taskName=isExchange?'一键换水':'目标任务';
   jobBusy=true;$('job-message').textContent=cancel?'正在请求停止，等待设备确认关闭。':'正在提交'+taskName+'，等待服务端确认。';
   if(isExchange)setFeedback($('job-message').textContent);renderControls();
   try{
     const id=cancel?null:Array.from(crypto.getRandomValues(new Uint8Array(16)),value=>value.toString(16).padStart(2,'0')).join('');
-    await api(cancel?'level-job/cancel':'level-job',cancel?{job_id:job.id}:exchange?{mode:'exchange',id}:{target_level:preview.target,id});
+    await api(cancel?'level-job/cancel':'level-job',cancel?stopIntent:exchange?{mode:'exchange',id}:{target_level:preview.target,id});
     if(epoch!==authEpoch)return;
     if(exchange&&!cancel)observedExchangeId=id;
     $('job-message').textContent=cancel?'停止请求已提交；两路关闭以设备回执为准。':taskName+'已提交；运行状态以设备回执为准。';
@@ -519,8 +533,27 @@ async function submitLevelJob(cancel=false,exchange=false){
   finally{if(epoch===authEpoch){jobBusy=false;renderControls();}}
 }
 $('level-job-form').addEventListener('submit',event=>{event.preventDefault();submitLevelJob();});
-$('cancel-level-job').addEventListener('click',()=>submitLevelJob(true));
-$('exchange-button').addEventListener('click',()=>submitLevelJob(lastSnapshot?.level_job?.status==='running'&&lastSnapshot.level_job.mode==='exchange',true));
+const stopGestures=new WeakMap();
+for(const button of [$('cancel-level-job'),$('exchange-stop-button')]){
+  const capture=event=>{
+    if(!event.isTrusted||button.disabled||button.hidden||event.type==='pointerdown'&&event.button!==0||event.type==='keydown'&&(event.repeat||!['Enter',' '].includes(event.key)))return;
+    const job=lastSnapshot?.level_job;if(job?.status!=='running')return;
+    stopGestures.set(button,{job_id:job.id,intent:'manual_stop',source:'web_ui',event:event.type==='keydown'?'keyboard_activation':'click',button:button.id,capturedAt:Date.now()});
+  };
+  button.addEventListener('pointerdown',capture);
+  button.addEventListener('keydown',capture);
+  button.addEventListener('pointercancel',()=>stopGestures.delete(button));
+  button.addEventListener('blur',()=>stopGestures.delete(button));
+  button.addEventListener('click',event=>{
+    const gesture=stopGestures.get(button);stopGestures.delete(button);
+    if(!event.isTrusted||!gesture||button.disabled||button.hidden||Date.now()-gesture.capturedAt>10000)return;
+    const job=lastSnapshot?.level_job;
+    if(job?.status!=='running'||job.id!==gesture.job_id){setFeedback('任务已变化，本次点击未停止新任务；请核实当前任务后重新点击停止。');return;}
+    const {capturedAt,...intent}=gesture;
+    submitLevelJob(true,button.id==='exchange-stop-button',intent);
+  });
+}
+$('exchange-button').addEventListener('click',event=>{if(event.isTrusted)submitLevelJob(false,true);});
 $('confirm-exchange-start')?.addEventListener('click',()=>{
   renderExchangeConfirmation();
   if(signedIn&&!authBusy&&$('exchange-confirm')?.open&&!exchangeStartReason()&&exchangePreview())$('exchange-confirm').close('ok');

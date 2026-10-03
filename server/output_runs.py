@@ -140,7 +140,7 @@ class OutputRuns:
         run.update(phase='starting', round=run['round'] + 1, reason='running')
         runtime.update(on_tick=None, stop_at=None, off_id=None, start_until=self.store.control_clock() + 8)
         runtime.pop('stop_tick', None)
-        runtime['on_id'] = self.store.job_command(direction.upper())
+        runtime['on_id'] = self.store.job_command(direction.upper(), reason='output_run_round_start', job_id=run['id'], action='round_start')
         self.save(run, True)
 
     def request_stop(self, direction, reason=None, command_id=None):
@@ -158,7 +158,10 @@ class OutputRuns:
             runtime['cancel_reason'] = reason
             self.revoke_unclaimed(direction)
         run.update(phase='stopping', reason=reason or 'round_stopping')
-        runtime['off_id'] = command_id or self.store.job_command(direction.upper() + '_OFF', ttl=5)
+        runtime['off_id'] = command_id or self.store.job_command(direction.upper() + '_OFF', ttl=5,
+                                                             origin='manual' if reason in ('cancelled_by_user', 'manual_override') else 'system',
+                                                             reason=reason or 'output_run_round_stop', job_id=run['id'],
+                                                             action='manual_stop' if reason == 'cancelled_by_user' else 'manual_switch' if reason == 'manual_override' else 'round_stop')
         runtime['stop_until'] = min(runtime['stop_until'], self.store.control_clock() + 5) if stopping else self.store.control_clock() + 5
         self.save(run, True)
 

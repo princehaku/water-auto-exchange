@@ -130,7 +130,7 @@ class LevelJobTests(unittest.TestCase):
         self.store.ws_touch(self.session, self.status)
         with self.assertRaises(Problem):
             self.pulse(5)
-        self.assertEqual(self.store.level_job['reason'], 'stop_unconfirmed')
+        self.assertEqual(self.store.level_job['phase'], 'paused')
         self.assertIsNone(self.store.ws_gateway)
 
     def test_cancel_before_on_ack_requires_stop_receipt(self):
@@ -155,7 +155,7 @@ class LevelJobTests(unittest.TestCase):
         self.store.enqueue('FILL_OFF', 'f' * 32)
         self.assertEqual(self.store.level_job['reason'], 'manual_override')
 
-    def test_recalibration_exclusion_and_restart_cannot_resume(self):
+    def test_recalibration_exclusion_and_restart_waits_for_verified_new_session(self):
         self.store.start_level_job(dict(target_level=50))
         with self.assertRaises(Problem) as caught:
             self.store.start_level_job(dict(target_level=40))
@@ -228,7 +228,7 @@ class LevelJobTests(unittest.TestCase):
                 self.off()
                 self.store.ws_touch(self.session, dict(STATUS, **changes))
                 self.assertEqual(self.store.level_job['status'], 'failed')
-                self.assertEqual(self.store.level_job['reason'], 'device_not_ready')
+                self.assertEqual(self.store.level_job['reason'], 'overflow' if changes.get('overflow') == '1' else 'device_not_ready')
                 self.pulse(2)
                 self.assertIsNone(self.store.ws_offer(self.session))
 
@@ -250,7 +250,8 @@ class LevelJobTests(unittest.TestCase):
             self.store.ws_ping(self.session, self.sequence + 1)
         self.assertTrue(self.store.simulation['uncertain'])
         self.assertEqual(self.store.simulation['level'], previous)
-        self.assertEqual(self.store.level_job['status'], 'failed')
+        self.assertEqual(self.store.level_job['status'], 'running')
+        self.assertEqual(self.store.level_job['phase'], 'paused')
         self.store.ws_close(self.session)
         self.assertIsNone(self.store.ws_gateway)
 

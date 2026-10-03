@@ -14,8 +14,10 @@ from socketserver import ThreadingMixIn
 
 if __package__:
     from .output_runs import OutputRuns, ROUND_SECONDS
+    from .auto_recovery import AutoRecovery, LEVEL_EPSILON, recovery_enabled
 else:
     from output_runs import OutputRuns, ROUND_SECONDS
+    from auto_recovery import AutoRecovery, LEVEL_EPSILON, recovery_enabled
 
 ACTIVE = ('DRAINING', 'SETTLING', 'FILLING', 'EXCHANGING')
 COMMANDS = ('START', 'FILL', 'DRAIN', 'FILL_OFF', 'DRAIN_OFF', 'STOP', 'RESET')
@@ -109,7 +111,8 @@ class Store:
         self._job_saved_second = None
         saved_job = self.db.execute('SELECT value FROM level_job WHERE id=1').fetchone()
         self.level_job = json.loads(saved_job['value']) if saved_job else None
-        if self.level_job and self.level_job['status'] == 'running':
+        if (self.level_job and self.level_job['status'] == 'running'
+                and not recovery_enabled(self.level_job)):
             self.level_job.update(status='failed', phase='done', reason='server_restarted',
                                   updated_at=self.clock(), finished_at=self.clock())
             self.save_level_job(True)
@@ -153,6 +156,7 @@ class Store:
             if self.connection_state == 'online':
                 self.connection_event(False, 'server_restarted')
         self.output_runner = OutputRuns(self, Problem)
+        self.auto_recovery = AutoRecovery(self)
 
     def connection_event(self, online, reason):
         state = 'online' if online else 'offline'
@@ -263,6 +267,7 @@ class Store:
         if not job:
             return None
         if job['status'] == 'running':
+            self.auto_recovery.checkpoint()
             current = max(0, runtime.get('stop_tick', self.control_clock()) - runtime['on_tick']) if runtime.get('on_tick') is not None else 0
             job['round_elapsed_seconds'] = current
             job['elapsed_seconds'] = runtime.get('completed_seconds', 0) + current
@@ -278,9 +283,11 @@ class Store:
 
     def job_stage_remaining(self):
         job = self.level_job
+        if self.auto_recovery.enabled() and job['recovery'].get('attempts', 0):
+            return self.auto_recovery.stage_remaining()
         difference = job['target_level'] - self.simulation['level']
         remaining = difference if job['direction'] == 'fill' else -difference
-        return max(0, remaining * job[job['direction'] + '_seconds'] / 100)
+        return 0.0 if remaining <= LEVEL_EPSILON else remaining * job[job['direction'] + '_seconds'] / 100
 
     def job_remaining(self):
         job = self.level_job
@@ -294,7 +301,7 @@ class Store:
         self.level_job.update(status=state, phase='done', reason=reason, finished_at=self.clock(), updated_at=self.clock(), round_remaining_seconds=None)
         # Revoke offers which have not been authorized yet. Already executed
         # commands retain their receipt path and their independent soft timer.
-        for key in ('on_id', 'off_id'):
+        for key in ('on_id', 'off_id', 'reset_id'):
             command_id = self._job_runtime.get(key)
             if command_id and command_id not in self.ws_grants:
                 self.db.execute("UPDATE commands SET status='cancelled', result='level_job_ended', finished=? WHERE id=? AND status IN ('queued','delivered')", (self.clock(), command_id))
@@ -310,7 +317,11 @@ class Store:
     def job_start_round(self):
         job, runtime = self.level_job, self._job_runtime
         job.update(phase='starting', round=job['round'] + 1, reason='running')
-        runtime.update(on_tick=None, stop_at=None, off_id=None, start_until=self.control_clock() + 8)
+        runtime.update(on_tick=None, stop_at=None, off_id=None, start_until=self.control_clock() + 8, accounted_seconds=0, accounted_min_seconds=0)
+        runtime.pop('off_grant_tick', None)
+        if self.auto_recovery.enabled():
+            self.level_job['recovery']['authorized'] = False
+            self.level_job['recovery']['startup_slop'] = 0
         runtime.pop('stop_tick', None)
         runtime['on_id'] = self.job_command(job['direction'].upper())
         self.save_level_job(True)
@@ -368,11 +379,17 @@ class Store:
                                   estimated_liters=0 if self.simulation['capacity_liters'] is not None else None,
                                   progress=0, estimated=True, created_at=self.clock(), updated_at=self.clock(), finished_at=None, reason='running')
             self._job_runtime = dict(session=self.ws_gateway, completed_seconds=0, completed_liters=0, cancel_reason=None)
+            self.auto_recovery.initialize_new()
             self.job_start_round()
             return self.job_refresh()
 
     def job_request_stop(self, cancel_reason=None, command_id=None):
         job, runtime = self.level_job, self._job_runtime
+        if cancel_reason and self.auto_recovery.enabled():
+            job['recovery']['cancel_reason'] = cancel_reason
+        if cancel_reason and self.auto_recovery.waiting():
+            self.job_finish('cancelled', cancel_reason)
+            return
         stopping = job['phase'] == 'stopping'
         if stopping and cancel_reason and command_id is None:
             # A late cancellation keeps the pending OFF receipt and its original
@@ -411,6 +428,10 @@ class Store:
         if not self.job_running():
             return
         job, runtime = self.level_job, self._job_runtime
+        if self.auto_recovery.observe(status, ack):
+            return
+        if not self.job_running():
+            return
         if status['state'] == 'FAULT':
             self.job_finish('failed', 'device_fault')
             return
@@ -430,8 +451,16 @@ class Store:
             self.control_abort('level_job_unexpected_output')
         if job['phase'] == 'stopping' and status['fill'] == status['drain'] == '0' and runtime.get('off_id') in self.ws_grants:
             runtime.setdefault('stop_tick', self.control_clock())
+            if self.auto_recovery.enabled():
+                job['recovery']['authorized'] = False
+                self.save_level_job(True)
         if job['phase'] == 'starting' and status[direction] == '1' and runtime['on_id'] in self.ws_grants:
             runtime['on_tick'] = self.control_clock()
+            if self.auto_recovery.enabled():
+                startup = max(0, self.control_clock() - runtime.get('grant_tick', self.control_clock()))
+                job['recovery']['startup_slop'] = startup
+                self.auto_recovery.add_duration(direction, 0, startup)
+                job['recovery']['possible_extra_seconds'] += startup
             grant = self.control_runs[direction]
             runtime['stop_at'] = min(runtime['on_tick'] + min(job['round_limit_seconds'], self.job_stage_remaining()), grant['until'] - 10)
             job['phase'] = 'active'
@@ -439,6 +468,9 @@ class Store:
         elif job['phase'] == 'active' and status[direction] == '0':
             self.job_finish('failed', 'unexpected_output_off')
         elif job['phase'] == 'stopping' and ack and ack.get('id') == runtime['off_id'] and status['fill'] == status['drain'] == '0' and status['state'] in ('IDLE', 'DONE'):
+            self.auto_recovery.checkpoint(proven=True)
+            if self.auto_recovery.enabled():
+                job['recovery']['authorized'] = False
             self.job_refresh()
             runtime['completed_seconds'] = job['elapsed_seconds']
             runtime['completed_liters'] = job['estimated_liters']
@@ -446,7 +478,7 @@ class Store:
             if runtime.get('cancel_reason'):
                 self.job_finish('cancelled', runtime['cancel_reason'])
             elif self.job_remaining() <= 0.00001:
-                self.job_finish('completed', 'target_reached')
+                self.job_finish('completed', 'completed_with_uncertainty' if job.get('recovery', {}).get('uncertain') else 'target_reached')
             else:
                 transition = job.get('mode') == 'exchange' and job['stage'] == 'drain' and self.job_stage_remaining() <= 0.00001
                 runtime['next_stage'] = 'fill' if transition else None
@@ -460,27 +492,37 @@ class Store:
         self._job_ticking = True
         try:
             job, runtime = self.level_job, self._job_runtime
+            if self.auto_recovery.tick():
+                self.job_refresh()
+                return
             if runtime.get('session') != self.ws_gateway:
-                self.job_finish('failed', 'device_disconnected')
+                if not self.auto_recovery.pause('device_disconnected'):
+                    self.job_finish('failed', 'device_disconnected')
                 return
             if not self.online():
-                self.job_finish('failed', 'device_disconnected')
+                if not self.auto_recovery.pause('device_disconnected'):
+                    self.job_finish('failed', 'device_disconnected')
                 self.control_abort('level_job_disconnected')
             active = self.simulation['fill_on'] or self.simulation['drain_on']
             gap = self.estimate_gap()
             if active and gap is not None and gap > 5:
                 self.freeze_estimate()
-            if self.simulation['uncertain']:
-                self.job_finish('failed', 'estimate_uncertain')
+                if self.auto_recovery.pause('communication_timeout'):
+                    self.control_abort('level_job_communication_timeout')
+            if self.simulation['uncertain'] and not job.get('recovery', {}).get('resumed'):
+                if not self.auto_recovery.pause('estimate_uncertain'):
+                    self.job_finish('failed', 'estimate_uncertain')
                 self.control_abort('level_job_estimate_uncertain')
             now = self.control_clock()
             if job['phase'] == 'starting' and now >= runtime['start_until']:
-                self.job_finish('failed', 'start_timeout')
+                if not self.auto_recovery.pause('start_timeout'):
+                    self.job_finish('failed', 'start_timeout')
                 self.control_abort('level_job_start_timeout')
             elif job['phase'] == 'active' and (now >= runtime['stop_at'] or self.job_stage_remaining() <= 0.00001):
                 self.job_request_stop()
             elif job['phase'] == 'stopping' and now >= runtime['stop_until']:
-                self.job_finish('failed', 'stop_unconfirmed')
+                if not self.auto_recovery.pause('stop_unconfirmed'):
+                    self.job_finish('failed', 'stop_unconfirmed')
                 self.control_abort('level_job_stop_unconfirmed')
             elif job['phase'] == 'waiting' and now >= runtime['wait_until']:
                 status = self.status or {}
@@ -489,7 +531,7 @@ class Store:
                 elif status.get('ready') != '1' or status.get('overflow') != '0':
                     self.job_finish('failed', 'device_not_ready')
                 elif self.job_remaining() <= 0.00001:
-                    self.job_finish('completed', 'target_reached')
+                    self.job_finish('completed', 'completed_with_uncertainty' if job.get('recovery', {}).get('uncertain') else 'target_reached')
                 else:
                     if runtime.pop('next_stage', None) == 'fill':
                         job.update(stage='fill', direction='fill', target_level=100.0, round_limit_seconds=ROUND_SECONDS)
@@ -499,6 +541,8 @@ class Store:
             self._job_ticking = False
 
     def control_abort(self, reason):
+        if reason in ('control_protocol_changed', 'control_state_uncertain', 'control_unowned_output'):
+            self.job_finish('failed', reason)
         self.control_uncertain = True
         if self.ws_gateway:
             self.ws_close(self.ws_gateway, reason)
@@ -875,6 +919,12 @@ class Store:
                     raise Problem(409, 'request_id_conflict')
                 return dict(previous)
             if not self.online():
+                if command == 'STOP' and self.auto_recovery.waiting():
+                    self.job_finish('cancelled', 'manual_override')
+                    now = self.clock()
+                    self.db.execute('INSERT INTO commands VALUES (?,?,?,?,?,?,?)', (request_id, command, now, now, 'cancelled', 'offline_recovery_cancelled', now))
+                    self.db.commit()
+                    return dict(self.db.execute('SELECT * FROM commands WHERE id=?', (request_id,)).fetchone())
                 raise Problem(409, 'device_offline')
             s = self.status
             exchange_cancel = self.job_running() and self.level_job.get('mode') == 'exchange'
@@ -976,7 +1026,13 @@ class Store:
             return dict(gateway=self.gateway)
 
     def ws_open(self, status, previous_session=None):
-        status = validate_status(status)
+        try:
+            status = validate_status(status)
+        except Problem as exc:
+            if exc.message == 'firmware_mismatch' and self.auto_recovery.enabled() and self.job_running():
+                with self.lock:
+                    self.job_finish('failed', 'control_protocol_changed')
+            raise
         with self.lock:
             soft = status['version'] == '0.8.2' and status.get('control_mode') == 'manual'
             # Only the authenticated previous owner can replace its half-open
@@ -988,6 +1044,8 @@ class Store:
             if self.ws_gateway or (self.gateway and self.gateway_seen > self.clock() - 15):
                 raise Problem(409, 'another_device_active')
             if soft and (status['outputs_known'] != '1' or status['fill'] != '0' or status['drain'] != '0'):
+                if self.auto_recovery.enabled() and self.job_running():
+                    self.job_finish('failed', 'output_unknown' if status['outputs_known'] != '1' else 'unexpected_output')
                 raise Problem(409, 'control_state_uncertain')
             self.ws_gateway = self.gateway = secrets.token_hex(16)
             self.ws_grants = {}
@@ -1005,6 +1063,7 @@ class Store:
             self.observe_outputs(status)
             self.gateway_seen = self.seen
             self.connection_event(True, 'connected')
+            self.auto_recovery.observe(status, new_session=True)
             return self.ws_gateway
 
     def ws_ping(self, session, sequence):
@@ -1029,8 +1088,14 @@ class Store:
                 self.integrate_estimate(5)
                 sim['estimate_basis'] = 'confirmed_outputs_heartbeat_estimate'
                 self.save_simulation()
+            elif active and authorized and self.auto_recovery.enabled() and self.level_job['recovery'].get('resumed'):
+                # Historical uncertainty does not erase the independent
+                # heartbeat deadline used by the resumed task's time budget.
+                self.control_tick(session)
+                self.estimate_tick = self.control_clock()
             self.ws_ping_sequence = sequence
             self.ws_touch(session, effective_ping=True)
+            self.auto_recovery.ping()
             return True
 
     def ws_touch(self, session, status=None, ack=None, effective_ping=False):
@@ -1110,7 +1175,14 @@ class Store:
                 return dict(type='expired', id=command_id)
             if self.web_limits and row['command'] in ('FILL', 'DRAIN') and command_id not in self.ws_grants:
                 try:
-                    self.check_output_start(row['command'].lower())
+                    recovering_on = (self.auto_recovery.enabled() and self.job_running()
+                                     and self.level_job['recovery'].get('resumed')
+                                     and self._job_runtime.get('on_id') == command_id)
+                    if recovering_on and not self.auto_recovery.owns(command_id):
+                        self.job_finish('failed', 'device_not_ready')
+                        raise Problem(409, 'device_not_ready')
+                    if not recovering_on:
+                        self.check_output_start(row['command'].lower())
                 except Problem as exc:
                     self.db.execute("UPDATE commands SET status='cancelled', result=?, finished=? WHERE id=?", (exc.message, self.clock(), command_id))
                     self.db.commit()
@@ -1118,6 +1190,7 @@ class Store:
             if command_id not in self.ws_grants:
                 self.ws_grant_sequence += 1
                 self.ws_grants[command_id] = dict(sequence=self.ws_grant_sequence, acked=False)
+            self.auto_recovery.authorize(command_id)
             if self.web_limits and row['command'] in ('FILL', 'DRAIN'):
                 self.control_start(row['command'].lower(), row['id'])
             return dict(type='execute', id=row['id'], command=row['command'], ttl_ms=max(0, int((row['expires'] - self.clock()) * 1000)))
@@ -1127,7 +1200,8 @@ class Store:
             if session != self.ws_gateway:
                 return
             self.output_runner.end_all('device_disconnected')
-            self.job_finish('failed', 'device_disconnected')
+            if not self.auto_recovery.pause(reason):
+                self.job_finish('failed', 'device_disconnected')
             self.db.execute("UPDATE commands SET status='uncertain', result='device_disconnected', finished=? WHERE status IN ('queued','delivered')", (self.clock(),))
             self.db.commit()
             self.ws_gateway = self.gateway = None

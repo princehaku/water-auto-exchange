@@ -157,7 +157,8 @@ class ExchangeJobTests(unittest.TestCase):
         self.assert_no_fill_command()
         with self.assertRaises(Problem):
             self.pulse(1)
-        self.assertEqual(self.store.level_job['reason'], 'stop_unconfirmed')
+        self.assertEqual(self.store.level_job['phase'], 'paused')
+        self.assertIsNone(self.store.ws_gateway)
 
     def test_rejected_drain_off_and_late_ack_cannot_start_fill(self):
         self.configure(fill=4, drain=4)
@@ -210,7 +211,12 @@ class ExchangeJobTests(unittest.TestCase):
         self.assertEqual(self.store._job_runtime['stop_until'], deadline)
         with self.assertRaises(Problem):
             self.pulse(1)
-        self.assertEqual(self.store.level_job['reason'], 'stop_unconfirmed')
+        self.assertEqual(self.store.level_job['status'], 'cancelled')
+        self.assertEqual(self.store.level_job['reason'], 'cancelled_by_user')
+        self.session = self.store.ws_open(STATUS)
+        self.sequence = 0
+        self.pulse(10)
+        self.assertIsNone(self.store.ws_offer(self.session))
         self.assert_no_fill_command()
 
     def test_cancel_during_stop_accepts_existing_off_then_finishes_cancelled(self):
@@ -260,24 +266,31 @@ class ExchangeJobTests(unittest.TestCase):
         self.ack(self.offer('STOP'), fill='0', drain='0', state='IDLE')
         self.assertEqual(self.store.start_level_job(dict(target_level=40))['mode'], 'target')
 
-    def test_restart_keeps_failed_job_and_request_id_cannot_restart_it(self):
+    def test_restart_pauses_same_job_and_duplicate_request_does_not_restart_it(self):
         job = self.short_drain_finished()
         self.store.db.close()
         self.store = Store(self.path, lambda: self.now)
         self.session = self.store.ws_open(STATUS)
         self.assertEqual(self.start()['id'], job['id'])
         self.assertEqual(self.start()['reason'], 'server_restarted')
+        self.assertEqual(self.start()['phase'], 'paused')
         self.pulse(3)
         self.assert_no_fill_command()
         self.assertIsNone(self.store.ws_offer(self.session))
+        self.pulse(5)
+        self.on('fill')
+        self.assertEqual(self.store.level_job['id'], job['id'])
 
-    def test_disconnect_between_stages_never_resumes_on_new_connection(self):
+    def test_disconnect_between_stages_waits_for_stability_before_resuming_fill(self):
         self.short_drain_finished()
         self.store.ws_close(self.session)
         self.session = self.store.ws_open(STATUS)
+        self.sequence = 0
         self.pulse(3)
-        self.assertEqual(self.store.level_job['status'], 'failed')
+        self.assertEqual(self.store.level_job['status'], 'running')
         self.assert_no_fill_command()
+        self.pulse(5)
+        self.on('fill')
 
     def test_fault_reset_then_recalibration_starts_new_exchange_from_saved_current_level(self):
         self.configure(level=100, fill=60, drain=400)
@@ -287,10 +300,11 @@ class ExchangeJobTests(unittest.TestCase):
         self.pulse(40)
         self.store.ws_close(self.session)
         self.assertTrue(self.store.simulation['uncertain'])
-        self.assertEqual(self.store.level_job['reason'], 'device_disconnected')
+        self.assertEqual(self.store.level_job['phase'], 'paused')
         self.status = dict(STATUS, state='FAULT', reason='remote_timeout')
         self.session = self.store.ws_open(self.status)
         self.sequence = 0
+        self.assertEqual(self.store.level_job['status'], 'failed')
         self.store.enqueue('RESET', 'c' * 32)
         self.ack(self.offer('RESET'), state='IDLE', reason='reset')
         # RESET acknowledges the controller fault; only an explicit water-level
@@ -408,7 +422,7 @@ class ExchangeJobTests(unittest.TestCase):
 
     def test_upgrade_of_legacy_persisted_job_ends_old_run_without_replaying(self):
         job = self.store.start_level_job(dict(target_level=40))
-        for key in ('mode', 'stage', 'fill_seconds', 'drain_seconds', 'capacity_liters'):
+        for key in ('mode', 'stage', 'fill_seconds', 'drain_seconds', 'capacity_liters', 'recovery'):
             job.pop(key)
         self.store.db.execute('UPDATE level_job SET value=?', (json.dumps(job),))
         self.store.db.execute('DROP TABLE level_job_requests')
@@ -425,7 +439,7 @@ class ExchangeJobTests(unittest.TestCase):
         self.short_drain_finished()
         self.store.ws_touch(self.session, dict(STATUS, overflow='1'))
         self.pulse(2)
-        self.assertEqual(self.store.level_job['reason'], 'device_not_ready')
+        self.assertEqual(self.store.level_job['reason'], 'overflow')
         self.assert_no_fill_command()
 
     def test_invalid_mode_id_and_cancel_payload_are_rejected(self):

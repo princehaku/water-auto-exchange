@@ -28,7 +28,8 @@ class ScriptModeWebSocketTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             env = dict(os.environ, WATER_ADMIN_KEY='test-admin-' + 'a' * 32,
                        WATER_DEVICE_KEY='b' * 32, WATER_DB=str(Path(folder) / 'water.db'),
-                       WATER_PORT=str(port), PYTHONPATH=str(root / 'build' / 'debug-python'))
+                       WATER_PORT=str(port), PYTHONPATH=os.pathsep.join(filter(None, (
+                           str(root / 'build' / 'debug-python'), os.environ.get('PYTHONPATH')))))
             process = subprocess.Popen([sys.executable, str(root / 'server' / 'app.py')],
                                        cwd=str(root / 'server'), env=env,
                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -101,6 +102,76 @@ class WebSocketTests(unittest.TestCase):
         self.assertEqual(json.loads(c.recv())['type'], 'received')
         self.assertEqual(self.store.snapshot()['commands'][0]['status'], 'succeeded')
         self.assertEqual(self.store.snapshot()['device']['state'], 'DRAINING')
+
+    def test_automatic_exchange_recovers_through_new_session_reset_and_execute(self):
+        status = dict(STATUS, version='0.8.2', control_mode='manual', need_fill='unknown')
+        fault = dict(status, state='FAULT', reason='communication_timeout', ready='0')
+        client = self.connect(status=status)
+        self.store.configure_simulation(dict(level=100, fill_seconds=120, drain_seconds=320))
+        pending = []
+
+        def receive(kind):
+            for index, message in enumerate(pending):
+                if message['type'] == kind:
+                    return pending.pop(index)
+            for _ in range(20):
+                message = json.loads(client.recv())
+                if message['type'] == kind:
+                    return message
+                pending.append(message)
+            self.fail('No websocket message of type ' + kind)
+
+        def execute(command, device):
+            offer = receive('offer')
+            self.assertEqual(offer['command'], command)
+            client.send(json.dumps(dict(type='claim', id=offer['id'])))
+            frame = receive('execute')
+            self.assertEqual(frame['command'], command)
+            self.assertEqual(frame['id'], offer['id'])
+            client.send(json.dumps(dict(type='ack', ack=dict(id=offer['id'],
+                status='succeeded', result='OK'), status=device)))
+            receive('received')
+            return offer['id']
+
+        def ping(sequence, seconds=1):
+            self.now += seconds
+            client.send(json.dumps(dict(type='ping', seq=sequence)))
+            self.assertEqual(receive('pong')['seq'], sequence)
+
+        job = self.store.start_level_job(dict(mode='exchange', id='c' * 32))
+        first_on = execute('DRAIN', dict(status, state='DRAINING', drain='1'))
+        for sequence in range(1, 11):
+            ping(sequence)
+        client.close()
+        for _ in range(100):
+            if self.store.ws_gateway is None:
+                break
+            time.sleep(.01)
+        self.assertIsNone(self.store.ws_gateway)
+        self.assertEqual(self.store.level_job['phase'], 'paused')
+        self.now += 12
+        client = self.connect(False)
+        pending.clear()
+        client.send(json.dumps(dict(type='auth', key='b' * 32, status=fault)))
+        receive('ready')
+        # Production 0.8.2 uses thirty-second pings while idle or in FAULT.
+        ping(1, 30)
+        self.assertEqual(self.store.level_job['phase'], 'paused')
+        ping(2, 30)
+        execute('RESET', dict(status, reason='reset'))
+        self.assertEqual(self.store.level_job['phase'], 'recovering')
+        self.now += 2
+        resumed_on = execute('DRAIN', dict(status, state='DRAINING', drain='1'))
+        self.assertNotEqual(first_on, resumed_on)
+        snapshot = self.store.snapshot()
+        self.assertEqual(snapshot['level_job']['id'], job['id'])
+        self.assertEqual(snapshot['level_job']['recovery']['attempts'], 1)
+        self.assertTrue(snapshot['simulation']['uncertain'])
+        self.assertGreater(snapshot['level_job']['recovery']['used_max']['drain'], 10)
+        self.assertEqual(snapshot['level_job']['phase'], 'active')
+        self.store.cancel_level_job(dict(job_id=job['id']))
+        execute('STOP', dict(status, reason='stopped'))
+        self.assertEqual(self.store.level_job['status'], 'cancelled')
 
     def test_wrong_key_never_registers(self):
         c = self.connect(False)

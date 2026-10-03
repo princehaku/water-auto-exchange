@@ -16,6 +16,17 @@ Object.assign(errors,{invalid_output_run:'作业参数不正确，请刷新后�
 Object.assign(errors,{output_requires_calibration:'水位估算未校准或已不确定，请按现场水位重新校准。',output_stop_pending:'正在确认本路关闭，请稍候再操作。',fill_target_reached:'水位已达 100%，无需继续补水。',drain_target_reached:'水位已达 0%，无需继续冲水。'});
 Object.assign(errors,{invalid_level_target:'目标水位须为 0–100%。',invalid_level_job:'任务参数不正确，请刷新后重试。',level_job_active:'已有水位任务正在执行，请先停止。',level_job_changed:'任务已变化，请等待同步后再操作。',level_job_requires_idle:'启动前设备须在线、就绪，且两路均已关闭。',level_job_requires_calibration:'水位估算尚未校准或已不确定，请按现场水位重新校准。',level_job_requires_web:'当前设备暂不支持目标水位任务。',level_target_reached:'当前估算已经达到目标水位。'});
 const jobReasons={done:'已按校准估算完成目标。',target_reached:'已达到预估目标水位。',cancelled_by_user:'已按你的要求停止任务。',manual_override:'手动操作已结束目标任务。',calibration_changed:'重新校准后，原目标任务已结束。',device_disconnected:'设备连接中断，目标任务已结束。',server_restarted:'服务重启，原目标任务未恢复。',output_unknown:'输出状态未知，目标任务已结束。',device_fault:'设备故障，目标任务已停止；请检查现场。',command_rejected:'设备拒绝指令，目标任务已结束。',start_timeout:'开启回执未确认，目标任务已结束。',stop_unconfirmed:'关断尚未确认，请检查设备状态。',estimate_uncertain:'水位估算不确定，请重新校准。'};
+Object.assign(jobReasons,{completed_with_uncertainty:'已完成保守续行；实际水位仍不确定，请到现场核实并重新校准。',recovery_wait_expired:'等待设备恢复超过 30 分钟，任务已结束；请检查设备并按现场水位校准。',recovery_limit_reached:'自动恢复已达到 5 次上限，任务已结束；请检查通信与现场水位。',recovery_reset_rejected:'通信故障复位未通过设备确认，任务已结束；请检查现场。',control_protocol_changed:'设备版本或控制模式变化，任务已结束；请重新确认设备状态。',unexpected_output:'设备输出与任务记录不符，任务已停止；请检查现场。',overflow:'设备报告超高水位，任务已停止；请先排除现场原因。'});
+const recoveryStates={paused:'等待设备恢复',recovering:'确认恢复状态',resetting:'恢复通信故障'};
+function recoveryState(job){return job?.status==='running'?recoveryStates[job.phase]||'':'';}
+function recoveryNotice(job){
+  const state=recoveryState(job),recovery=job?.recovery;
+  if(!state)return '';
+  const detail=job.phase==='paused'?'任务已暂停，保留剩余时长；设备恢复后确认全关再继续。':job.phase==='resetting'?'仅自动复位本次通信超时故障，正在等待设备确认；其他故障不会自动清除。':'正在确认设备状态及两路关闭，尚未继续开水。';
+  const attempts=Number.isFinite(recovery?.attempts)?' 恢复 '+recovery.attempts+' / 5 次。':'';
+  return detail+attempts+' 可随时停止，停止后不再恢复。';
+}
+function jobCompletion(job){return job?.reason==='completed_with_uncertainty'?jobReasons.completed_with_uncertainty:job?.mode==='exchange'&&job.status==='completed'?'已按校准估算完成冲水至 0% 和补水至 100%。':jobReasons[job?.reason]||'任务已结束，请以设备回执及现场水位为准。';}
 
 try{scene=createAquarium($('tank-canvas'));}catch(error){$('scene-fallback').hidden=false;$('tank-canvas').hidden=true;}
 
@@ -117,26 +128,27 @@ function can(command){
   if(busy||jobBusy)return false;
   if(command==='FILL_OFF'||command==='DRAIN_OFF')return concurrent(device);
   if(data.commands.some(item=>['queued','delivered'].includes(item.status)))return false;
-  if(command==='RESET')return device.state==='FAULT';
+  if(command==='RESET')return device.state==='FAULT'&&!recoveryState(data.level_job);
   if(webLimits(device)&&(data.control_limits?.source!=='web'||data.control_limits?.uncertain||data.control_limits?.timeout_pending))return false;
   if(webLimits(device)&&['FILL','DRAIN'].includes(command)&&outputBoundaryReason(command.toLowerCase()))return false;
   return ['FILL','DRAIN'].includes(command)&&supportedManual.includes(device.version)&&device.control_mode==='manual'&&device.ready==='1'&&device.outputs_known==='1'&&device.overflow==='0'&&(concurrent(device)?['IDLE','DONE','FILLING','DRAINING','EXCHANGING']:['IDLE','DONE']).includes(device.state);
 }
 const calibrationWaitNotice='请先结束补排作业或一键换水，并等待输出关闭确认后校准；单个目标水位任务可在轮间全关时校准。';
+const recoveryCalibrationNotice='自动任务正在等待恢复；请先停止任务，再确认输出关闭并按现场水位校准。';
 function canCalibrate(){
   const data=snapshot,device=data?.device,control=data?.control_limits;
   if(!signedIn||authBusy||!data?.online||Date.now()-lastSuccess>10000||device?.outputs_known!=='1'||device.fill!=='0'||device.drain!=='0')return false;
   if(hasOutputRuns(data)||outputBusy.fill||outputBusy.drain||jobBusy||data.level_job?.status==='running'&&data.level_job.mode==='exchange')return false;
   if((data.commands||[]).some(item=>['FILL','DRAIN','START'].includes(item.command)&&['queued','delivered'].includes(item.status)))return false;
   if(control?.source==='web'&&(control.uncertain||control.timeout_pending||['fill_on_since','drain_on_since','fill_deadline','drain_deadline'].some(key=>control[key]!=null)))return false;
-  return !(data.level_job?.status==='running'&&['starting','active','stopping'].includes(data.level_job.phase));
+  return !(data.level_job?.status==='running'&&['starting','active','stopping','paused','recovering','resetting'].includes(data.level_job.phase));
 }
 function renderCalibrationStatus(){
   const ready=canCalibrate();$('save-calibration').disabled=!ready;
-  document.querySelectorAll('#calibration-form input,[data-anchor]').forEach(input=>input.disabled=!signedIn||authBusy);
+  document.querySelectorAll('#calibration-form input,[data-anchor]').forEach(input=>input.disabled=!signedIn||authBusy||!!recoveryState(lastSnapshot?.level_job));
   const message=$('calibration-message');
-  if(signedIn&&!ready&&snapshot?.online)message.textContent=calibrationWaitNotice;
-  else if(message.textContent===calibrationWaitNotice)message.textContent='';
+  if(signedIn&&!ready&&(snapshot?.online||recoveryState(lastSnapshot?.level_job)))message.textContent=recoveryState(lastSnapshot?.level_job)?recoveryCalibrationNotice:calibrationWaitNotice;
+  else if([calibrationWaitNotice,recoveryCalibrationNotice].includes(message.textContent))message.textContent='';
 }
 function renderControls(){
   const device=lastSnapshot?.device;
@@ -148,7 +160,8 @@ function renderControls(){
     button.classList.toggle('has-run',!!run);button.dataset.runPhase=run?.phase||'';
     button.setAttribute('aria-checked',on?'true':'false');
     const boundary=web?outputBoundaryReason(output,lastSnapshot):'';
-    const detail=!known?'状态未知':device.state==='FAULT'?'故障锁定 · 请先复位':exchange?(on?'换水中 · 已开启':'换水中 · 已关闭'):run?(run.reason==='target_reached'?'已达水位 · 等待关断':run.reason==='cancelled_by_user'?'正在结束 · 等待关断':run.phase==='waiting'?'等待下一轮 · 点击结束':run.phase==='starting'?'等待开启 · 点击结束':run.phase==='stopping'?'等待关闭 · 点击结束':'运行中 · 点击结束'):outputBusy[output]?'正在提交作业':pendingFor(output)?'命令待设备确认':on?'已开启 · 点击独立关闭':boundary|| (web&&calibratedDuration(output,lastSnapshot)===null?'未校准 · 请先校准用时':previous?({completed:previous.reason==='target_reached'?'已到目标水位':previous.reason==='duration_limit'?'运行上限已到':'已完成',cancelled:'已结束',failed:'已中止'}[previous.status]||'已关闭')+' · 点击再运行':web?'已关闭 · 到水位自动停':'已关闭 · 点击开启');
+    const recovery=recoveryState(lastSnapshot?.level_job);
+    const detail=!known?'状态未知':recovery?(!lastSnapshot?.online?'恢复中 · 上次'+(on?'开启':'关闭'):on?'恢复中 · 已上报开启':'恢复中 · 已关闭'):device.state==='FAULT'?'故障锁定 · 请先复位':exchange?(on?'换水中 · 已开启':'换水中 · 已关闭'):run?(run.reason==='target_reached'?'已达水位 · 等待关断':run.reason==='cancelled_by_user'?'正在结束 · 等待关断':run.phase==='waiting'?'等待下一轮 · 点击结束':run.phase==='starting'?'等待开启 · 点击结束':run.phase==='stopping'?'等待关闭 · 点击结束':'运行中 · 点击结束'):outputBusy[output]?'正在提交作业':pendingFor(output)?'命令待设备确认':on?'已开启 · 点击独立关闭':boundary|| (web&&calibratedDuration(output,lastSnapshot)===null?'未校准 · 请先校准用时':previous?({completed:previous.reason==='target_reached'?'已到目标水位':previous.reason==='duration_limit'?'运行上限已到':'已完成',cancelled:'已结束',failed:'已中止'}[previous.status]||'已关闭')+' · 点击再运行':web?'已关闭 · 到水位自动停':'已关闭 · 点击开启');
     $(output+'-detail').textContent=detail;
     button.title=exchange?detail+'，可通过“停止换水”结束任务。':run?(on?'阀门已开启。':'阀门已关闭。')+detail:!on&&web?(boundary||'按当前水位运行，补到 100% / 冲到 0% 自动停止；校准用时为运行上限。'):detail;
     $(output+'-state').textContent=!known?'未知':snapshot?.online?(on?'开启':'关闭'):(on?'上次上报：开启':'上次上报：关闭');
@@ -171,10 +184,10 @@ function renderProgress(data,serviceOk=true){
       const additional=advancing?Math.min(Math.max(0,(Date.now()-lastSuccess)/1000),stage.remaining,job.round_remaining_seconds??Infinity):0;
       const remaining=Math.max(0,stage.remaining-additional),elapsed=Math.max(0,stage.total-remaining),name=output==='fill'?'补水':'冲水';
       $(output+'-progress-label').textContent='自动'+name+'阶段';
-      $(output+'-countdown-label').textContent=stage.total<=0?name+'无需运行':stage.pending?name+'待执行':job.phase==='stopping'&&job.direction===output?name+'确认关闭':remaining<=0?name+'已完成':name+'阶段剩余';
+      $(output+'-countdown-label').textContent=stage.total<=0?name+'无需运行':stage.pending?name+'待执行':recoveryState(job)?name+'暂停剩余':job.phase==='stopping'&&job.direction===output?name+'确认关闭':remaining<=0?name+'已完成':job.recovery?.uncertain?name+'保守剩余':name+'阶段剩余';
       $(output+'-progress-text').textContent=Math.floor(elapsed)+' / '+Math.ceil(stage.total)+' 秒';
       $(output+'-progress').style.width=stage.total>0?Math.min(100,elapsed/stage.total*100)+'%':'0%';
-      $(output+'-countdown').textContent=!fresh?'—':job.reason==='cancelled_by_user'?'停止中':job.phase==='stopping'&&job.direction===output&&remaining<=0?'关断中':etaLabel(remaining);
+      $(output+'-countdown').textContent=job.reason==='cancelled_by_user'?'停止中':recoveryState(job)?etaLabel(remaining):!fresh?'—':job.phase==='stopping'&&job.direction===output&&remaining<=0?'关断中':etaLabel(remaining);
       $(output+'-countdown').classList.toggle('is-ending',fresh&&!stage.pending&&remaining>0&&remaining<=30);
       continue;
     }
@@ -252,7 +265,7 @@ function renderLevel(data){
   $('level-value').textContent=!calibrated?'未校准':level.toLocaleString('zh-CN',{maximumFractionDigits:1})+'%';
   $('level-detail').textContent=!calibrated?'示意水面 · 请先校准':sim.uncertain?'估算不确定 · 需校准':data.online?'按输出状态推算':'设备离线 · 模拟暂停';
   renderSceneStatus(data);
-  $('model-note').textContent=!calibrated?'没有水位传感器。填写历史满缸与空缸用时，并按现场已知水位校准，才能开始估算。':sim.uncertain?'工作期间通信中断或服务重启，实际停止时刻无法确认。请到现场核实并重新校准；估算恢复可信前禁止开始补水或冲水。':'0.8.2 根据本次连接已确认的开关状态、有效心跳和校准速率估算水位，双路同时开启时按净变化计算。水位为预估值；心跳不会清除已有的不确定历史。';
+  $('model-note').textContent=!calibrated?'没有水位传感器。填写历史满缸与空缸用时，并按现场已知水位校准，才能开始估算。':sim.uncertain?'工作期间通信中断或服务重启，实际停止时刻无法确认。已有自动任务可在确认恢复后按保守剩余时长续行，水位仍标记不确定；任务结束后到现场核实并重新校准，再开始新任务或手动补排。':'0.8.2 根据本次连接已确认的开关状态、有效心跳和校准速率估算水位，双路同时开启时按净变化计算。水位为预估值；心跳不会清除已有的不确定历史。';
   renderCalibrationStatus();
   if(!formLoaded){if(calibrated){$('fill-seconds').value=String(sim.fill_seconds);$('drain-seconds').value=String(sim.drain_seconds);$('anchor-level').value=String(Math.round(sim.level));$('capacity-liters').value=Number.isFinite(sim.capacity_liters)?String(sim.capacity_liters):'';}formLoaded=true;}
   renderWaterEstimate(data);
@@ -295,13 +308,14 @@ function levelJobOutputStage(job,output){
 }
 function renderSceneStatus(data){
   const sim=data?.simulation||{},job=data?.level_job,active=job?.status==='running',synced=!!snapshot&&Date.now()-lastSuccess<=10000;
+  const recovery=recoveryState(job);
   const outputs=['fill','drain'].filter(output=>runningOutput(output,data)||data?.online&&data.device?.outputs_known==='1'&&data.device[output]==='1');
   const run=outputs.length===1?runningOutput(outputs[0],data):null,manualName=outputs[0]==='fill'?'补水':'冲水';
   const manual=outputs.length===2?'手动补排运行中':outputs.length===1?(run?.phase==='waiting'?manualName+'轮间等待':run?.phase==='stopping'?manualName+'确认关闭':run?.phase==='starting'?manualName+'等待开启':'手动'+manualName+'中'):'';
-  const label=!synced?'状态待确认':!data?.online?'设备离线':data.device?.state==='FAULT'?'设备故障':active?(job.reason==='cancelled_by_user'?'正在停止任务':job.mode==='exchange'?'自动换水中':'目标任务中'):manual||'待机';
+  const label=!synced?'状态待确认':active&&job.reason==='cancelled_by_user'?'正在停止任务':recovery||(!data?.online?'设备离线':data.device?.state==='FAULT'?'设备故障':active?(job.mode==='exchange'?'自动换水中':'目标任务中'):manual||'待机');
   if($('control-mode-status')){$('control-mode-status').textContent=label;$('control-mode-status').classList.toggle('is-active',synced&&data?.online&&(active||!!manual));}
   if($('manual-run-status')){$('manual-run-status').textContent=!synced?'状态待同步':active?'自动任务期间暂停手动操作':manual||'补水 / 冲水独立操作';$('manual-run-status').dataset.active=String(!active&&!!manual);}
-  $('scene-status').textContent=!synced?'服务连接中断':active&&job.mode==='exchange'?(job.reason==='cancelled_by_user'?'正在停止换水':job.phase==='waiting'?'正在换水 · 轮间等待':job.phase==='starting'?'正在换水 · 等待开启':job.phase==='stopping'?'正在换水 · 确认关闭':job.stage==='fill'?'正在换水 · 补水中':'正在换水 · 冲水中'):active?'目标任务 · '+(job.direction==='fill'?'补水':'冲水'):data?.online&&manual?manual:!sim.calibrated?'场景示意':sim.uncertain?'估算不确定':data?.online?'模拟同步中':'模拟已暂停';
+  $('scene-status').textContent=!synced?'服务连接中断':recovery?recovery:active&&job.mode==='exchange'?(job.reason==='cancelled_by_user'?'正在停止换水':job.phase==='waiting'?'正在换水 · 轮间等待':job.phase==='starting'?'正在换水 · 等待开启':job.phase==='stopping'?'正在换水 · 确认关闭':job.stage==='fill'?'正在换水 · 补水中':'正在换水 · 冲水中'):active?'目标任务 · '+(job.direction==='fill'?'补水':'冲水'):data?.online&&manual?manual:!sim.calibrated?'场景示意':sim.uncertain?'估算不确定':data?.online?'模拟同步中':'模拟已暂停';
 }
 function exchangePreview(sim=snapshot?.simulation){
   if(!sim||![sim.level,sim.fill_seconds,sim.drain_seconds].every(Number.isFinite)||sim.level<0||sim.level>100||sim.fill_seconds<=0||sim.drain_seconds<=0)return null;
@@ -332,13 +346,14 @@ async function confirmExchange(){
 function renderLevelJob(){
   renderExchangeConfirmation();
   const data=lastSnapshot,sim=data?.simulation||{},job=data?.level_job,active=job?.status==='running',exchange=job?.mode==='exchange',synced=!!snapshot&&Date.now()-lastSuccess<=10000;
+  const recovery=recoveryState(job),uncertain=job?.recovery?.uncertain===true;
   renderSceneStatus(data);
   if(active&&!exchange)$('target-level').value=String(job.target_level);
   const preview=jobPreview(),reason=jobStartReason(preview),summary=$('job-summary'),exchangeButton=$('exchange-button');
   exchangeButton.disabled=!signedIn||authBusy||(active&&exchange?jobBusy||job.reason==='cancelled_by_user':!!exchangeStartReason());
   exchangeButton.textContent=active&&exchange?(job.reason==='cancelled_by_user'?'正在停止…':'停止换水'):'一键换水';
   exchangeButton.classList.toggle('is-running',active&&exchange);
-  exchangeButton.title=active&&exchange?'停止本次换水，并等待两路关闭确认。':exchangeStartReason()||'先按当前估算冲水至 0%，确认关闭后自动补水至 100%。';
+  exchangeButton.title=active&&exchange?'永久取消本次换水与自动恢复；输出关闭以设备回执为准，设备离线时也可取消。':exchangeStartReason()||'先按当前估算冲水至 0%，确认关闭后自动补水至 100%；通信异常可暂停并恢复续行。';
   $('menu-level-job').disabled=false;
   $('level-job-title').textContent=active&&exchange?'一键换水':'按目标水位运行';
   $('exchange-workflow').hidden=!(active&&exchange);
@@ -358,11 +373,11 @@ function renderLevelJob(){
   summary.hidden=!active;$('control-hint').hidden=active;
   if(!job)return;
   const direction=job.direction==='fill'?'补水':exchange?'冲水':'排水',progress=Number.isFinite(job.progress)?Math.max(0,Math.min(100,job.progress)):0;
-  const stage=job.stage==='fill'?'2/2 · 补水至 100%':'1/2 · 冲水至 0%',taskName=exchange?'一键换水':'目标任务';
-  const state=!synced?'同步中断 · 保留任务记录':active?(job.reason==='cancelled_by_user'?'正在取消 · 等待关闭确认':({starting:'等待开启确认',active:'正在'+direction,stopping:'等待关闭确认',waiting:'轮间等待 · 2 秒'}[job.phase]||'任务执行中')):({completed:taskName+'已完成',cancelled:taskName+'已停止',failed:taskName+'已中止'}[job.status]||'任务记录');
+  const stage=job.stage==='fill'?(uncertain?'2/2 · 补水保守续行':'2/2 · 补水至 100%'):(uncertain?'1/2 · 冲水保守续行':'1/2 · 冲水至 0%'),taskName=exchange?'一键换水':'目标任务';
+  const state=!synced?'同步中断 · 保留任务记录':active?(job.reason==='cancelled_by_user'?'正在取消 · 等待关闭确认':recovery||({starting:'等待开启确认',active:'正在'+direction,stopping:'等待关闭确认',waiting:'轮间等待 · 2 秒'}[job.phase]||'任务执行中')):({completed:taskName+'已完成'+(job.reason==='completed_with_uncertainty'?' · 需校准':''),cancelled:taskName+'已停止',failed:taskName+'已中止'}[job.status]||'任务记录');
   if(exchange&&active)observedExchangeId=job.id;
   if(exchange&&!active&&synced&&observedExchangeId===job.id){
-    setFeedback(state+'。'+(job.status==='completed'?'已按校准估算先冲水至 0%，再补水至 100%。':jobReasons[job.reason]||'请检查设备状态与现场水位。'));
+    setFeedback(state+'。'+jobCompletion(job));
     observedExchangeId=null;
   }
   $('job-state').textContent=state;
@@ -370,16 +385,17 @@ function renderLevelJob(){
   $('job-progress-text').textContent=percentLabel(progress);
   $('job-progress').value=progress;
   $('job-round').textContent='第 '+job.round+' / '+job.estimated_rounds+' 轮';
-  $('job-target').textContent=exchange?(job.stage==='fill'?'补水至 100%':'冲水至 0%'):percentLabel(job.target_level);
+  $('job-target').textContent=(exchange?(job.stage==='fill'?'补水至 100%':'冲水至 0%'):percentLabel(job.target_level))+(uncertain?' · 预估':'' );
+  $('job-remaining-label').textContent=uncertain?'保守可继续时长':'预计剩余运行';
   $('job-remaining').textContent=Number.isFinite(job.remaining_seconds)?durationLabel(Math.ceil(job.remaining_seconds)):'—';
   $('job-elapsed').textContent=durationLabel(job.elapsed_seconds);
   $('job-volume').textContent=waterLabel(job.estimated_liters);
-  $('job-reason').textContent=active?(job.reason==='cancelled_by_user'?'正在等待两路关闭回执，尚未确认停止。':exchange?'先冲水至估算 0%，确认关闭后补至 100%；进度与剩余运行时间覆盖两阶段。轮间等待另计。':'按校准估算 · 本轮最多 '+job.round_limit_seconds+' 秒；只在确认关闭后进入下一轮。'):(exchange&&job.status==='completed'?'已按校准估算完成冲水至 0% 和补水至 100%。':jobReasons[job.reason]||'任务已结束，请以设备回执及现场水位为准。');
-  const headline=!synced?'同步中断 · 状态待确认':job.reason==='cancelled_by_user'?'正在停止'+(exchange?'换水':'任务'):exchange?'正在换水':'目标任务运行中';
+  $('job-reason').textContent=active?(job.reason==='cancelled_by_user'?'已取消后续运行与自动恢复，正在等待两路关闭回执；设备离线时保持取消。':recovery?recoveryNotice(job):uncertain?'已恢复保守续行；剩余时长已扣除无法确认的可能开启时段，实际水位仍不确定，任务结束后请按现场校准。':exchange?'先冲水至估算 0%，确认关闭后补至 100%；进度与剩余运行时间覆盖两阶段。轮间等待另计。':'按校准估算 · 本轮最多 '+job.round_limit_seconds+' 秒；只在确认关闭后进入下一轮。'):jobCompletion(job);
+  const headline=!synced?'同步中断 · 状态待确认':job.reason==='cancelled_by_user'?'正在停止'+(exchange?'换水':'任务'):recovery|| (exchange?'正在换水':'目标任务运行中');
   if($('job-summary-state')){
     $('job-summary-state').textContent=headline;
     $('job-summary-stage').textContent=(exchange?stage:direction+' · 第 '+job.round+' 轮 → '+percentLabel(job.target_level))+' · '+percentLabel(progress);
-    $('job-summary-remaining').textContent='运行余 '+etaLabel(job.remaining_seconds);
+    $('job-summary-remaining').textContent=(uncertain?'保守余 ':'运行余 ')+etaLabel(job.remaining_seconds);
   }else summary.textContent=headline+' · '+(exchange?stage:direction+' → '+percentLabel(job.target_level))+' · '+percentLabel(progress)+' · 余 '+etaLabel(job.remaining_seconds);
   summary.title=state+'，点击查看任务详情';summary.style.setProperty('--job-progress',progress+'%');
 }
